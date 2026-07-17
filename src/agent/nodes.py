@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news三层
-from src.tools.calculators import rank_news, calculate_prefilter_importance, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
@@ -148,17 +148,6 @@ def fetch_news_node(state: AgentState) -> dict:
 # ============================================================
 # Stage 1: Python预过滤 (毫秒级)
 # ============================================================
-
-# 硬件科技核心关键词 (预过滤保底: 即使重要度不高也优先保留)
-TECH_HARDWARE_KEYWORDS = [
-    "CPO", "光模块", "光连接", "光通信", "硅光", "光电",
-    "PCB", "覆铜板", "线路板", "HDI",
-    "半导体", "芯片", "封测", "晶圆", "光刻", "EDA", "存储芯片",
-    "算力", "服务器", "交换机", "液冷", "散热",
-    "HBM", "DDR5", "先进封装", "CoWoS",
-    "英伟达", "AMD", "台积电", "海力士",
-]
-
 
 def _calc_similarity(text1: str, text2: str) -> float:
     # 简单的2-gram字符级别Jaccard相似度
@@ -438,52 +427,6 @@ def _apply_guardrails(items: list) -> list:
             item["sentiment"] = band.value
             item["impact_direction"] = _band_to_direction(band)
     return items
-
-
-
-def _llm_analyze_batch(news_batch: list) -> list:
-    """调用LLM分析一批资讯, 返回分析后的资讯列表"""
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # 截断content减少token, 加速LLM响应
-    truncated_batch = []
-    for n in news_batch:
-        item = dict(n)
-        content = item.get("content", "")
-        if len(content) > 100:
-            item["content"] = content[:100] + "..."
-        truncated_batch.append(item)
-
-    prompt = ANALYSIS_PROMPT.format(
-        n=len(truncated_batch),
-        news_list=json.dumps(truncated_batch, ensure_ascii=False, indent=2)
-    )
-
-    system_msg = "你是资深A股资讯分析师，善于从海量资讯中识别噪音、判断多空方向、分析板块影响。请只返回JSON，不要在JSON字符串中使用换行符。"
-
-    try:
-        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=2)
-    except Exception as e:
-        logger.error(f"LLM API 调用最终失败: {e}")
-        # 全部降级返回原始数据
-        return truncated_batch
-
-    logger.info(f"LLM返回长度: {len(content)}, 前100字: {content[:100]}")
-
-    filtered = result.get("filtered_news", [])
-
-    # 我们已经改为在 llm_filter_node 中基于 title 原地合并回原始 news 字典
-    # 这里只需要保证输出的格式对得齐 title 和新增字段即可
-    for item in filtered:
-        item.setdefault("market_impact_score", 3.0)
-        item.setdefault("impact_direction", "neutral")
-        item.setdefault("affected_sectors", [])
-        item.setdefault("affected_stocks", [])
-        item.setdefault("impact_reason", "")
-        item.setdefault("sentiment", "neutral")
-
-    return filtered
 
 
 def _build_llm():
