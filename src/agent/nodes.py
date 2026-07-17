@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news三层
 from src.tools.calculators import rank_news, calculate_prefilter_importance, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance
-from src.agent.state import AgentState
+from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
 
@@ -119,14 +119,27 @@ def fetch_news_node(state: AgentState) -> dict:
 
     all_news = raw_news + ann_as_news + market_signals
 
+    # 三层去重（URL/标题/SimHash）
+    before_dedup = len(all_news)
+    all_news = dedup_news三层(all_news)
+    logger.info(f"[fetch_news] 三层去重: {before_dedup} -> {len(all_news)}条")
+
+    # 哨兵：全部核心源失败
+    data_status = "ok"
+    if not all_news:
+        data_status = NO_DATA_SENTINEL
+        logger.warning("[fetch_news] 全部数据源失败，置 NO_DATA 哨兵")
+
     return {
         "raw_news": all_news,
         "announcements": announcements,
+        "data_status": data_status,
         "messages": [
             AIMessage(content=(
                 f"[fetch_news] 已获取当日全部资讯："
                 f"新闻{len(raw_news)}条 + 公告{len(announcements)}条 + "
                 f"信号情报{len(market_signals)}条 = 合计{len(all_news)}条"
+                + (" | 注意: 全部数据源失败" if data_status == NO_DATA_SENTINEL else "")
             ))
         ]
     }
@@ -608,11 +621,16 @@ def route_after_prefilter(state: AgentState) -> str:
     """条件路由：根据预筛结果，智能决定是否走 LLM 分析
     
     规则：
+    - 哨兵优先：数据源全失败，直接跳到排名；
     - 如果 prefiltered 为空，直达排名；
     - 如果预筛列表中包含重磅信号（科技硬件/政策/ST等），必须走 LLM 深度分析；
     - 如果预筛列表很少（<=3条）且无重磅信号，可跳过 LLM 直接排名节省时间；
     - 否则默认走 LLM 分析。
     """
+    # 哨兵：数据源全失败，跳过 LLM
+    if state.get("data_status") == NO_DATA_SENTINEL:
+        return "skip_to_rank"
+
     prefiltered = state.get("prefiltered_news", [])
     if not prefiltered:
         return "skip_to_rank"
@@ -816,12 +834,17 @@ def rank_news_node(state: AgentState) -> dict:
     if not ranked:
         raw_count = len(state.get("raw_news", []))
         pre_count = len(state.get("prefiltered_news", []))
+        data_status = state.get("data_status", "ok")
         msg_parts.append(
-            f" | 注意: 全部数据被过滤！原始获取{raw_count}条, "
-            f"预筛保留{pre_count}条, LLM过滤后剩余0条。"
+            f" | 注意: 排名为空！原始{raw_count}条, 预筛{pre_count}条, "
+            f"data_status={data_status}"
         )
-        if raw_count == 0:
+        if data_status == NO_DATA_SENTINEL:
+            msg_parts.append(" 根因: 全部数据源失败，请检查网络/akshare可用性。")
+        elif raw_count == 0:
             msg_parts.append(" 可能原因: 数据源全部不可用或网络异常。")
+        elif pre_count == 0:
+            msg_parts.append(" 可能原因: 预筛过滤过严，请检查权重表配额。")
 
     return {
         "ranked_news": ranked,
