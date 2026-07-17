@@ -225,40 +225,35 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
 # Stage 2: LLM分析 (标签化)
 # ============================================================
 
-ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯进行分析。
+ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条分析，输出结构化 JSON。
 
 ## 资讯列表（共{n}条）
 {news_list}
 
-请完成以下分析:
+## 输出契约（每条必须包含全部字段）
+1. market_impact_score: 0-10（0无影响/10极重大）
+2. impact_band: 6档之一
+   - bullish(强利好, score 6.5-10): 业绩预增/大额中标/政策扶持/增持回购/技术突破
+   - mildly_bullish(弱利好, 5.5-6.4): 普通经营利好
+   - neutral(中性, 4.5-5.5): 无明显多空的常规播报
+   - mixed(多空交织, 4.5-5.5): 同时含利好利空
+   - mildly_bearish(弱利空, 3.5-4.4): 普通经营利空
+   - bearish(强利空, 0-3.4): 立案/退市/爆雷/违约/重大处罚
+3. confidence: high/medium/low
+   - high: 多源报道/有具体数据/官方源
+   - medium: 单一来源/有事件细节
+   - low: 内容<50字/信息不足
+4. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
+5. affected_stocks: 明确提及的个股
+6. impact_reason: 一句话影响逻辑
 
-### 1. 噪音识别
-识别并过滤剩余噪音:
-- 公司庆典、年会、获奖、表彰等公关活动
-- 旧闻重复、过时信息
-- 娱乐八卦、社会新闻
-- 广告软文、营销推广
-- 与A股市场无直接关联的内容
+## 规则
+- band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
+- 含明确多空信号的严禁判 neutral/mixed
+- 科技板块资讯以"对科技板块的影响"判定方向
+- 噪音（庆典/八卦/软文）不输出到 filtered_news，计入 removed_count
 
-### 2. 影响分析与打分 (保留所有非噪音资讯)
-对每条保留的资讯客观分析其市场影响：
-- market_impact_score: 市场影响力打分(0-10分，请拉开分值差距，避免集中在中庸分数):
-  * 9-10分: 国家级宏观政策（如降准、降息）、重大系统性黑天鹅、千亿级龙头生死攸关的事件
-  * 7-8分: 板块级重大利好/利空、知名企业重大变动（如并购重组、立案调查等）
-  * 4-6分: 普通个股常规经营利好/利空（如业绩预增、大股东减持）、重要行业日常数据更新
-  * 1-3分: 边缘个股无关痛痒常规动态（如召开股东大会）、日常无增量信息的股评
-- impact_direction: 必须根据以下原则进行客观的多空倾向判定，严禁将明显有利好或利空倾向的资讯保守地判定为中性(neutral)：
-  * bullish (利好): 适用于公司业绩预增/翻倍、大额签约/中标、政策扶持、大股东增持/回购、兼并重组利好、技术突破、产品提价等。
-  * bearish (利空): 适用于立案调查、违规处罚、业绩爆雷/亏损、大股东减持、债务违约、产品降价、行业利空政策等。
-  * neutral (中性): 仅适用于无明显多空倾向的常规行业宏观播报、边缘数据更新、无实质性增量信息的日常公告、股评分析等。
-  * 特别规则(科技板块): 当资讯涉及半导体/芯片/CPO/光模块/PCB/算力/服务器/HBM/封测等硬件科技核心板块时，impact_direction 必须以"对科技板块的影响"为判定依据。例如"存储芯片涨价"对科技板块属利好(bullish)，"芯片降价打价格战"对科技板块属利空(bearish)。
-- affected_sectors: 影响的板块（如 ["半导体", "新能源"] ）。**必须填写**: 只要资讯涉及任何行业/板块, 就必须提取对应的板块名称, 严禁留空数组。常见板块包括: 半导体/芯片、CPO/光通信、PCB/电路板、算力/服务器、存储/HBM、新能源、光伏、储能、人工智能、医药、白酒、银行、房地产、军工、煤炭、钢铁、汽车、锂电池、机器人、消费电子等。
-- affected_stocks: 明确提及的个股（如 ["贵州茅台", "宁德时代"] ）
-- impact_reason: 一句话说明影响逻辑
-
-重要: 利好和利空资讯都应保留, 客观打分并标注方向。方向判定要果断, 含明确多空信号的严禁判中性。
-
-请以JSON格式返回（只返回JSON，不要其他文字）:
+请以JSON格式返回（只返回JSON）:
 ```json
 {{
   "filtered_news": [
@@ -269,22 +264,21 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯进行�
       "published_at": "原时间",
       "category": "原分类",
       "market_impact_score": 8,
-      "impact_direction": "bullish",
+      "impact_band": "bullish",
+      "confidence": "high",
       "affected_sectors": ["半导体"],
       "affected_stocks": ["中芯国际"],
       "impact_reason": "半导体国产替代加速，利好板块龙头"
     }}
   ],
-  "removed_count": 去除的噪音数量,
-  "analysis_summary": "本次分析简要摘要（一句话）"
+  "removed_count": 0,
+  "analysis_summary": "本次分析简要摘要"
 }}
 ```
 
 注意:
-- filtered_news 中的每条必须保留原始字段，并新增 market_impact_score 和 impact_* 字段
-- removed_count 只包含噪音数量
-- 如果资讯内容不足以判断影响方向，impact_direction 设为 "neutral"，打分酌情降低
-- affected_sectors 必须尽力提取, 仅当资讯完全不涉及任何行业板块时才设为空数组 []
+- filtered_news 中每条必须保留原始字段并新增上述字段
+- affected_sectors 必须尽力提取，仅当完全不涉及行业板块时才设为空数组
 """
 
 
@@ -479,6 +473,70 @@ def _llm_analyze_batch(news_batch: list) -> list:
     return filtered
 
 
+def _build_llm():
+    """构建 LangChain ChatOpenAI（复用 OpenRouter 配置）"""
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        model=OPENROUTER_MODEL_NAME,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        temperature=0.3,
+        max_tokens=4096,
+    )
+
+
+def _build_analysis_prompt(news_batch: list) -> str:
+    """构建分析提示词（预取注入，整块塞提示词）"""
+    truncated_batch = []
+    for n in news_batch:
+        item = dict(n)
+        content = item.get("content", "")
+        if len(content) > 100:
+            item["content"] = content[:100] + "..."
+        truncated_batch.append(item)
+
+    return ANALYSIS_PROMPT.format(
+        n=len(truncated_batch),
+        news_list=json.dumps(truncated_batch, ensure_ascii=False, indent=2)
+    )
+
+
+def _llm_analyze_batch_structured(batch: list) -> list:
+    """结构化输出 + 自由文本降级
+
+    借鉴 TradingAgents bind_structured + invoke_structured_or_freetext
+    """
+    prompt = _build_analysis_prompt(batch)
+    system_msg = "你是资深A股资讯分析师。请只返回JSON，不要在JSON字符串中使用换行符。"
+
+    # 方式A：with_structured_output
+    try:
+        llm = _build_llm()
+        structured_llm = llm.with_structured_output(NewsAnalysisBatch)
+        result = structured_llm.invoke(prompt)
+        if result and result.filtered_news is not None:
+            items = result.filtered_news
+            return _apply_guardrails(items)
+    except Exception as e:
+        logger.warning(f"结构化输出失败，降级自由文本: {e}")
+
+    # 方式B：降级到 _call_llm_api + _safe_parse_json
+    try:
+        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=2)
+        parsed = _safe_parse_json(content)
+        raw_items = parsed.get("filtered_news", [])
+        items = []
+        for raw in raw_items:
+            try:
+                items.append(NewsAnalysisItem(**raw))
+            except Exception as e:
+                logger.warning(f"解析单条失败，跳过: {e}")
+        return _apply_guardrails(items)
+    except Exception as e:
+        logger.error(f"LLM 分析完全失败: {e}")
+        return batch
+
+
 # ============================================================
 # 节点2: prefilter - Python预过滤
 # ============================================================
@@ -606,7 +664,7 @@ def llm_filter_node(state: AgentState) -> dict:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         max_workers = min(len(batches), 4)
         executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = {executor.submit(_llm_analyze_batch, batch): idx for idx, batch in enumerate(batches)}
+        futures = {executor.submit(_llm_analyze_batch_structured, batch): idx for idx, batch in enumerate(batches)}
 
         results_map = {}
         try:
@@ -625,12 +683,18 @@ def llm_filter_node(state: AgentState) -> dict:
         finally:
             executor.shutdown(wait=False)
 
-        # 合并 LLM 结果
+        # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
         for idx in range(len(batches)):
             batch = batches[idx]
             filtered_batch = results_map.get(idx)
             if filtered_batch:
-                all_llm_results.extend(filtered_batch)
+                for item in filtered_batch:
+                    if isinstance(item, NewsAnalysisItem):
+                        all_llm_results.append(item.model_dump())
+                    elif isinstance(item, dict):
+                        all_llm_results.append(item)
+                    else:
+                        all_llm_results.append(item)
             else:
                 # 失败降级处理
                 for n in batch:
@@ -675,6 +739,8 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["affected_stocks"] = news.get("affected_stocks", [])
                 news["impact_reason"] = "大模型调用降级：基于规则系统自动分析"
                 news["sentiment"] = direction
+                news["impact_band"] = "neutral"
+                news["confidence"] = "low"
             else:
                 # 2. 正常 LLM 输出: 尊重 LLM 方向, 但对中性结论做精细纠偏
                 #    仅当 LLM=neutral 且规则发现明确强正向/强负向组合时才纠偏
@@ -709,6 +775,8 @@ def llm_filter_node(state: AgentState) -> dict:
                         news.get("title", ""), news.get("content", ""), news.get("name", ""))
                 news["affected_stocks"] = llm_res.get("affected_stocks", news.get("affected_stocks", []))
                 news["sentiment"] = direction
+                news["impact_band"] = llm_res.get("impact_band", "neutral")
+                news["confidence"] = llm_res.get("confidence", "medium")
 
             final_filtered.append(news)
         else:
