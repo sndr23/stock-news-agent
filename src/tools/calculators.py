@@ -36,6 +36,9 @@ class RankedNewsItem(TypedDict):
     affected_sectors: list
     affected_stocks: list
     impact_reason: str
+    impact_band: str
+    band_priority: int
+    confidence: str
 
 
 # ============================================================
@@ -576,112 +579,170 @@ def _has_national_policy(text: str) -> bool:
     return any(np in text for np in NATIONAL_POLICY_KEYWORDS)
 
 
+BAND_PRIORITY = {
+    "bullish": 6, "mildly_bullish": 5,
+    "mixed": 4, "neutral": 3,
+    "mildly_bearish": 2, "bearish": 1,
+}
+
+CONFIDENCE_WEIGHT = {
+    "high": 1.0, "medium": 0.85, "low": 0.7,
+}
+
+
+def _band_direction_conflict(band: str, direction: str) -> bool:
+    """band 与 direction 冲突判定"""
+    bullish_bands = {"bullish", "mildly_bullish"}
+    bearish_bands = {"bearish", "mildly_bearish"}
+    if band in bullish_bands and direction == "bearish":
+        return True
+    if band in bearish_bands and direction == "bullish":
+        return True
+    return False
+
+
+def _downgrade_band(band: str) -> str:
+    """band 降一档"""
+    order = ["bullish", "mildly_bullish", "mixed", "neutral", "mildly_bearish", "bearish"]
+    idx = order.index(band) if band in order else 3
+    return order[min(idx + 1, len(order) - 1)]
+
+
+def _calc_continuous_score(news: dict) -> float:
+    """连续分数计算 — 保留原 rank_news 循环体内全部计算逻辑
+
+    total = (w_cred × 可信度 + w_imp × LLM重要度 [+ w_cluster × 聚类热度]) × 方向折扣 × 科技加成
+    - 方向折扣: 非中性=1.0; 中性按 LLM 重要度分级 (高分不折/中分轻折/低分重折)
+    - 科技加成: 科技利好×1.15 / 科技中性×1.05 / 科技利空不加
+    - 国家级权威来源 + 政策关键词 → 额外加成
+    - ST/退市类垃圾股进一步降级
+    - 封顶 0.99
+    """
+    cred = calculate_credibility(news.get("source", ""))
+
+    raw_val = news.get("market_impact_score", 3.0)
+    try:
+        if isinstance(raw_val, (int, float)):
+            llm_impact_raw = float(raw_val)
+        else:
+            import re
+            match = re.search(r'([\d.]+)', str(raw_val))
+            llm_impact_raw = float(match.group(1)) if match else 3.0
+    except Exception:
+        llm_impact_raw = 3.0
+
+    llm_impact = min(max(llm_impact_raw / 10.0, 0.0), 1.0)
+
+    cluster_w = float(news.get("cluster_weight", 0.0))
+    cluster_bonus = min(cluster_w * 0.05, NEWS_CLUSTER_WEIGHT)
+
+    category = news.get("category", "news")
+    if category == "announcement":
+        total_base = ANN_CRED_WEIGHT * cred + ANN_IMP_WEIGHT * llm_impact
+    elif category == "signal":
+        total_base = SIGNAL_CRED_WEIGHT * cred + SIGNAL_IMP_WEIGHT * llm_impact
+    else:
+        total_base = NEWS_CRED_WEIGHT * cred + NEWS_IMP_WEIGHT * llm_impact + cluster_bonus
+
+    direction = news.get("impact_direction", "neutral")
+    if direction != "neutral":
+        sentiment_factor = 1.00
+    else:
+        if llm_impact >= 0.70:
+            sentiment_factor = 1.00
+        elif llm_impact >= 0.40:
+            sentiment_factor = 0.92
+        else:
+            sentiment_factor = 0.80
+
+    total = round(total_base * sentiment_factor, 4)
+
+    # ---- 改进的加成/降级逻辑 ----
+    title = news.get("title", "")
+    content = news.get("content", "")
+    name = news.get("name", "")
+    clean_title = title.replace(name, "") if name else title
+    clean_content = content.replace(name, "") if name else content
+    clean_text = f"{clean_title} {clean_content}"
+
+    is_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
+    is_national_auth = _is_national_authority(news.get("source", ""))
+    is_national_policy = _has_national_policy(clean_text)
+    is_st_delist = any(kw in clean_text for kw in ["*ST", "ST", "退市", "终止上市"])
+
+    if is_tech:
+        # 科技加成收窄: 利好适度拔高, 中性微加, 利空不加
+        if direction == "bullish":
+            total = round(total * 1.15, 4)   # 科技利好 x1.15 (从1.35降下来)
+        elif direction == "neutral":
+            total = round(total * 1.05, 4)   # 科技中性 x1.05 (从1.20降下来)
+        # 科技利空不加乘 (从1.10去掉), 让它自然排名
+
+    # 国家级政策/权威来源加成
+    if is_national_auth and is_national_policy:
+        total = round(total * 1.12, 4)   # 国家级政策 x1.12
+    elif is_national_auth:
+        total = round(total * 1.05, 4)   # 国家级来源 x1.05
+
+    # ST/退市类垃圾股进一步降级 (除非是撤销退市等利好)
+    if is_st_delist and direction == "bearish":
+        total = round(total * 0.85, 4)
+
+    # 封顶
+    if total > 0.99:
+        total = 0.99
+
+    return total
+
+
 def rank_news(news_list: list) -> list:
-    """对新闻列表基于 LLM 评分与聚类热度进行最终排序
-    
-    排序规则改进:
-    1. 国家级政策 > 科技利好 > 重大公告 > 普通利好 > 中性 > 利空 > 噪音
-    2. 科技加成收窄: 利好x1.15 / 中性x1.05 / 利空x1.0 (不再无差别加成)
-    3. 国家级权威来源 + 政策关键词 → 额外加成
-    4. 公告类 ST/退市类 (垃圾股) 进一步降级
+    """综合排名：band 主序 → 连续分数次序 → 时间因子
+
+    改进：
+    1. band 6 档作为主排序键（分级评级优先）
+    2. 连续分数（可信度×重要度+聚类+方向折扣+科技加成）作同级内次排序键
+    3. confidence 加权（high 1.0 / medium 0.85 / low 0.7）
+    4. band 与 direction 冲突时 band 降一档
     """
     ranked = []
     for news in news_list:
-        cred = calculate_credibility(news.get("source", ""))
-        
-        raw_val = news.get("market_impact_score", 3.0)
-        try:
-            if isinstance(raw_val, (int, float)):
-                llm_impact_raw = float(raw_val)
-            else:
-                import re
-                match = re.search(r'([\d.]+)', str(raw_val))
-                llm_impact_raw = float(match.group(1)) if match else 3.0
-        except Exception:
-            llm_impact_raw = 3.0
-            
-        llm_impact = min(max(llm_impact_raw / 10.0, 0.0), 1.0)
-        
-        cluster_w = float(news.get("cluster_weight", 0.0))
-        cluster_bonus = min(cluster_w * 0.05, NEWS_CLUSTER_WEIGHT)
+        total = _calc_continuous_score(news)
+
+        conf = news.get("confidence", "medium")
+        total = round(total * CONFIDENCE_WEIGHT.get(conf, 0.85), 4)
+
+        band = news.get("impact_band", "neutral")
+        direction = news.get("impact_direction", "neutral")
+        if _band_direction_conflict(band, direction):
+            band = _downgrade_band(band)
 
         tf = calculate_time_factor(news.get("published_at", ""))
-
-        category = news.get("category", "news")
-        if category == "announcement":
-            total_base = ANN_CRED_WEIGHT * cred + ANN_IMP_WEIGHT * llm_impact
-        elif category == "signal":
-            total_base = SIGNAL_CRED_WEIGHT * cred + SIGNAL_IMP_WEIGHT * llm_impact
-        else:
-            total_base = NEWS_CRED_WEIGHT * cred + NEWS_IMP_WEIGHT * llm_impact + cluster_bonus
-
-        direction = news.get("impact_direction", "neutral")
-        if direction != "neutral":
-            sentiment_factor = 1.00
-        else:
-            if llm_impact >= 0.70:
-                sentiment_factor = 1.00
-            elif llm_impact >= 0.40:
-                sentiment_factor = 0.92
-            else:
-                sentiment_factor = 0.80
-
-        total = round(total_base * sentiment_factor, 4)
-
-        # ---- 改进的加成/降级逻辑 ----
-        title = news.get("title", "")
-        content = news.get("content", "")
-        name = news.get("name", "")
-        clean_title = title.replace(name, "") if name else title
-        clean_content = content.replace(name, "") if name else content
-        clean_text = f"{clean_title} {clean_content}"
-
-        is_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
-        is_national_auth = _is_national_authority(news.get("source", ""))
-        is_national_policy = _has_national_policy(clean_text)
-        is_st_delist = any(kw in clean_text for kw in ["*ST", "ST", "退市", "终止上市"])
-
-        if is_tech:
-            # 科技加成收窄: 利好适度拔高, 中性微加, 利空不加
-            if direction == "bullish":
-                total = round(total * 1.15, 4)   # 科技利好 x1.15 (从1.35降下来)
-            elif direction == "neutral":
-                total = round(total * 1.05, 4)   # 科技中性 x1.05 (从1.20降下来)
-            # 科技利空不加乘 (从1.10去掉), 让它自然排名
-
-        # 国家级政策/权威来源加成
-        if is_national_auth and is_national_policy:
-            total = round(total * 1.12, 4)   # 国家级政策 x1.12
-        elif is_national_auth:
-            total = round(total * 1.05, 4)   # 国家级来源 x1.05
-
-        # ST/退市类垃圾股进一步降级 (除非是撤销退市等利好)
-        if is_st_delist and direction == "bearish":
-            total = round(total * 0.85, 4)
-
-        # 封顶
-        if total > 0.99:
-            total = 0.99
 
         ranked.append(RankedNewsItem(
             title=news.get("title", ""),
             source=news.get("source", ""),
             content=news.get("content", ""),
             published_at=news.get("published_at", ""),
-            credibility_score=cred,
-            market_impact_score=llm_impact_raw,
-            cluster_weight=cluster_w,
+            credibility_score=calculate_credibility(news.get("source", "")),
+            market_impact_score=news.get("market_impact_score", 3.0),
+            cluster_weight=float(news.get("cluster_weight", 0.0)),
             time_factor=tf,
             total_score=total,
             category=news.get("category", "news"),
             sentiment=news.get("sentiment", "neutral"),
-            impact_direction=news.get("impact_direction", "neutral"),
+            impact_direction=direction,
             affected_sectors=news.get("affected_sectors", []),
             affected_stocks=news.get("affected_stocks", []),
-            impact_reason=news.get("impact_reason", "")
+            impact_reason=news.get("impact_reason", ""),
+            impact_band=band,
+            band_priority=BAND_PRIORITY.get(band, 3),
+            confidence=conf,
         ))
 
-    ranked.sort(key=lambda x: (x["total_score"], x["time_factor"]), reverse=True)
+    ranked.sort(
+        key=lambda x: (x["band_priority"], x["total_score"], x["time_factor"]),
+        reverse=True
+    )
     return ranked
 
 

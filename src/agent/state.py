@@ -26,6 +26,9 @@ class RankedNewsItem(TypedDict):
     affected_sectors: list
     affected_stocks: list
     impact_reason: str
+    impact_band: str
+    band_priority: int
+    confidence: str
 
 
 class AgentState(TypedDict):
