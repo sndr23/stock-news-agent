@@ -22,8 +22,8 @@ from langchain_core.messages import AIMessage
 logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL
-from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals
-from src.tools.calculators import rank_news, calculate_prefilter_importance, predict_direction_by_rules, infer_sectors_by_rules
+from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news三层
+from src.tools.calculators import rank_news, calculate_prefilter_importance, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance
 from src.agent.state import AgentState
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
@@ -136,14 +136,6 @@ def fetch_news_node(state: AgentState) -> dict:
 # Stage 1: Python预过滤 (毫秒级)
 # ============================================================
 
-# 明确噪音关键词 (与股市完全无关)
-NOISE_KEYWORDS = [
-    "庆典", "年会", "获奖", "表彰", "周年", "联谊", "晚会",
-    "八卦", "娱乐", "明星", "综艺", "电影", "电视剧",
-    "广告", "软文", "赞助", "冠名",
-    "天气预报", "高温预警", "暴雨预警", "地震",
-]
-
 # 硬件科技核心关键词 (预过滤保底: 即使重要度不高也优先保留)
 TECH_HARDWARE_KEYWORDS = [
     "CPO", "光模块", "光连接", "光通信", "硅光", "光电",
@@ -164,87 +156,68 @@ def _calc_similarity(text1: str, text2: str) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 
-def _python_prefilter(news_list: list, top_n: int = 40) -> tuple:
-    """Python预过滤: 关键词去噪 + 去重 + 硬件科技保底 + 聚类热度 + 重要度初筛"""
-    # 1. 关键词去噪
-    non_noise = []
-    noise_count = 0
-    for news in news_list:
-        text = f"{news.get('title', '')} {news.get('content', '')}"
-        is_noise = any(kw in text for kw in NOISE_KEYWORDS)
-        if is_noise:
-            noise_count += 1
+_PREFILTER_QUOTA = {"direct": None, "sector": 20, "macro": 10}
+_PREFILTER_TOTAL_LIMIT = 40
+
+
+def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> tuple:
+    """Python 预筛：权重表打分 + 分类配额截断 + 聚类热度
+
+    流程：
+      1. 三层去重（URL/标题/SimHash）
+      2. 对每条调 score_news_relevance 打分分类
+      3. 按分类配额截断：direct全留, sector取top20, macro取top10
+      4. 计算聚类热度 cluster_weight
+
+    注：噪音过滤交由权重表负责——零关联度且 sector 类的条目视为纯噪音丢弃，
+        不再使用 nodes.py 内的 NOISE_KEYWORDS 黑名单（已删除）。
+    """
+    deduped = dedup_news三层(news_list)
+    dup_count = len(news_list) - len(deduped)
+
+    for news in deduped:
+        score, category = score_news_relevance(news)
+        news["_prefilter_score"] = score
+        news["_prefilter_category"] = category
+
+    # 权重表初筛：丢弃"零关联度且 sector 类"的纯噪音条目
+    # （macro 类即使被权重表罚分至 0 也保留，因其类别本身即宏观信号）
+    scored = [n for n in deduped if n["_prefilter_score"] > 0 or n["_prefilter_category"] != "sector"]
+
+    buckets = {"direct": [], "sector": [], "macro": []}
+    for news in scored:
+        cat = news["_prefilter_category"]
+        buckets[cat].append(news)
+
+    for cat in buckets:
+        buckets[cat].sort(key=lambda x: x["_prefilter_score"], reverse=True)
+
+    kept = []
+    for cat, quota in _PREFILTER_QUOTA.items():
+        if quota is not None:
+            kept.extend(buckets[cat][:quota])
         else:
-            non_noise.append(news)
+            kept.extend(buckets[cat])
 
-    # 2. 标题去重
-    seen_titles = set()
-    deduped = []
-    for news in non_noise:
-        title = news.get("title", "").strip()
-        if title and title not in seen_titles:
-            seen_titles.add(title)
-            deduped.append(news)
-    dup_count = len(non_noise) - len(deduped)
+    if len(kept) > top_n:
+        kept.sort(key=lambda x: x["_prefilter_score"], reverse=True)
+        kept = kept[:top_n]
 
-    # 2.5 聚类热度计算 (同一事件被多家报道则加权)
-    # 仅比较去重后的标题，如果相似度>0.35则认为是同一事件
-    for i, news1 in enumerate(deduped):
+    for i, news1 in enumerate(kept):
         cluster_size = 1
         title1 = news1.get("title", "")
-        for j, news2 in enumerate(deduped):
+        for j, news2 in enumerate(kept):
             if i != j:
                 title2 = news2.get("title", "")
                 if _calc_similarity(title1, title2) > 0.35:
                     cluster_size += 1
-        # cluster_weight 记录关联数量，最多计入10条以防霸榜
         news1["cluster_weight"] = min(cluster_size - 1, 10)
 
-    # 3. 硬件科技保底 + 信号情报保底: 确保不被截断
-    tech_news = []
-    signal_news = []
-    other_news = []
-    for news in deduped:
-        title = news.get("title", "")
-        content = news.get("content", "")
-        name = news.get("name", "")
-        clean_title = title.replace(name, "") if name else title
-        clean_content = content.replace(name, "") if name else content
-        clean_text = f"{clean_title} {clean_content}"
-        
-        if news.get("category") == "signal":
-            score = calculate_prefilter_importance(news)
-            has_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
-            if has_tech or score >= 0.70:
-                signal_news.append(news)
-            else:
-                other_news.append(news)
-        elif any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS):
-            tech_news.append(news)
-        else:
-            other_news.append(news)
-
-    # 4. 重要度初筛: 硬件科技+信号全保留 + 其余按重要度取top
-    for news in other_news:
-        news["_prefilter_score"] = calculate_prefilter_importance(news) + (news["cluster_weight"] * 0.05)
-    other_news.sort(key=lambda x: x["_prefilter_score"], reverse=True)
-
-    reserved = len(tech_news) + len(signal_news)
-    remaining_slots = max(top_n - reserved, 10)
-    if len(other_news) > remaining_slots:
-        kept_other = other_news[:remaining_slots]
-        cut_count = len(other_news) - remaining_slots
-    else:
-        kept_other = other_news
-        cut_count = 0
-
-    kept = tech_news + signal_news + kept_other
-
-    # 清理临时字段
     for news in kept:
         news.pop("_prefilter_score", None)
+        news.pop("_prefilter_category", None)
 
-    total_removed = noise_count + dup_count + cut_count
+    total_removed = dup_count + (len(deduped) - len(kept))
     return kept, total_removed
 
 
