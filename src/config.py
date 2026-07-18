@@ -31,8 +31,9 @@ logging.basicConfig(
 )
 
 # OpenRouter 配置
-OPENROUTER_API_KEY = os.getenv("openrouter_api_key", "")
-OPENROUTER_MODEL_NAME = os.getenv("openrouter_model_name", "google/gemini-3-flash-preview")
+# 大写优先（云端 GitHub Actions 环境变量），小写兜底（本地 .ENV 文件）
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("openrouter_api_key", "")
+OPENROUTER_MODEL_NAME = os.getenv("OPENROUTER_MODEL_NAME") or os.getenv("openrouter_model_name", "google/gemini-3-flash-preview")
 OPENROUTER_BASE_URL = "https://apihub.agnes-ai.com/v1"
 
 # 项目路径配置
