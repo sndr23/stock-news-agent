@@ -40,6 +40,12 @@ BJT = timezone(timedelta(hours=8))
 logger = logging.getLogger(__name__)
 
 
+def _force_exit(code: int):
+    """强制退出：flush 日志后立即终止进程，避免 LLM 超时 futures 等后台线程拖着不退出"""
+    logging.shutdown()
+    os._exit(code)
+
+
 def _build_title() -> str:
     """按当前时段生成推送标题"""
     now = datetime.now(BJT)
@@ -90,7 +96,7 @@ def main():
             top_n=1,
             title=f"{title} - 运行失败",
         )
-        sys.exit(1)
+        _force_exit(1)
 
     ranked = result.get("ranked_news", [])
     if not ranked:
@@ -104,7 +110,7 @@ def main():
             top_n=1,
             title=f"{title} - 无资讯",
         )
-        sys.exit(0)
+        _force_exit(0)
 
     logger.info(f"Pipeline 完成，共 {len(ranked)} 条资讯，推送前 {top_n} 条")
 
@@ -119,12 +125,13 @@ def main():
         title=title,
     )
 
-    if result.get("code") == 200 or result.get("errcode") == 0:
+    # WxPusher 成功 code=1000，PushPlus 成功 code=200，企业微信成功 errcode=0
+    if result.get("code") in (200, 1000) or result.get("errcode") == 0:
         logger.info("推送成功")
-        sys.exit(0)
+        _force_exit(0)
     else:
         logger.error(f"推送失败: {result}")
-        sys.exit(1)
+        _force_exit(1)
 
 
 if __name__ == "__main__":
