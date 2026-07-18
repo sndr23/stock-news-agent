@@ -125,7 +125,7 @@ def push_via_wxpusher(
     uid: str,
     title: str,
     content: str,
-    content_type: str = "markdown",
+    content_type: int = 3,
     summary: str = "",
 ) -> dict:
     """通过 WxPusher 推送消息到微信
@@ -135,7 +135,7 @@ def push_via_wxpusher(
         uid: 接收消息的用户 UID
         title: 消息标题（仅用于日志）
         content: 消息内容（Markdown/HTML/Text）
-        content_type: 内容类型（markdown / html / text）
+        content_type: 内容类型整数（1=文字 2=html 3=markdown）
         summary: 消息摘要（≤20字，显示在微信卡片上，不传则截取前20字）
 
     Returns:
@@ -157,14 +157,22 @@ def push_via_wxpusher(
         "contentType": content_type,
         "uids": [uid],
     }
+    # 记录请求参数（脱敏）方便诊断 400 等错误
+    logger.info(
+        f"WxPusher 请求: appToken={app_token[:6]}***, uid={uid[:6]}***, "
+        f"content_len={len(content)}, summary_len={len(summary)}"
+    )
     try:
         resp = requests.post(WXPUSHER_API, json=payload, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
+        # 不使用 raise_for_status，直接解析响应体（即使 400/500 也能看到 WxPusher 的错误信息）
+        try:
+            result = resp.json()
+        except Exception:
+            result = {"code": resp.status_code, "msg": resp.text[:500]}
         if result.get("code") == 1000:
             logger.info(f"WxPusher 推送成功: {title}")
         else:
-            logger.warning(f"WxPusher 推送失败: {result}")
+            logger.warning(f"WxPusher 推送失败: HTTP {resp.status_code}, response={result}")
         return result
     except Exception as e:
         logger.error(f"WxPusher 推送异常: {e}")

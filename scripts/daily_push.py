@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 def _force_exit(code: int):
     """强制退出：flush 日志后立即终止进程，避免 LLM 超时 futures 等后台线程拖着不退出"""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
     logging.shutdown()
     os._exit(code)
 
