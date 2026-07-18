@@ -57,7 +57,7 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3,
-        "max_tokens": 4096
+        "max_tokens": 16384
     }
 
     last_error = None
@@ -430,14 +430,20 @@ def _apply_guardrails(items: list) -> list:
 
 
 def _build_llm():
-    """构建 LangChain ChatOpenAI（复用 OpenRouter 配置）"""
+    """构建 LangChain ChatOpenAI（复用 OpenRouter 配置）
+
+    max_tokens=16384: 推理模型(agnes-2.0-flash)的 reasoning_tokens 会占用大量额度，
+    4096 时几乎全部用于推理导致 JSON 输出被截断。提升到 16384 确保推理+文本输出都有空间。
+    reasoning_effort="low": 尽量减少推理开销，让更多 token 用于实际 JSON 输出。
+    """
     from langchain_openai import ChatOpenAI
     return ChatOpenAI(
         model=OPENROUTER_MODEL_NAME,
         api_key=OPENROUTER_API_KEY,
         base_url=OPENROUTER_BASE_URL,
         temperature=0.3,
-        max_tokens=4096,
+        max_tokens=16384,
+        extra_body={"reasoning_effort": "low"},
     )
 
 
@@ -615,7 +621,7 @@ def llm_filter_node(state: AgentState) -> dict:
     batch_errors = 0
     error_details = []
 
-    BATCH_SIZE = 15
+    BATCH_SIZE = 8
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
     old_socket_timeout = socket.getdefaulttimeout()
@@ -689,9 +695,20 @@ def llm_filter_node(state: AgentState) -> dict:
                 final_filtered.append(news)
                 continue
 
+            # NewsAnalysisItem 没有 impact_direction 字段，从 impact_band 推导方向
             direction = llm_res.get("impact_direction")
-            # 1. 降级兜底: 仅当 LLM 异常未返回方向时, 才用规则兜底
             if not direction:
+                band = llm_res.get("impact_band", "neutral")
+                # model_dump() 返回枚举对象，需要取 .value 得到字符串
+                band_str = band.value if hasattr(band, "value") else str(band)
+                if "bullish" in band_str:
+                    direction = "bullish"
+                elif "bearish" in band_str:
+                    direction = "bearish"
+                else:
+                    direction = "neutral"
+            # 1. 降级兜底: 仅当 LLM 异常未返回 band/方向时, 才用规则兜底
+            if not llm_res.get("impact_band"):
                 direction = predict_direction_by_rules(news.get("title", ""), news.get("content", ""))
                 news["market_impact_score"] = 5.0 if direction != "neutral" else 3.0
                 news["impact_direction"] = direction
@@ -736,8 +753,11 @@ def llm_filter_node(state: AgentState) -> dict:
                         news.get("title", ""), news.get("content", ""), news.get("name", ""))
                 news["affected_stocks"] = llm_res.get("affected_stocks", news.get("affected_stocks", []))
                 news["sentiment"] = direction
-                news["impact_band"] = llm_res.get("impact_band", "neutral")
-                news["confidence"] = llm_res.get("confidence", "medium")
+                # model_dump() 返回枚举对象，转为字符串值存入 news（BAND_PRIORITY 等字典用字符串 key）
+                band_val = llm_res.get("impact_band", "neutral")
+                conf_val = llm_res.get("confidence", "medium")
+                news["impact_band"] = band_val.value if hasattr(band_val, "value") else str(band_val)
+                news["confidence"] = conf_val.value if hasattr(conf_val, "value") else str(conf_val)
 
             final_filtered.append(news)
         else:

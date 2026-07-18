@@ -360,7 +360,7 @@ def calculate_prefilter_importance(news: dict) -> float:
             base *= 0.6
 
         tech_hits = sum(1 for kw in TECH_HARDWARE_KEYWORDS if kw in text)
-        tech_bonus = min(tech_hits * 0.10, 0.30)
+        tech_bonus = min(tech_hits * 0.15, 0.40)
 
         llm_bonus = 0.0
         if direction in ("bullish", "bearish"):
@@ -397,7 +397,7 @@ def calculate_prefilter_importance(news: dict) -> float:
     policy_cat = min(policy_bonus, 0.35)
 
     tech_hits = sum(1 for kw in TECH_HARDWARE_KEYWORDS if kw in text)
-    tech_cat = min(tech_hits * 0.15, 0.40)
+    tech_cat = min(tech_hits * 0.20, 0.50)
     other_sector_hits = sum(1 for kw in SECTOR_KEYWORDS if kw in text and kw not in TECH_HARDWARE_KEYWORDS)
     sector_cat = min(other_sector_hits * 0.04, 0.10)
 
@@ -608,7 +608,28 @@ def _downgrade_band(band: str) -> str:
     return order[min(idx + 1, len(order) - 1)]
 
 
-def _calc_continuous_score(news: dict) -> float:
+def _is_hs300_stock(stock_name: str, stock_code: str, hs300: dict) -> bool:
+    """判断个股是否在沪深300成分股中。
+
+    hs300 为空（获取失败）时保守返回 True（不降权），避免误伤。
+    优先代码精确匹配，其次名称精确匹配。
+    """
+    if not hs300:
+        return True
+    codes = hs300.get("codes", set()) or set()
+    names = hs300.get("names", set()) or set()
+    if not codes and not names:
+        return True
+    stock_name = (stock_name or "").strip()
+    stock_code = (stock_code or "").strip().zfill(6)
+    if stock_code and stock_code in codes:
+        return True
+    if stock_name and stock_name in names:
+        return True
+    return False
+
+
+def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     """连续分数计算 — 保留原 rank_news 循环体内全部计算逻辑
 
     total = (w_cred × 可信度 + w_imp × LLM重要度 [+ w_cluster × 聚类热度]) × 方向折扣 × 科技加成
@@ -664,28 +685,52 @@ def _calc_continuous_score(news: dict) -> float:
     clean_title = title.replace(name, "") if name else title
     clean_content = content.replace(name, "") if name else content
     clean_text = f"{clean_title} {clean_content}"
+    # ST/退市检测使用原始文本（title+content），避免公司名称含"*ST"前缀被误删
+    raw_text = f"{title} {content}"
 
     is_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
     is_national_auth = _is_national_authority(news.get("source", ""))
     is_national_policy = _has_national_policy(clean_text)
-    is_st_delist = any(kw in clean_text for kw in ["*ST", "ST", "退市", "终止上市"])
+    is_st_delist = any(kw in raw_text for kw in ["*ST", "ST", "退市", "终止上市"])
 
+    # ---- 科技板块统一加权 / 非科技统一降权 ----
+    # CPO/PCB/半导体等科技硬件词命中：不管利好利空统一显著加成
+    # 非科技资讯：国家级政策保持加成，其他统一降权
     if is_tech:
-        # 科技加成收窄: 利好适度拔高, 中性微加, 利空不加
-        if direction == "bullish":
-            total = round(total * 1.15, 4)   # 科技利好 x1.15 (从1.35降下来)
-        elif direction == "neutral":
-            total = round(total * 1.05, 4)   # 科技中性 x1.05 (从1.20降下来)
-        # 科技利空不加乘 (从1.10去掉), 让它自然排名
-
-    # 国家级政策/权威来源加成
-    if is_national_auth and is_national_policy:
+        total = round(total * 1.35, 4)   # 科技资讯 x1.35 (不管方向)
+    elif is_national_auth and is_national_policy:
         total = round(total * 1.12, 4)   # 国家级政策 x1.12
     elif is_national_auth:
         total = round(total * 1.05, 4)   # 国家级来源 x1.05
+    else:
+        total = round(total * 0.70, 4)   # 非科技非国家级资讯降权 x0.70
 
-    # ST/退市类垃圾股进一步降级 (除非是撤销退市等利好)
-    if is_st_delist and direction == "bearish":
+    # ---- 沪深300成分股过滤 + ST/退市分级降权 ----
+    affected_stocks = news.get("affected_stocks", []) or []
+    stock_name = news.get("name", "")
+    stock_code = news.get("code", "")
+    has_individual_stock = bool(affected_stocks or stock_name or stock_code)
+
+    all_non_hs300 = True
+    if has_individual_stock and hs300 is not None:
+        stocks_to_check = list(affected_stocks)
+        if stock_name:
+            stocks_to_check.append(stock_name)
+        for s in stocks_to_check:
+            # 仅当唯一个股时才用 code 精确匹配（公告类 name↔code 对应）
+            check_code = stock_code if len(stocks_to_check) == 1 else ""
+            if _is_hs300_stock(s, check_code, hs300):
+                all_non_hs300 = False
+                break
+
+    if has_individual_stock and all_non_hs300 and hs300 is not None:
+        # 非沪深300个股：温和降权
+        total = round(total * 0.7, 4)
+        # 叠加 ST/退市：强力降权 (0.7 × 0.6 = 0.42)
+        if is_st_delist:
+            total = round(total * 0.6, 4)
+    elif is_st_delist and direction == "bearish":
+        # 沪深300的 ST（罕见）或无个股信息的 ST：保留原降权
         total = round(total * 0.85, 4)
 
     # 封顶
@@ -703,10 +748,14 @@ def rank_news(news_list: list) -> list:
     2. 连续分数（可信度×重要度+聚类+方向折扣+科技加成）作同级内次排序键
     3. confidence 加权（high 1.0 / medium 0.85 / low 0.7）
     4. band 与 direction 冲突时 band 降一档
+    5. 沪深300成分股过滤：非沪深300个股资讯降权（入口获取一次，避免循环内重复查询）
     """
+    from src.tools.data_fetchers import get_hs300_constituents
+    hs300 = get_hs300_constituents()
+
     ranked = []
     for news in news_list:
-        total = _calc_continuous_score(news)
+        total = _calc_continuous_score(news, hs300)
 
         conf = news.get("confidence", "medium")
         total = round(total * CONFIDENCE_WEIGHT.get(conf, 0.85), 4)

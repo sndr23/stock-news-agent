@@ -577,6 +577,40 @@ def _parallel_fetch(tasks: dict, per_source_timeout: int = 30, total_timeout: in
 
 
 # ============================================================
+# 沪深300成分股 (用于排序时识别优质个股)
+# ============================================================
+
+def get_hs300_constituents() -> dict:
+    """获取沪深300成分股（代码集合 + 名称集合），带内存缓存（1天TTL）。
+
+    用于排序时识别"非垃圾股"：沪深300以内视为优质个股，不降权。
+    失败时返回空集合，调用方应据此跳过降权（保守不降权）。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    cache_key = "hs300_constituents"
+    cached = _get_cache(cache_key, today)
+    if cached is not None:
+        return cached
+
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
+    try:
+        import akshare as ak
+        df = ak.index_stock_cons_csindex(symbol="000300")
+        codes = set(str(c).zfill(6) for c in df["成分券代码"].tolist())
+        names = set(str(n).strip() for n in df["成分券名称"].tolist() if str(n).strip())
+        result = {"codes": codes, "names": names}
+        _set_cache(cache_key, result, today)
+        logger.info(f"沪深300成分股: 获取成功, {len(codes)}只")
+        return result
+    except Exception as e:
+        logger.warning(f"沪深300成分股获取失败: {e}")
+        return {"codes": set(), "names": set()}
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+# ============================================================
 # LangChain Tools
 # ============================================================
 
