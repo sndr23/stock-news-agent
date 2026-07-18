@@ -1,0 +1,52 @@
+# filepath: .github/workflows/daily-push.yml
+name: 每日资讯推送
+
+on:
+  schedule:
+    # 北京时间 09:00 (盘前) 和 15:30 (盘后)
+    # UTC 01:00 和 07:30
+    # 注意: GitHub Actions cron 用 UTC 时间
+    - cron: "0 1 * * 1-5"    # UTC 01:00 = BJT 09:00 周一到周五
+    - cron: "30 7 * * 1-5"   # UTC 07:30 = BJT 15:30 周一到周五
+  workflow_dispatch:        # 支持手动触发测试
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL_NAME: ${{ secrets.OPENROUTER_MODEL_NAME }}
+      # 推送后端三选一（优先级：WxPusher > PushPlus > 企业微信）
+      WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+      WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      # WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      PUSH_TOP_N: "20"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 执行推送
+        run: python scripts/daily_push.py
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 3
