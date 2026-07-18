@@ -648,6 +648,9 @@ def llm_filter_node(state: AgentState) -> dict:
         except Exception as e:
             logger.warning(f"LLM 并行超时: {e}")
         finally:
+            # 取消未完成的 futures（运行中的线程无法中断，由 daily_push 的 os._exit 兜底）
+            for f in futures:
+                f.cancel()
             executor.shutdown(wait=False)
 
         # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
