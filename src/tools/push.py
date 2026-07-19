@@ -28,6 +28,63 @@ PUSHPLUS_API = "http://www.pushplus.plus/send"
 WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
 
 
+def _extract_title_core(title: str) -> str:
+    """提取标题核心内容：去掉【】()等括号内容及标点空格，用于相似度比较"""
+    import re
+    # 去掉【...】、(...)、（...）等括号包裹的前缀/后缀
+    t = re.sub(r'[【】\[\]()（）{}<>《》]', '', title)
+    # 去掉所有标点和空白
+    t = re.sub(r'[^\w\u4e00-\u9fff]', '', t)
+    return t
+
+
+def _title_similarity(t1: str, t2: str) -> float:
+    """基于字符集合的 Jaccard 相似度（0-1）"""
+    s1, s2 = set(t1), set(t2)
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+
+def dedup_ranked_by_title(ranked_news: list, threshold: float = 0.6) -> list:
+    """排序后标题相似度去重：保留排名靠前的，去掉后续相似标题
+
+    Args:
+        ranked_news: 已排序的资讯列表
+        threshold: 标题核心内容 Jaccard 相似度阈值，超过则判定重复
+
+    Returns:
+        去重后的列表（保持原排序）
+    """
+    if not ranked_news:
+        return ranked_news
+    kept = []
+    kept_cores = []
+    removed = 0
+    for news in ranked_news:
+        title = news.get("title", "")
+        core = _extract_title_core(title)
+        is_dup = False
+        for kc in kept_cores:
+            # 判定重复：Jaccard 相似度高，或短标题核心是长标题核心的子串
+            if _title_similarity(core, kc) >= threshold:
+                is_dup = True
+                break
+            # 子串包含：短标题(>=6字)完全包含在长标题中
+            shorter, longer = (core, kc) if len(core) <= len(kc) else (kc, core)
+            if len(shorter) >= 6 and shorter in longer:
+                is_dup = True
+                break
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(news)
+            kept_cores.append(core)
+    if removed > 0:
+        logger.info(f"推送前标题去重: {len(ranked_news)} -> {len(kept)}条, 去除{removed}条重复")
+    return kept
+
+
 def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股资讯日报") -> str:
     """将排名后的资讯格式化为 Markdown 文本
 
@@ -63,19 +120,25 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         band = n.get("impact_band", "neutral")
         direction = n.get("impact_direction", "neutral")
         score = n.get("market_impact_score", 0)
-        total = n.get("total_score", 0)
-        conf = n.get("confidence", "medium")
         sectors = n.get("affected_sectors", [])
         sector_str = "、".join(sectors[:2]) if sectors else "—"
+        stocks = n.get("affected_stocks", [])
+        stock_str = "、".join(stocks[:3]) if stocks else ""
+        reason = (n.get("impact_reason", "") or "").strip()[:80]
 
         icon = dir_icon.get(direction, "—")
         band_label = band_icon.get(band, band)
-        conf_label = {"high": "高", "medium": "中", "low": "低"}.get(conf, conf)
 
-        lines.append(
-            f"**{i}. {icon} [{band_label}] {n_title}**\n\n"
-            f"> 影响分: {score:.1f} | 综合分: {total:.4f} | 置信: {conf_label} | 板块: {sector_str}\n"
-        )
+        # 第一行：序号 + 方向 + band + 标题
+        lines.append(f"**{i}. {icon}[{band_label}] {n_title}**\n")
+        # 第二行：板块 + 个股 + 影响分
+        meta_parts = [f"板块: {sector_str}", f"影响分: {score:.1f}"]
+        if stock_str:
+            meta_parts.append(f"个股: {stock_str}")
+        lines.append(f"> {' | '.join(meta_parts)}\n")
+        # 第三行：影响逻辑（如果有）
+        if reason:
+            lines.append(f"> {reason}\n")
 
     # 截断到 39000 字（WxPusher 支持 40000 字，留 1000 字给标题和边距）
     # 注意：PushPlus 免费版限 5000 字，调用方需自行选择后端
@@ -236,6 +299,8 @@ def push_news(
     Returns:
         推送结果 dict
     """
+    # 推送前标题相似度去重（保留排名靠前的）
+    ranked_news = dedup_ranked_by_title(ranked_news)
     content = format_ranked_news_md(ranked_news, top_n=top_n, title=title)
 
     if wxpusher_token and wxpusher_uid:
