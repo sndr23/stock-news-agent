@@ -19,6 +19,7 @@
 """
 import os
 import sys
+import json
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -158,6 +159,24 @@ def main():
     # WxPusher 成功 code=1000，PushPlus 成功 code=200，企业微信成功 errcode=0
     if push_result.get("code") in (200, 1000) or push_result.get("errcode") == 0:
         logger.info("推送成功")
+        # 保存历史推送记录到 logs/（会被 artifact 上传，方便回溯）
+        try:
+            history_dir = PROJECT_ROOT / "logs" / "history"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(BJT).strftime("%Y-%m-%d_%H-%M")
+            history_path = history_dir / f"push_{ts}.json"
+            history_data = {
+                "pushed_at": ts,
+                "title": title,
+                "total_count": len(ranked),
+                "pushed_count": min(len(ranked), top_n),
+                "news": ranked,
+            }
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(history_data, f, ensure_ascii=False, indent=2, default=str)
+            logger.info(f"历史记录已保存: {history_path.name}")
+        except Exception as e:
+            logger.warning(f"保存历史记录失败(不影响推送): {e}")
         _force_exit(0)
     else:
         logger.error(f"推送失败: {push_result}")

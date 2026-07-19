@@ -17,7 +17,15 @@ A股资讯业务计算工具
 """
 from typing import TypedDict
 from datetime import datetime
+from pathlib import Path
+import json
+import logging
 import math
+
+logger = logging.getLogger(__name__)
+
+# 关注股票列表缓存
+_watchlist_cache = None
 
 
 class RankedNewsItem(TypedDict):
@@ -608,6 +616,30 @@ def _downgrade_band(band: str) -> str:
     return order[min(idx + 1, len(order) - 1)]
 
 
+def _load_watchlist():
+    """加载自定义关注股票/板块列表（缓存，来自 watchlist.json）"""
+    global _watchlist_cache
+    if _watchlist_cache is not None:
+        return _watchlist_cache
+    try:
+        watchlist_path = Path(__file__).parent.parent / "watchlist.json"
+        if watchlist_path.exists():
+            with open(watchlist_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _watchlist_cache = {
+                "stocks": set(data.get("stocks", [])),
+                "sectors": set(data.get("sectors", [])),
+            }
+            if _watchlist_cache["stocks"] or _watchlist_cache["sectors"]:
+                logger.info(f"关注列表已加载: {len(_watchlist_cache['stocks'])}只个股, {len(_watchlist_cache['sectors'])}个板块")
+        else:
+            _watchlist_cache = {"stocks": set(), "sectors": set()}
+    except Exception as e:
+        logger.warning(f"加载 watchlist.json 失败: {e}")
+        _watchlist_cache = {"stocks": set(), "sectors": set()}
+    return _watchlist_cache
+
+
 def _is_hs300_stock(stock_name: str, stock_code: str, hs300: dict) -> bool:
     """判断个股是否在沪深300成分股中。
 
@@ -732,6 +764,25 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     elif is_st_delist and direction == "bearish":
         # 沪深300的 ST（罕见）或无个股信息的 ST：保留原降权
         total = round(total * 0.85, 4)
+
+    # ---- 自定义关注股票/板块加权 ----
+    watchlist = _load_watchlist()
+    if watchlist["stocks"] or watchlist["sectors"]:
+        hit_watchlist = False
+        # 检查个股命中（affected_stocks + stock_name）
+        stocks_to_check = list(affected_stocks) + ([stock_name] if stock_name else [])
+        for s in stocks_to_check:
+            if s and s in watchlist["stocks"]:
+                hit_watchlist = True
+                break
+        # 检查板块命中
+        if not hit_watchlist:
+            for sec in news.get("affected_sectors", []) or []:
+                if sec in watchlist["sectors"]:
+                    hit_watchlist = True
+                    break
+        if hit_watchlist:
+            total = round(total * 1.2, 4)
 
     # 封顶
     if total > 0.99:
