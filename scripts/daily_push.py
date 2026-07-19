@@ -32,7 +32,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME
 from src.agent.graph import run_agent
-from src.tools.push import push_news
+from src.tools.push import push_news, push_via_wxpusher, push_via_pushplus, push_via_wecom
 
 # 北京时间
 BJT = timezone(timedelta(hours=8))
@@ -51,15 +51,49 @@ def _force_exit(code: int):
     os._exit(code)
 
 
+def _send_alert(push_config: dict, alert_msg: str):
+    """发送简短告警消息（pipeline失败/推送失败时用）
+
+    与正常推送独立，发一条简短文本消息确保用户能收到失败通知
+    """
+    title = "A股资讯Agent告警"
+    content = f"## {title}\n\n{alert_msg}"
+    try:
+        if push_config.get("wxpusher_token") and push_config.get("wxpusher_uid"):
+            push_via_wxpusher(
+                push_config["wxpusher_token"],
+                push_config["wxpusher_uid"],
+                title, content,
+                summary=alert_msg[:20],
+            )
+        elif push_config.get("pushplus_token"):
+            push_via_pushplus(push_config["pushplus_token"], title, content)
+        elif push_config.get("wecom_webhook"):
+            push_via_wecom(push_config["wecom_webhook"], title, content)
+        logger.info(f"告警已发送: {alert_msg[:50]}")
+    except Exception as e:
+        logger.error(f"告警发送失败: {e}")
+
+
 def _build_title() -> str:
-    """按当前时段生成推送标题"""
+    """按当前时段生成推送标题，附带延迟标注（GitHub Actions cron 可能有延迟）"""
     now = datetime.now(BJT)
     hour = now.hour
     date_str = now.strftime("%m-%d")
+
     if hour < 12:
-        return f"A股盘前资讯 {date_str} 09:00"
+        base_title = f"A股盘前资讯 {date_str} 09:00"
+        expected = now.replace(hour=9, minute=0, second=0, microsecond=0)
     else:
-        return f"A股盘后资讯 {date_str} 15:30"
+        base_title = f"A股盘后资讯 {date_str} 15:30"
+        expected = now.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # 延迟超过30分钟则在标题标注
+    delay_min = (now - expected).total_seconds() / 60
+    if delay_min > 30:
+        base_title += f" (延迟{int(delay_min)}分钟)"
+
+    return base_title
 
 
 def main():
@@ -84,6 +118,14 @@ def main():
         logger.error("未配置推送后端：需要 PUSHPLUS_TOKEN 或 WXPUSHER_TOKEN+WXPUSHER_UID 或 WECOM_WEBHOOK")
         sys.exit(1)
 
+    # 推送配置（告警用）
+    push_config = {
+        "pushplus_token": pushplus_token or None,
+        "wxpusher_token": wxpusher_token or None,
+        "wxpusher_uid": wxpusher_uid or None,
+        "wecom_webhook": wecom_webhook or None,
+    }
+
     logger.info(f"开始执行每日推送: {title}")
 
     # 运行 pipeline
@@ -91,36 +133,19 @@ def main():
         result = run_agent(data_mode="live", thread_id=f"push_{datetime.now(BJT).strftime('%Y%m%d_%H%M')}")
     except Exception as e:
         logger.error(f"Pipeline 运行失败: {e}", exc_info=True)
-        # 即使 pipeline 失败也推送错误通知
-        push_news(
-            [],
-            pushplus_token=pushplus_token or None,
-            wxpusher_token=wxpusher_token or None,
-            wxpusher_uid=wxpusher_uid or None,
-            wecom_webhook=wecom_webhook or None,
-            top_n=1,
-            title=f"{title} - 运行失败",
-        )
+        _send_alert(push_config, f"Pipeline运行失败: {str(e)[:80]}")
         _force_exit(1)
 
     ranked = result.get("ranked_news", [])
     if not ranked:
         logger.warning("Pipeline 返回空结果")
-        push_news(
-            [],
-            pushplus_token=pushplus_token or None,
-            wxpusher_token=wxpusher_token or None,
-            wxpusher_uid=wxpusher_uid or None,
-            wecom_webhook=wecom_webhook or None,
-            top_n=1,
-            title=f"{title} - 无资讯",
-        )
+        _send_alert(push_config, "Pipeline返回空结果，今日无资讯可推送")
         _force_exit(0)
 
     logger.info(f"Pipeline 完成，共 {len(ranked)} 条资讯，推送前 {top_n} 条")
 
     # 推送
-    result = push_news(
+    push_result = push_news(
         ranked,
         pushplus_token=pushplus_token or None,
         wxpusher_token=wxpusher_token or None,
@@ -131,11 +156,13 @@ def main():
     )
 
     # WxPusher 成功 code=1000，PushPlus 成功 code=200，企业微信成功 errcode=0
-    if result.get("code") in (200, 1000) or result.get("errcode") == 0:
+    if push_result.get("code") in (200, 1000) or push_result.get("errcode") == 0:
         logger.info("推送成功")
         _force_exit(0)
     else:
-        logger.error(f"推送失败: {result}")
+        logger.error(f"推送失败: {push_result}")
+        # 推送失败告警：尝试发简短消息通知用户
+        _send_alert(push_config, f"推送失败({len(ranked)}条资讯未送达): {str(push_result)[:60]}")
         _force_exit(1)
 
 
