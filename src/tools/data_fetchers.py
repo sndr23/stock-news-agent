@@ -235,7 +235,11 @@ AKSHARE_TIMEOUT = 20
 
 
 def _fetch_em_news():
-    """东财全球财经快讯 (stock_info_global_em)"""
+    """东财全球财经快讯 (stock_info_global_em)
+
+    akshare 固定返回最近200条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据，
+    避免零点后或非交易日运行时当日数据过少。
+    """
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
@@ -244,7 +248,7 @@ def _fetch_em_news():
         news = []
         for _, row in df.iterrows():
             pub_time = str(row.get("发布时间", ""))
-            if not _is_today(pub_time):
+            if not _in_news_window(pub_time, look_back_days=1):
                 continue
             news.append({
                 "title": str(row.get("标题", "")),
@@ -309,8 +313,9 @@ def _fetch_cls_news():
             except (ValueError, TypeError):
                 continue
 
-            # 只保留今日电报
-            if pub_date != today_str:
+            # 保留今天+昨天的电报（财联社API只返回20条，零点后当日可能只有1-2条）
+            yesterday_str = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y-%m-%d")
+            if pub_date not in (today_str, yesterday_str):
                 continue
 
             # 标题: 优先 title 字段，没有则取 content 前40字
@@ -338,7 +343,10 @@ def _fetch_cls_news():
 
 
 def _fetch_sina_news():
-    """新浪财经全球快讯 (stock_info_global_sina)"""
+    """新浪财经全球快讯 (stock_info_global_sina)
+
+    akshare 固定返回最近20条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
+    """
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
@@ -347,7 +355,7 @@ def _fetch_sina_news():
         news = []
         for _, row in df.iterrows():
             pub_time = str(row.get("时间", ""))
-            if not _is_today(pub_time):
+            if not _in_news_window(pub_time, look_back_days=1):
                 continue
             content = str(row.get("内容", ""))
             title = content[:30] + ("..." if len(content) > 30 else "")
@@ -369,7 +377,10 @@ def _fetch_sina_news():
 
 
 def _fetch_ths_news():
-    """同花顺全球快讯 (stock_info_global_ths)"""
+    """同花顺全球快讯 (stock_info_global_ths)
+
+    akshare 固定返回最近20条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
+    """
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
@@ -378,7 +389,7 @@ def _fetch_ths_news():
         news = []
         for _, row in df.iterrows():
             pub_time = str(row.get("发布时间", ""))
-            if not _is_today(pub_time):
+            if not _in_news_window(pub_time, look_back_days=1):
                 continue
             news.append({
                 "title": str(row.get("标题", "")),
