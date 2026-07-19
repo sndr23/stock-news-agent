@@ -253,7 +253,11 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条�
 - band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
 - 含明确多空信号的严禁判 neutral/mixed
 - 科技板块资讯以"对科技板块的影响"判定方向
-- 噪音（庆典/八卦/软文）不输出到 filtered_news，计入 removed_count
+- 噪音不输出到 filtered_news，计入 removed_count。噪音定义：
+  - 庆典/八卦/软文/公关稿
+  - 与A股无直接关联的纯国际资讯（如海外天气、非涉华国际事件）
+  - 纯宏观经济评论（无具体板块/个股影响逻辑）
+  - 重复报道同一事件（只保留信息量最大的一条）
 
 请以JSON格式返回（只返回JSON）:
 ```json
