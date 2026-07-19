@@ -409,29 +409,40 @@ def _fetch_ths_news():
 
 
 def _fetch_announcements():
-    """交易所公告 (stock_notice_report)"""
+    """交易所公告 (stock_notice_report)
+
+    查询最近3天的公告并合并去重，确保非交易日运行时也能获取到最近交易日的公告。
+    交易日盘后某一天可能有 1000+ 条公告，盘前/非交易日可能只有几十条。
+    """
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
-        today = datetime.now(BJT).strftime("%Y%m%d")
-        yesterday = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y%m%d")
-        # 尝试今天和前一天的公告（周一盘后需含周五公告）
-        df = None
-        for date_try in [today, yesterday]:
+        now = datetime.now(BJT)
+        # 查询最近3天的公告（覆盖周末：周一运行时能拿到周五+周六的公告）
+        dates_to_query = [(now - timedelta(days=i)).strftime("%Y%m%d") for i in range(3)]
+
+        all_dfs = []
+        for date_try in dates_to_query:
             try:
                 df = ak.stock_notice_report(symbol="全部", date=date_try)
                 if df is not None and len(df) > 0:
-                    break
+                    all_dfs.append(df)
             except Exception:
                 continue
-        if df is None or len(df) == 0:
+        if not all_dfs:
             return []
+
+        # 合并多天公告并去重（按 代码+公告标题+公告日期 去重）
+        import pandas as pd
+        merged_df = pd.concat(all_dfs, ignore_index=True)
+        merged_df = merged_df.drop_duplicates(subset=["代码", "公告标题", "公告日期"], keep="first")
+
         announcements = []
-        for _, row in df.iterrows():
+        for _, row in merged_df.iterrows():
             pub_time = str(row.get("公告日期", ""))
-            # 保留查询窗口内的公告（今天+昨天，避免周一丢失周五公告）
-            if not _in_news_window(pub_time, look_back_days=1):
+            # 保留最近3天窗口内的公告
+            if not _in_news_window(pub_time, look_back_days=3):
                 continue
             announcements.append({
                 "code": str(row.get("代码", "")),
@@ -441,7 +452,7 @@ def _fetch_announcements():
                 "content": str(row.get("公告标题", "")),
                 "published_at": pub_time
             })
-        logger.info(f"交易所公告: 当日{len(announcements)}条")
+        logger.info(f"交易所公告: 查询{len(dates_to_query)}天, 合并去重后{len(announcements)}条")
         return announcements
     except Exception as e:
         logger.warning(f"交易所公告获取失败: {e}")
