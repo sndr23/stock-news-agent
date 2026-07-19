@@ -21,13 +21,16 @@ env/
 .env.*
 !.env.example
 
-# 日志
-logs/
-*.log
+# 日志（保留 history 子目录用于历史推送记录）
+logs/*.log
+logs/*.log.*
+logs/!history/
 
 # IDE / 编辑器
 .idea/
 .vscode/
+.trae-cn/
+.trae/
 *.swp
 
 # 操作系统

@@ -77,13 +77,14 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
         except Exception as e:
             last_error = str(e)
             logger.warning(f"第{attempt+1}次调用失败: {e}")
+        finally:
+            session.close()
 
         if attempt < max_retries:
             # 指数退避: 2s, 4s
             wait_time = 2 ** (attempt + 1)
             logger.info(f"等待 {wait_time}s 后重试...")
             time.sleep(wait_time)
-        session.close()
 
     raise Exception(f"LLM API 调用失败，已重试 {max_retries} 次: {last_error}")
 
@@ -218,6 +219,10 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     for news in kept:
         news.pop("_prefilter_score", None)
         news.pop("_prefilter_category", None)
+        # 清理所有以 _ 开头的临时字段，防止泄漏到 LLM 输入
+        for key in list(news.keys()):
+            if key.startswith("_"):
+                news.pop(key, None)
 
     total_removed = dup_count + (len(deduped) - len(kept))
     return kept, total_removed
@@ -318,12 +323,15 @@ def _safe_parse_json(content: str) -> dict:
     import re
     cleaned = content
     cleaned = cleaned.replace('\u0000', '')  # 移除null字符
-    cleaned = re.sub(r'[^\x20-\x7E\xA0-\xFF\u4e00-\u9fff]', ' ', cleaned)  # 保留可见字符和中文字符
-
+    # 先提取代码块（避免代码块标记被破坏）
     if "```json" in cleaned:
         cleaned = cleaned.split("```json")[1].split("```")[0]
     elif "```" in cleaned:
         cleaned = cleaned.split("```")[1].split("```")[0]
+    # 先修复中文标点（中文引号/冒号/逗号等），再做不可见字符清理
+    cleaned = _repair_json(cleaned)
+    # 清理不可见字符，但保留中文引号/标点（已转换为ASCII）和中文汉字
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cleaned)
 
     cleaned = cleaned.strip()
 
@@ -377,11 +385,11 @@ def _safe_parse_json(content: str) -> dict:
 
 BAND_SCORE_RANGE = {
     ImpactBand.BULLISH: (6.5, 10.0),
-    ImpactBand.MILDLY_BULLISH: (5.5, 6.4),
-    ImpactBand.NEUTRAL: (4.5, 5.5),
-    ImpactBand.MIXED: (4.5, 5.5),
-    ImpactBand.MILDLY_BEARISH: (3.5, 4.4),
-    ImpactBand.BEARISH: (0.0, 3.4),
+    ImpactBand.MILDLY_BULLISH: (5.5, 6.499),
+    ImpactBand.NEUTRAL: (4.5, 5.499),
+    ImpactBand.MIXED: (4.5, 5.499),
+    ImpactBand.MILDLY_BEARISH: (3.5, 4.499),
+    ImpactBand.BEARISH: (0.0, 3.499),
 }
 
 
@@ -424,7 +432,10 @@ def _apply_guardrails(items: list) -> list:
             except ValueError:
                 band = ImpactBand.NEUTRAL
             lo, hi = BAND_SCORE_RANGE[band]
-            score = float(item.get("market_impact_score", 3.0))
+            try:
+                score = float(item.get("market_impact_score", 3.0))
+            except (ValueError, TypeError):
+                score = 3.0
             if not (lo <= score <= hi):
                 band = _band_from_score(score)
             item["impact_band"] = band.value
@@ -438,16 +449,21 @@ def _build_llm():
 
     max_tokens=16384: 推理模型(agnes-2.0-flash)的 reasoning_tokens 会占用大量额度，
     4096 时几乎全部用于推理导致 JSON 输出被截断。提升到 16384 确保推理+文本输出都有空间。
-    reasoning_effort="low": 尽量减少推理开销，让更多 token 用于实际 JSON 输出。
+    reasoning_effort="low": 仅对推理模型(agnes/o1/deepseek-r1)生效，减少推理开销。
     """
     from langchain_openai import ChatOpenAI
+    # 仅推理模型传 reasoning_effort（Gemini 等非推理模型会拒绝该参数）
+    reasoning_models = ("agnes", "o1", "o3", "deepseek-r1", "deepseek-reasoner")
+    extra_body = {}
+    if any(m in OPENROUTER_MODEL_NAME.lower() for m in reasoning_models):
+        extra_body["reasoning_effort"] = "low"
     return ChatOpenAI(
         model=OPENROUTER_MODEL_NAME,
         api_key=OPENROUTER_API_KEY,
         base_url=OPENROUTER_BASE_URL,
-        temperature=0.3,
+        temperature=0.1,  # 结构化输出场景降低温度提升一致性
         max_tokens=16384,
-        extra_body={"reasoning_effort": "low"},
+        extra_body=extra_body,
     )
 
 
@@ -457,8 +473,8 @@ def _build_analysis_prompt(news_batch: list) -> str:
     for n in news_batch:
         item = dict(n)
         content = item.get("content", "")
-        if len(content) > 100:
-            item["content"] = content[:100] + "..."
+        if len(content) > 300:
+            item["content"] = content[:300] + "..."
         truncated_batch.append(item)
 
     return ANALYSIS_PROMPT.format(
@@ -516,7 +532,7 @@ def prefilter_node(state: AgentState) -> dict:
     logger = logging.getLogger(__name__)
 
     raw_news = state.get("raw_news", [])
-    prefiltered, py_removed = _python_prefilter(raw_news, top_n=30)
+    prefiltered, py_removed = _python_prefilter(raw_news, top_n=_PREFILTER_TOTAL_LIMIT)
 
     logger.info(f"[prefilter] Python预过滤: 原始{len(raw_news)}条 -> 保留{len(prefiltered)}条, 去除{py_removed}条")
 
@@ -655,7 +671,10 @@ def llm_filter_node(state: AgentState) -> dict:
             # 取消未完成的 futures（运行中的线程无法中断，由 daily_push 的 os._exit 兜底）
             for f in futures:
                 f.cancel()
-            executor.shutdown(wait=False)
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
 
         # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
         for idx in range(len(batches)):
@@ -683,13 +702,21 @@ def llm_filter_node(state: AgentState) -> dict:
 
     # 3. 结果合并: 使用 LLM 结果中的 impact 字段更新原始 news 对象, 保留原始所有的属性(解决丢失问题)
     final_filtered = []
+    # 用 (title, published_at) 复合 key 避免同标题碰撞
+    llm_results_by_key = {}
+    for n in all_llm_results:
+        key = (n.get("title", "").strip(), str(n.get("published_at", "")))
+        llm_results_by_key[key] = n
+    # 同时保留 title-only 索引作为兜底（LLM 可能截断 published_at）
     llm_results_by_title = {n.get("title", "").strip(): n for n in all_llm_results}
 
     for news in prefiltered:
         title = news.get("title", "").strip()
-        if title in llm_results_by_title:
+        pub = str(news.get("published_at", ""))
+        # 优先复合 key 匹配，其次 title 匹配
+        llm_res = llm_results_by_key.get((title, pub)) or llm_results_by_title.get(title)
+        if llm_res:
             # LLM 没有认为是噪音，合并字段
-            llm_res = llm_results_by_title[title]
 
             # 信号情报: 方向已由交易所官方数据锁定, 不被 LLM 覆盖
             if news.get("category") == "signal":
@@ -698,6 +725,14 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["affected_stocks"] = llm_res.get("affected_stocks", news.get("affected_stocks", []))
                 if llm_res.get("impact_reason"):
                     news["impact_reason"] = llm_res["impact_reason"]
+                # 根据 direction 同步 impact_band（否则下游 rank_news 默认 neutral 导致排名偏低）
+                direction = news.get("impact_direction", "neutral")
+                if direction == "bullish":
+                    news["impact_band"] = "bullish"
+                elif direction == "bearish":
+                    news["impact_band"] = "bearish"
+                else:
+                    news["impact_band"] = "neutral"
                 # impact_direction / sentiment 保持信号情报原始值
                 final_filtered.append(news)
                 continue

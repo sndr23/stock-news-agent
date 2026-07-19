@@ -10,10 +10,15 @@ on:
     - cron: "30 7 * * 1-5"   # UTC 07:30 = BJT 15:30 周一到周五
   workflow_dispatch:        # 支持手动触发测试
 
+# 防止 cron 延迟导致两个时段的推送并发执行
+concurrency:
+  group: daily-push
+  cancel-in-progress: false
+
 jobs:
   push:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     env:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -22,7 +27,7 @@ jobs:
       WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
       WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-      # WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       PUSH_TOP_N: "20"
 
     steps:
@@ -39,6 +44,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-cloud.txt
+          pip install chinese_calendar
+
+      - name: 运行单元测试
+        run: python -m pytest tests/test_rank.py tests/test_schemas.py tests/test_prefilter.py tests/test_dedup.py tests/test_state.py tests/test_prefilter_flow.py -q
 
       - name: 执行推送
         run: python scripts/daily_push.py
@@ -49,4 +58,5 @@ jobs:
         with:
           name: agent-log-${{ github.run_id }}
           path: logs/
-          retention-days: 3
+          retention-days: 7
+          if-no-files-found: ignore
