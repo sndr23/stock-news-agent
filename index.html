@@ -150,6 +150,16 @@
                     <span id="runBtnText">获取当日资讯并排名</span>
                 </button>
 
+                <!-- 预览推送按钮 -->
+                <button id="previewBtn"
+                    class="w-full mt-2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2 rounded-lg transition-all text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled>
+                    <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                    </svg>
+                    预览推送格式
+                </button>
+
                 <!-- 统计概览 -->
                 <div id="statsBox" class="mt-5 hidden">
                     <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">处理概览</h3>
@@ -209,6 +219,7 @@
                                 <th class="py-3 px-2">标题</th>
                                 <th class="py-3 px-2 w-28">来源</th>
                                 <th class="py-3 px-2 w-32">时间</th>
+                                <th class="py-3 px-2 w-20 text-center">Band</th>
                                 <th class="py-3 px-2 w-20 text-center">方向</th>
                                 <th class="py-3 px-2 w-32">影响板块</th>
                                 <th class="py-3 px-2 w-40">综合分</th>
@@ -241,6 +252,7 @@
                     <h3 id="modalTitle" class="text-lg font-bold text-gray-800 leading-snug"></h3>
                     <div class="flex flex-wrap items-center gap-2 mt-2">
                         <span id="modalSource"></span>
+                        <span id="modalBand"></span>
                         <span id="modalDirection"></span>
                         <span id="modalTime" class="text-xs text-gray-400"></span>
                     </div>
@@ -297,6 +309,27 @@
         </div>
     </div>
 
+    <!-- 推送预览弹窗 -->
+    <div id="pushPreviewModal" class="fixed inset-0 z-50 hidden items-center justify-center modal-backdrop p-4">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[88vh] flex flex-col">
+            <div class="flex items-start justify-between p-5 border-b border-gray-100">
+                <div class="flex-1">
+                    <h3 class="text-lg font-bold text-gray-800">推送格式预览</h3>
+                    <p class="text-xs text-gray-400 mt-1">以下为微信推送的实际 Markdown 内容</p>
+                </div>
+                <button id="pushPreviewClose"
+                    class="flex-shrink-0 w-8 h-8 rounded-full hover:bg-gray-100 flex items-center justify-center text-gray-400 hover:text-gray-600 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            <div class="p-5 overflow-y-auto scrollbar-thin flex-1">
+                <pre id="pushPreviewContent" class="text-sm text-gray-700 leading-relaxed bg-gray-50 rounded-lg p-4 whitespace-pre-wrap font-mono"></pre>
+            </div>
+        </div>
+    </div>
+
     <script>
         // ===== 配置 =====
         const API_BASE = ''; // 同源访问
@@ -306,6 +339,16 @@
             bullish: { label: '利好', cls: 'bg-red-100 text-red-700 border border-red-200' },
             bearish: { label: '利空', cls: 'bg-green-100 text-green-700 border border-green-200' },
             neutral: { label: '中性', cls: 'bg-gray-100 text-gray-600 border border-gray-200' }
+        };
+
+        // 6-band 样式（A股红涨绿跌）
+        const BAND_META = {
+            bullish:         { label: '强多',     cls: 'bg-red-500 text-white' },
+            mildly_bullish:  { label: '偏多',     cls: 'bg-red-100 text-red-700' },
+            neutral:         { label: '中性',     cls: 'bg-gray-100 text-gray-600' },
+            mixed:           { label: '多空交织', cls: 'bg-yellow-100 text-yellow-700' },
+            mildly_bearish:  { label: '偏空',     cls: 'bg-green-100 text-green-700' },
+            bearish:         { label: '强空',     cls: 'bg-green-500 text-white' },
         };
 
         // 来源徽章配色：财联社=橙、东财=蓝、同花顺=青、新浪=红、交易所公告=紫、交易所信号=绿、其他=灰
@@ -500,6 +543,7 @@
                 const tf = (n.time_factor ?? 0);
                 const total = (n.total_score ?? 0);
                 const dir = DIRECTION_META[n.impact_direction] || DIRECTION_META.neutral;
+                const band = BAND_META[n.impact_band] || BAND_META.neutral;
                 const rankCls = i < 3 ? rankColors[i] : 'text-gray-500';
                 const title = n.title || '（无标题）';
                 const src = sourceBadge(n.source);
@@ -520,6 +564,9 @@
                         <span class="inline-block text-xs px-2 py-0.5 rounded-full line-clamp-1 ${src.cls}" title="${escapeHtml(src.label)}">${escapeHtml(src.label)}</span>
                     </td>
                     <td class="py-3 px-2 align-top text-gray-500 text-xs whitespace-nowrap">${escapeHtml(time)}</td>
+                    <td class="py-3 px-2 align-top text-center">
+                        <span class="inline-block text-xs px-2 py-0.5 rounded-full font-medium ${band.cls}">${band.label}</span>
+                    </td>
                     <td class="py-3 px-2 align-top text-center">
                         <span class="inline-block text-xs px-2 py-0.5 rounded-full ${dir.cls}">${dir.label}</span>
                     </td>
@@ -570,6 +617,12 @@
             const dirEl = document.getElementById('modalDirection');
             dirEl.className = `inline-block text-xs px-2 py-0.5 rounded-full ${dir.cls}`;
             dirEl.textContent = dir.label;
+
+            // Band
+            const band = BAND_META[n.impact_band] || BAND_META.neutral;
+            const bandEl = document.getElementById('modalBand');
+            bandEl.className = `inline-block text-xs px-2 py-0.5 rounded-full font-medium ${band.cls}`;
+            bandEl.textContent = `Band: ${band.label}`;
 
             // 时间
             document.getElementById('modalTime').textContent = n.published_at || '';
@@ -711,8 +764,68 @@
                 isRunning = false;
                 btn.disabled = false;
                 btnText.textContent = '获取资讯并排名';
+                // 有结果时启用预览按钮
+                const previewBtn = document.getElementById('previewBtn');
+                if (currentRanked && currentRanked.length > 0) {
+                    previewBtn.disabled = false;
+                }
             }
         }
+
+        // ===== 推送格式预览 =====
+        function generatePushPreview(rankedNews, topN = 20) {
+            const dirIcon = { bullish: '▲', bearish: '▼', neutral: '—' };
+            const bandIcon = {
+                bullish: '强多', mildly_bullish: '偏多', neutral: '中性',
+                mixed: '多空交织', mildly_bearish: '偏空', bearish: '强空',
+            };
+            const now = new Date();
+            const dateStr = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const hour = now.getHours();
+            const title = hour < 12 ? `A股盘前资讯 ${dateStr} 09:00` : `A股盘后资讯 ${dateStr} 15:30`;
+
+            let lines = [`## ${title}\n`];
+            rankedNews.slice(0, topN).forEach((n, i) => {
+                const nTitle = (n.title || '').slice(0, 60);
+                const band = bandIcon[n.impact_band] || n.impact_band || '中性';
+                const direction = n.impact_direction || 'neutral';
+                const score = n.market_impact_score ?? 0;
+                const sectors = Array.isArray(n.affected_sectors) ? n.affected_sectors : [];
+                const sectorStr = sectors.slice(0, 2).join('、') || '—';
+                const stocks = Array.isArray(n.affected_stocks) ? n.affected_stocks : [];
+                const stockStr = stocks.slice(0, 3).join('、');
+                const reason = (n.impact_reason || '').trim().slice(0, 80);
+                const icon = dirIcon[direction] || '—';
+
+                lines.push(`**${i + 1}. ${icon}[${band}] ${nTitle}**\n`);
+                let meta = `> 板块: ${sectorStr} | 影响分: ${score.toFixed(1)}`;
+                if (stockStr) meta += ` | 个股: ${stockStr}`;
+                lines.push(`${meta}\n`);
+                if (reason) lines.push(`> ${reason}\n`);
+            });
+            return lines.join('\n');
+        }
+
+        function showPushPreview() {
+            if (!currentRanked || currentRanked.length === 0) return;
+            const content = generatePushPreview(currentRanked);
+            document.getElementById('pushPreviewContent').textContent = content;
+            const modal = document.getElementById('pushPreviewModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closePushPreview() {
+            const modal = document.getElementById('pushPreviewModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        document.getElementById('previewBtn').addEventListener('click', showPushPreview);
+        document.getElementById('pushPreviewClose').addEventListener('click', closePushPreview);
+        document.getElementById('pushPreviewModal').addEventListener('click', (e) => {
+            if (e.target.id === 'pushPreviewModal') closePushPreview();
+        });
 
         // ===== 初始化 =====
         document.getElementById('runBtn').addEventListener('click', runPipeline);
