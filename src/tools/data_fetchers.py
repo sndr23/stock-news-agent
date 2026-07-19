@@ -10,8 +10,9 @@ import logging
 import threading
 import hashlib
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
@@ -250,44 +251,72 @@ def _fetch_em_news():
 
 
 def _fetch_cls_news():
-    """财联社电报 (stock_info_global_cls)"""
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
+    """财联社电报 (直接调用财联社官方API，不依赖akshare)
+
+    新接口: https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9
+    旧接口 nodeapi/telegraphList 已废弃(404)，akshare 的 stock_info_global_cls 响应极慢/失败
+    新接口返回最近20条电报，无分页参数
+    """
+    BJT = timezone(timedelta(hours=8))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.cls.cn/telegraph",
+    }
+    url = "https://www.cls.cn/api/cache"
+    params = {
+        "app": "CailianpressWeb",
+        "name": "telegraph",
+        "os": "web",
+        "sv": "8.7.9",
+    }
     try:
-        import akshare as ak
-        # 尝试多个可能的 symbol 参数值
-        df = None
-        for sym in ["全部", "财经", ""]:
-            try:
-                df = ak.stock_info_global_cls(symbol=sym)
-                if df is not None and len(df) > 0:
-                    break
-            except Exception:
-                continue
-        if df is None or len(df) == 0:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        roll_data = data.get("data", {}).get("roll_data", [])
+        if not roll_data:
+            logger.warning("财联社电报: API返回空 roll_data")
             return []
+
         news = []
-        for _, row in df.iterrows():
-            pub_date = str(row.get("发布日期", ""))
-            if not _is_today(pub_date):
+        today_str = datetime.now(BJT).strftime("%Y-%m-%d")
+        for item in roll_data:
+            ctime = item.get("ctime", "")
+            if not ctime:
                 continue
-            pub_time = str(row.get("发布时间", ""))
-            published_at = f"{pub_date} {pub_time}" if pub_date else ""
+            try:
+                dt = datetime.fromtimestamp(int(ctime), BJT)
+                pub_date = dt.strftime("%Y-%m-%d")
+                pub_time = dt.strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+
+            # 只保留今日电报
+            if pub_date != today_str:
+                continue
+
+            # 标题: 优先 title 字段，没有则取 content 前40字
+            title = item.get("title", "").strip()
+            content = item.get("content", "").strip()
+            if not title:
+                title = content[:40] + ("..." if len(content) > 40 else "")
+            if not title:
+                continue
+
             news.append({
-                "title": str(row.get("标题", "")),
+                "title": title,
                 "source": "财联社电报",
-                "content": str(row.get("内容", "")),
-                "published_at": published_at,
+                "content": content,
+                "published_at": f"{pub_date} {pub_time}",
                 "category": "news",
-                "sentiment": "neutral"
+                "sentiment": "neutral",
             })
-        logger.info(f"财联社电报: 原始{len(df)}行, 当日{len(news)}条")
+
+        logger.info(f"财联社电报: 原始{len(roll_data)}条, 当日{len(news)}条")
         return news
     except Exception as e:
         logger.warning(f"财联社电报获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_sina_news():
