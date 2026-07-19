@@ -76,6 +76,30 @@ def _send_alert(push_config: dict, alert_msg: str):
         logger.error(f"告警发送失败: {e}")
 
 
+def _is_trading_day() -> bool:
+    """判断今天是否为A股交易日（排除周末，节假日需手动维护或用 chinese_calendar 库）
+
+    优先使用 chinese_calendar 库（如已安装），否则只排除周末。
+    """
+    now = datetime.now(BJT)
+    # 周末一定不交易
+    if now.weekday() >= 5:  # 5=周六, 6=周日
+        return False
+    # 尝试用 chinese_calendar 判断节假日
+    try:
+        import chinese_calendar  # type: ignore
+        return chinese_calendar.is_workday(now)
+    except ImportError:
+        # 未安装 chinese_calendar，仅排除周末
+        # 节假日可能在 .ENV 或环境变量 HOLIDAY_DATES 中配置（逗号分隔 YYYY-MM-DD）
+        holiday_str = os.getenv("HOLIDAY_DATES", "")
+        if holiday_str:
+            holidays = {d.strip() for d in holiday_str.split(",") if d.strip()}
+            if now.strftime("%Y-%m-%d") in holidays:
+                return False
+        return True
+
+
 def _build_title() -> str:
     """按当前时段生成推送标题，附带延迟标注（GitHub Actions cron 可能有延迟）"""
     now = datetime.now(BJT)
@@ -85,6 +109,10 @@ def _build_title() -> str:
     if hour < 12:
         base_title = f"A股盘前资讯 {date_str} 09:00"
         expected = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    elif hour < 15:
+        # 12:00-15:00 为盘中，不标注盘前/盘后
+        base_title = f"A股盘中资讯 {date_str} {hour:02d}:{now.minute:02d}"
+        return base_title
     else:
         base_title = f"A股盘后资讯 {date_str} 15:30"
         expected = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -112,7 +140,11 @@ def main():
     wxpusher_token = os.getenv("WXPUSHER_TOKEN", "").strip()
     wxpusher_uid = os.getenv("WXPUSHER_UID", "").strip()
     wecom_webhook = os.getenv("WECOM_WEBHOOK", "").strip()
-    top_n = int(os.getenv("PUSH_TOP_N", "20"))
+    try:
+        top_n = int(os.getenv("PUSH_TOP_N", "20"))
+    except ValueError:
+        logger.warning(f"PUSH_TOP_N 值无效: {os.getenv('PUSH_TOP_N')}, 使用默认值 20")
+        top_n = 20
     title = os.getenv("PUSH_TITLE", "") or _build_title()
 
     if not pushplus_token and not (wxpusher_token and wxpusher_uid) and not wecom_webhook:
@@ -128,6 +160,11 @@ def main():
     }
 
     logger.info(f"开始执行每日推送: {title}")
+
+    # 非交易日跳过推送（避免节假日浪费 LLM 配额）
+    if not _is_trading_day():
+        logger.info("今日非A股交易日，跳过推送")
+        _force_exit(0)
 
     # 运行 pipeline
     try:

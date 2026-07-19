@@ -280,8 +280,13 @@ def score_news_relevance(item: dict, stock_code: str = "", stock_name: str = "")
         elif stock_name in content:
             score += 28; direct_signal += 28
 
+    # 事件词加分：有 direct_signal 时按设计 +12；无 direct_signal（纯资讯流）时降为 +6
+    # 避免高频词（涨停/跌停）过度加分，但保留有价值的事件信号
     if any(t in text for t in _COMPANY_EVENT_TERMS):
-        score += 12; direct_signal += 12
+        if direct_signal > 0:
+            score += 12; direct_signal += 12
+        else:
+            score += 6
 
     if any(kw in text for kw in TECH_HARDWARE_KEYWORDS):
         score += 10
@@ -293,7 +298,9 @@ def score_news_relevance(item: dict, stock_code: str = "", stock_name: str = "")
         score += 6
 
     is_macro = any(t in text for t in _MACRO_NEWS_TERMS)
-    if is_macro and direct_signal == 0:
+    # 政策性词汇（央行/降准/降息等）不罚分，只有纯宏观评论才罚分
+    has_policy = any(kw in text for kw in POLICY_KEYWORDS)
+    if is_macro and direct_signal == 0 and not has_policy:
         score -= 12
 
     score = max(0, min(100, score))
@@ -506,6 +513,20 @@ def predict_direction_by_rules(title: str, content: str) -> str:
     """通过规则快速兜底判定多空方向"""
     text = f"{title} {content}"
 
+    # 否定词前缀：若关键词前接这些词，方向反转或不触发
+    negation_prefixes = ["不", "未", "取消", "终止", "失败", "撤销"]
+    def _has_negation(kw: str) -> bool:
+        """检查关键词前是否有否定前缀"""
+        idx = text.find(kw)
+        while idx >= 0:
+            for prefix in negation_prefixes:
+                # 检查关键词前 1-4 字是否是否定词
+                before = text[max(0, idx - len(prefix)):idx]
+                if before == prefix:
+                    return True
+            idx = text.find(kw, idx + 1)
+        return False
+
     strong_bullish = [
         "撤销退市", "撤销*ST", "撤销ST", "撤销风险警示", "申请撤销", "摘帽",
         "扭亏为盈", "业绩扭亏", "扭亏",
@@ -516,7 +537,7 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         "并购重组", "重大资产重组", "借壳上市",
     ]
     for kw in strong_bullish:
-        if kw in text:
+        if kw in text and not _has_negation(kw):
             return "bullish"
 
     strong_bearish = [
@@ -530,7 +551,7 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         "出口管制", "制裁", "禁运", "断供", "贸易摩擦",
     ]
     for kw in strong_bearish:
-        if kw in text:
+        if kw in text and not _has_negation(kw):
             return "bearish"
 
     return "neutral"
@@ -554,9 +575,7 @@ SECTOR_NAME_MAP = {
     "白酒": "白酒", "银行": "银行", "房地产": "房地产", "地产": "房地产",
     "军工": "军工", "稀土": "稀土", "煤炭": "煤炭", "钢铁": "钢铁", "有色": "有色金属",
     "消费电子": "消费电子", "汽车": "汽车", "锂电": "锂电池", "氢能": "氢能", "机器人": "机器人",
-    "降准": "银行", "降息": "银行", "货币政策": "银行", "财政政策": "银行",
-    "业绩预增": "新能源", "业绩预减": "新能源", "业绩预告": "新能源",
-    "出口管制": "半导体", "制裁": "半导体", "禁运": "半导体", "断供": "半导体",
+    # 宏观政策词不映射到具体板块（下游作为宏观处理）
 }
 
 
@@ -622,7 +641,8 @@ def _load_watchlist():
     if _watchlist_cache is not None:
         return _watchlist_cache
     try:
-        watchlist_path = Path(__file__).parent.parent / "watchlist.json"
+        # calculators.py 在 src/tools/，需三级 parent 才到项目根
+        watchlist_path = Path(__file__).parent.parent.parent / "watchlist.json"
         if watchlist_path.exists():
             with open(watchlist_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -723,7 +743,14 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     is_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
     is_national_auth = _is_national_authority(news.get("source", ""))
     is_national_policy = _has_national_policy(clean_text)
-    is_st_delist = any(kw in raw_text for kw in ["*ST", "ST", "退市", "终止上市"])
+    # ST/退市检测：用正则精确匹配 *ST/ST 前缀（公司名），避免误命中英文缩写如 STorage/STMicroelectronics
+    import re as _re
+    is_st_delist = bool(
+        _re.search(r'\*ST', raw_text)
+        or _re.search(r'(?<![A-Za-z])ST(?![A-Za-z])', raw_text)  # ST 前后不能是英文字母
+        or "退市" in raw_text
+        or "终止上市" in raw_text
+    )
 
     # ---- 科技板块统一加权 / 非科技统一降权 ----
     # CPO/PCB/半导体等科技硬件词命中：不管利好利空统一显著加成
@@ -769,11 +796,17 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     watchlist = _load_watchlist()
     if watchlist["stocks"] or watchlist["sectors"]:
         hit_watchlist = False
-        # 检查个股命中（affected_stocks + stock_name）
+        # 检查个股命中（affected_stocks + stock_name），支持模糊匹配（如"寒武纪-U"匹配"寒武纪"）
         stocks_to_check = list(affected_stocks) + ([stock_name] if stock_name else [])
         for s in stocks_to_check:
-            if s and s in watchlist["stocks"]:
-                hit_watchlist = True
+            if not s:
+                continue
+            for watch_stock in watchlist["stocks"]:
+                # 精确匹配或包含匹配（处理科创板后缀 -U/-W 等）
+                if s == watch_stock or watch_stock in s or s in watch_stock:
+                    hit_watchlist = True
+                    break
+            if hit_watchlist:
                 break
         # 检查板块命中
         if not hit_watchlist:
@@ -784,10 +817,7 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
         if hit_watchlist:
             total = round(total * 1.2, 4)
 
-    # 封顶
-    if total > 0.99:
-        total = 0.99
-
+    # 不在此处封顶，留给 rank_news 在 confidence 加权后统一封顶
     return total
 
 
@@ -810,6 +840,9 @@ def rank_news(news_list: list) -> list:
 
         conf = news.get("confidence", "medium")
         total = round(total * CONFIDENCE_WEIGHT.get(conf, 0.85), 4)
+        # confidence 加权后统一封顶（避免高分低置信被双重惩罚）
+        if total > 0.99:
+            total = 0.99
 
         band = news.get("impact_band", "neutral")
         direction = news.get("impact_direction", "neutral")

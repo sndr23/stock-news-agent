@@ -17,12 +17,16 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
+# 北京时区（云端 GitHub Actions 运行在 UTC，必须显式指定 BJT 避免日期过滤错位）
+BJT = timezone(timedelta(hours=8))
+
 # ============================================================
 # 线程安全内存缓存 (带 TTL)
 # ============================================================
 _cache = {}
 _cache_lock = threading.Lock()
 _CACHE_TTL_SECONDS = 3600  # 缓存 1 小时过期
+_CACHE_MAX_SIZE = 50  # 最大缓存条目数，防止长期运行 OOM
 
 
 def _get_cache(key: str, today: str):
@@ -43,7 +47,16 @@ def _get_cache(key: str, today: str):
 def _set_cache(key: str, data, today: str):
     import time
     with _cache_lock:
-        _cache[key] = {"date": today, "data": data, "_ts": time.time()}
+        # 清理过期项，防止长期运行内存泄漏
+        now = time.time()
+        expired_keys = [k for k, v in _cache.items() if now - v.get("_ts", 0) >= _CACHE_TTL_SECONDS]
+        for k in expired_keys:
+            _cache.pop(k, None)
+        # 超出容量时清理最早的条目
+        if len(_cache) >= _CACHE_MAX_SIZE:
+            oldest = sorted(_cache.items(), key=lambda x: x[1].get("_ts", 0))[0][0]
+            _cache.pop(oldest, None)
+        _cache[key] = {"date": today, "data": data, "_ts": now}
 
 
 # ============================================================
@@ -55,8 +68,7 @@ def _is_today(published_at: str) -> bool:
     if not published_at or not str(published_at).strip():
         return False
     text = str(published_at).strip()
-    today = datetime.now().strftime("%Y-%m-%d")
-    # 精确匹配 YYYY-MM-DD 格式
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     if text == today:
         return True
     # 匹配 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD HH:MM (要求日期后有空白分隔)
@@ -147,8 +159,7 @@ def _in_news_window(published_at: str, look_back_days: int = 1) -> bool:
     if not published_at or not str(published_at).strip():
         return False
     text = str(published_at).strip()
-    now = datetime.now()
-    # 窗口起点取 look_back_days 天前的 00:00，避免时间分量导致"昨天 00:00"被误判为早于起点
+    now = datetime.now(BJT)
     start = (now - timedelta(days=look_back_days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
@@ -157,6 +168,8 @@ def _in_news_window(published_at: str, look_back_days: int = 1) -> bool:
                 "%Y/%m/%d", "%Y%m%d %H:%M:%S"]:
         try:
             pub_time = datetime.strptime(text, fmt)
+            # strptime 返回 naive datetime，需加 BJT 时区才能与 aware now 比较
+            pub_time = pub_time.replace(tzinfo=BJT)
             if start <= pub_time <= now:
                 return True
             return False
@@ -257,7 +270,6 @@ def _fetch_cls_news():
     旧接口 nodeapi/telegraphList 已废弃(404)，akshare 的 stock_info_global_cls 响应极慢/失败
     新接口返回最近20条电报，无分页参数
     """
-    BJT = timezone(timedelta(hours=8))
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.cls.cn/telegraph",
@@ -273,7 +285,9 @@ def _fetch_cls_news():
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        roll_data = data.get("data", {}).get("roll_data", [])
+        # 防御 API 返回 {"data": null} 的情况
+        data_obj = data.get("data") or {}
+        roll_data = data_obj.get("roll_data") or []
         if not roll_data:
             logger.warning("财联社电报: API返回空 roll_data")
             return []
@@ -285,7 +299,11 @@ def _fetch_cls_news():
             if not ctime:
                 continue
             try:
-                dt = datetime.fromtimestamp(int(ctime), BJT)
+                # 兼容秒级(10位)和毫秒级(13位)时间戳
+                ctime_int = int(ctime)
+                if ctime_int > 1e12:  # 毫秒级
+                    ctime_int = ctime_int // 1000
+                dt = datetime.fromtimestamp(ctime_int, BJT)
                 pub_date = dt.strftime("%Y-%m-%d")
                 pub_time = dt.strftime("%H:%M:%S")
             except (ValueError, TypeError):
@@ -385,10 +403,11 @@ def _fetch_announcements():
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
-        today = datetime.now().strftime("%Y%m%d")
-        # 尝试今天和前一天的公告
+        today = datetime.now(BJT).strftime("%Y%m%d")
+        yesterday = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y%m%d")
+        # 尝试今天和前一天的公告（周一盘后需含周五公告）
         df = None
-        for date_try in [today, (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")]:
+        for date_try in [today, yesterday]:
             try:
                 df = ak.stock_notice_report(symbol="全部", date=date_try)
                 if df is not None and len(df) > 0:
@@ -400,7 +419,8 @@ def _fetch_announcements():
         announcements = []
         for _, row in df.iterrows():
             pub_time = str(row.get("公告日期", ""))
-            if not _is_today(pub_time):
+            # 保留查询窗口内的公告（今天+昨天，避免周一丢失周五公告）
+            if not _in_news_window(pub_time, look_back_days=1):
                 continue
             announcements.append({
                 "code": str(row.get("代码", "")),
@@ -436,9 +456,8 @@ def _fetch_lhb_signal():
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
-        from datetime import datetime, timedelta
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+        end_date = datetime.now(BJT).strftime("%Y%m%d")
+        start_date = (datetime.now(BJT) - timedelta(days=7)).strftime("%Y%m%d")
         df = ak.stock_lhb_jgmmtj_em(start_date=start_date, end_date=end_date)
 
         signals = []
@@ -451,7 +470,8 @@ def _fetch_lhb_signal():
             net_buy_yi = net_buy / 1e8
             direction = "bullish"
             pub_time = str(row.get("上榜日期", ""))
-            if not _is_today(pub_time):
+            # 保留最近3个交易日数据（周末/节假日不丢周五数据）
+            if not _in_news_window(pub_time, look_back_days=3):
                 continue
 
             signals.append({
@@ -501,8 +521,7 @@ def _fetch_yjyg_signal():
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
-        from datetime import datetime
-        today = datetime.now()
+        today = datetime.now(BJT)
         for month_day in [(6, 30), (3, 31), (9, 30), (12, 31)]:
             try:
                 date_str = today.replace(month=month_day[0], day=month_day[1]).strftime("%Y%m%d")
@@ -526,7 +545,8 @@ def _fetch_yjyg_signal():
                 direction = YJYG_DIRECTION_MAP.get(yj_type, "neutral")
                 change_desc = str(row.get("业绩变动", ""))[:150]
                 pub_time = str(row.get("公告日期", ""))
-                if not _is_today(pub_time):
+                # 保留最近3个交易日披露的预告
+                if not _in_news_window(pub_time, look_back_days=3):
                     continue
 
                 signals.append({
@@ -576,14 +596,17 @@ def _parallel_fetch(tasks: dict, per_source_timeout: int = 30, total_timeout: in
     """并行获取多个数据源，每个源独立超时，失败源不影响其他源"""
     results = {}
     failed_sources = []
-    executor = ThreadPoolExecutor(max_workers=min(len(tasks), 4))
+    max_workers = max(min(len(tasks), 4), 2)  # 至少 2 个 worker，单任务也并行
+    executor = ThreadPoolExecutor(max_workers=max_workers)
     futures = {executor.submit(fn): label for fn, label in tasks.items()}
 
     try:
         for future in as_completed(futures, timeout=total_timeout):
             label = futures[future]
             try:
-                results[label] = future.result(timeout=per_source_timeout)
+                result = future.result(timeout=per_source_timeout)
+                # 防御返回 None
+                results[label] = result if isinstance(result, list) else []
                 logger.info(f"{label}: 获取成功, {len(results[label])}条")
             except Exception as e:
                 failed_sources.append(label)
@@ -591,13 +614,18 @@ def _parallel_fetch(tasks: dict, per_source_timeout: int = 30, total_timeout: in
                 logger.warning(f"{label}: 获取失败 - {e}")
     except Exception as e:
         logger.warning(f"并行获取部分超时: {e}")
-        # 未完成的源标记为失败
+        # 未完成的源标记为失败并取消
         for future, label in futures.items():
             if not future.done():
+                future.cancel()
                 failed_sources.append(label)
                 results[label] = []
     finally:
-        executor.shutdown(wait=False)
+        # cancel_futures=True 取消未启动的任务（Python 3.9+）
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
 
     if failed_sources:
         logger.warning(f"以下数据源失败: {failed_sources}")
@@ -615,7 +643,7 @@ def get_hs300_constituents() -> dict:
     用于排序时识别"非垃圾股"：沪深300以内视为优质个股，不降权。
     失败时返回空集合，调用方应据此跳过降权（保守不降权）。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     cache_key = "hs300_constituents"
     cached = _get_cache(cache_key, today)
     if cached is not None:
@@ -626,8 +654,13 @@ def get_hs300_constituents() -> dict:
     try:
         import akshare as ak
         df = ak.index_stock_cons_csindex(symbol="000300")
-        codes = set(str(c).zfill(6) for c in df["成分券代码"].tolist())
-        names = set(str(n).strip() for n in df["成分券名称"].tolist() if str(n).strip())
+        # 防御空 DataFrame 或列名变更
+        if df is None or df.empty or "成分券代码" not in df.columns:
+            logger.warning(f"沪深300成分股: 返回数据异常, df={df is None and 'None' or (df.empty and 'empty' or 'missing column')}")
+            return {"codes": set(), "names": set()}
+        codes = set(str(c).zfill(6) for c in df["成分券代码"].dropna().tolist() if str(c).strip())
+        names_col = "成分券名称" if "成分券名称" in df.columns else None
+        names = set(str(n).strip() for n in df[names_col].dropna().tolist() if str(n).strip()) if names_col else set()
         result = {"codes": codes, "names": names}
         _set_cache(cache_key, result, today)
         logger.info(f"沪深300成分股: 获取成功, {len(codes)}只")
@@ -648,7 +681,7 @@ def get_stock_news(data_mode: str = "live") -> list:
     """获取当日全部A股财经新闻（多源聚合: 东财快讯 + 财联社电报）。
     自动按当日过滤 + 去重。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     cache_key = f"stock_news_{data_mode}"
     cached = _get_cache(cache_key, today)
     if cached is not None:
@@ -680,7 +713,7 @@ def get_stock_news(data_mode: str = "live") -> list:
 @tool
 def get_announcements(data_mode: str = "live") -> list:
     """获取当日全部交易所公告。"""
-    today_fmt = datetime.now().strftime("%Y-%m-%d")
+    today_fmt = datetime.now(BJT).strftime("%Y-%m-%d")
     cache_key = f"announcements_{data_mode}"
     cached = _get_cache(cache_key, today_fmt)
     if cached is not None:
@@ -700,7 +733,7 @@ def get_announcements(data_mode: str = "live") -> list:
 @tool
 def get_market_signals(data_mode: str = "live") -> list:
     """获取市场信号情报: 龙虎榜机构动向 + 业绩预告 (交易所官方披露)。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     cache_key = f"market_signals_{data_mode}"
     cached = _get_cache(cache_key, today)
     if cached is not None:

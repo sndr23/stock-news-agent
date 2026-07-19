@@ -22,7 +22,8 @@ class TestScoreNewsRelevance:
     def test_event_term_alone_in_flow_mode(self):
         item = {"title": "某公司业绩预增200%", "content": "", "url": "", "source": ""}
         score, cat = score_news_relevance(item)
-        assert score >= 12
+        # 纯资讯流（无 direct_signal）事件词降为 +6
+        assert score >= 6
 
     def test_official_source_bonus(self):
         item = {"title": "上交所公告", "content": "", "url": "https://sse.com.cn/notice", "source": "上交所"}

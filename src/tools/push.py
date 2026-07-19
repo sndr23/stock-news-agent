@@ -24,13 +24,15 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-PUSHPLUS_API = "http://www.pushplus.plus/send"
+PUSHPLUS_API = "https://www.pushplus.plus/send"
 WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
 
 
 def _extract_title_core(title: str) -> str:
     """提取标题核心内容：去掉【】()等括号内容及标点空格，用于相似度比较"""
     import re
+    # 防御 None 或非字符串
+    title = str(title) if title else ""
     # 去掉【...】、(...)、（...）等括号包裹的前缀/后缀
     t = re.sub(r'[【】\[\]()（）{}<>《》]', '', title)
     # 去掉所有标点和空白
@@ -116,15 +118,19 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
     }
 
     for i, n in enumerate(ranked_news[:top_n], 1):
-        n_title = n.get("title", "")[:60]
+        n_title = str(n.get("title", "") or "")[:60]
         band = n.get("impact_band", "neutral")
         direction = n.get("impact_direction", "neutral")
-        score = n.get("market_impact_score", 0)
-        sectors = n.get("affected_sectors", [])
-        sector_str = "、".join(sectors[:2]) if sectors else "—"
-        stocks = n.get("affected_stocks", [])
-        stock_str = "、".join(stocks[:3]) if stocks else ""
-        reason = (n.get("impact_reason", "") or "").strip()[:80]
+        # 防御 score 为字符串或 None
+        try:
+            score = float(n.get("market_impact_score", 0) or 0)
+        except (ValueError, TypeError):
+            score = 0.0
+        sectors = n.get("affected_sectors", []) or []
+        sector_str = "、".join(str(s) for s in sectors[:2]) if sectors else "—"
+        stocks = n.get("affected_stocks", []) or []
+        stock_str = "、".join(str(s) for s in stocks[:3]) if stocks else ""
+        reason = str(n.get("impact_reason", "") or "").strip()[:80]
 
         icon = dir_icon.get(direction, "—")
         band_label = band_icon.get(band, band)
@@ -253,18 +259,24 @@ def push_via_wecom(webhook_url: str, title: str, content: str) -> dict:
     Returns:
         企业微信 API 返回的 JSON
     """
+    # 企业微信 markdown 消息体限制 4096 字节，超出会返回 errcode=45008
+    full_content = f"## {title}\n\n{content}"
+    if len(full_content.encode('utf-8')) > 4000:
+        full_content = full_content[:3800] + "\n\n...（内容过长已截断）"
     payload = {
         "msgtype": "markdown",
-        "markdown": {"content": f"## {title}\n\n{content}"},
+        "markdown": {"content": full_content},
     }
     try:
         resp = requests.post(webhook_url, json=payload, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
+        try:
+            result = resp.json()
+        except Exception:
+            result = {"errcode": resp.status_code, "errmsg": resp.text[:500]}
         if result.get("errcode") == 0:
             logger.info(f"企业微信推送成功: {title}")
         else:
-            logger.warning(f"企业微信推送失败: {result}")
+            logger.warning(f"企业微信推送失败: HTTP {resp.status_code}, response={result}")
         return result
     except Exception as e:
         logger.error(f"企业微信推送异常: {e}")

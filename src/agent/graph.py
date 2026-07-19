@@ -59,6 +59,9 @@ def run_agent(
     thread_id: str = "default"
 ):
     """运行Agent生成排名结果"""
+    # 启动时校验配置，fail fast（避免 LLM 调用时才发现 API Key 缺失）
+    from src.config import validate_config
+    validate_config()
     agent = build_agent()
     initial_state = create_initial_state(data_mode)
     config = {"configurable": {"thread_id": thread_id}}

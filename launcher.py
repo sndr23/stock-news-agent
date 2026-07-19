@@ -8,12 +8,14 @@ import webbrowser
 import time
 import socket
 import sys
+import os
 
 # 依赖完整性预检
 try:
     import uvicorn
     import fastapi
     import langgraph
+    import langchain_openai
     import akshare
     import pandas
     import requests
@@ -29,13 +31,16 @@ def is_port_open(port):
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 def main():
-    port = 8000
+    # 端口可通过环境变量 PORT 配置，默认 8000
+    port = int(os.getenv("PORT", "8000"))
     print(f"正在启动 A股资讯监测 Agent 后端服务 (端口: {port})...")
-    
+
     # 启动 uvicorn 进程
     # 使用 sys.executable 确保使用相同的 python 解释器环境
     cmd = [sys.executable, "-m", "uvicorn", "src.api.main:app", "--host", "127.0.0.1", "--port", str(port)]
-    process = subprocess.Popen(cmd)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"  # 确保 Windows 下中文输出不乱码
+    process = subprocess.Popen(cmd, env=env)
     
     # 等待端口开放
     print("正在等待服务响应，即将自动打开浏览器...")

@@ -27,7 +27,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "null"],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -72,8 +72,12 @@ async def get_market_data():
 
 
 @app.post("/api/generate_report")
-async def generate_report(request: GenerateReportRequest):
-    """运行Agent：获取当日全部资讯 → 两阶段过滤 → 评分排名"""
+def generate_report(request: GenerateReportRequest):
+    """运行Agent：获取当日全部资讯 → 两阶段过滤 → 评分排名
+
+    注意：run_agent 内部含同步阻塞的 LLM 调用和 ThreadPoolExecutor，
+    用同步 def（非 async def）让 FastAPI 自动放到线程池执行，避免阻塞事件循环。
+    """
     try:
         result = run_agent(
             data_mode="live",
