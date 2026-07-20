@@ -11,8 +11,13 @@ class TestBandPriority:
     def test_bullish_highest(self):
         assert BAND_PRIORITY["bullish"] == 6
 
-    def test_bearish_lowest(self):
-        assert BAND_PRIORITY["bearish"] == 1
+    def test_bearish_above_neutral(self):
+        # 重大利空(退市/立案/暴雷)应排在中性前面，不再垫底
+        assert BAND_PRIORITY["bearish"] > BAND_PRIORITY["neutral"]
+
+    def test_bullish_above_bearish(self):
+        # 强利好略优先于强利空
+        assert BAND_PRIORITY["bullish"] > BAND_PRIORITY["bearish"]
 
     def test_mixed_above_neutral(self):
         assert BAND_PRIORITY["mixed"] > BAND_PRIORITY["neutral"]
