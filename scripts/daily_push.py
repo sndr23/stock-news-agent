@@ -101,21 +101,30 @@ def _is_trading_day() -> bool:
 
 
 def _build_title() -> str:
-    """按当前时段生成推送标题，附带延迟标注（GitHub Actions cron 可能有延迟）"""
+    """按当前时段生成推送标题，附带延迟标注（GitHub Actions cron 可能有延迟）
+
+    4个推送时段: 09:00 早盘前 / 12:00 午盘 / 16:00 盘后 / 22:00 晚间
+    """
     now = datetime.now(BJT)
     hour = now.hour
     date_str = now.strftime("%m-%d")
 
-    if hour < 12:
-        base_title = f"A股盘前资讯 {date_str} 09:00"
-        expected = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    elif hour < 15:
-        # 12:00-15:00 为盘中，不标注盘前/盘后
-        base_title = f"A股盘中资讯 {date_str} {hour:02d}:{now.minute:02d}"
-        return base_title
+    # 4个时段的预期推送时间
+    if hour < 11:
+        slot_name = "早盘前"
+        expected_h, expected_m = 9, 0
+    elif hour < 14:
+        slot_name = "午盘"
+        expected_h, expected_m = 12, 0
+    elif hour < 20:
+        slot_name = "盘后"
+        expected_h, expected_m = 16, 0
     else:
-        base_title = f"A股盘后资讯 {date_str} 15:30"
-        expected = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        slot_name = "晚间"
+        expected_h, expected_m = 22, 0
+
+    base_title = f"A股{slot_name}资讯 {date_str} {expected_h:02d}:00"
+    expected = now.replace(hour=expected_h, minute=expected_m, second=0, microsecond=0)
 
     # 延迟超过30分钟则在标题标注
     delay_min = (now - expected).total_seconds() / 60
