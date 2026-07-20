@@ -44,6 +44,7 @@ def validate_config():
     """验证配置是否完整"""
     if not OPENROUTER_API_KEY:
         raise ValueError("缺少 openrouter_api_key 配置，请检查 .ENV 文件")
+    print(f"[config] OPENROUTER_MODEL_NAME = {OPENROUTER_MODEL_NAME}", flush=True)
     return True
 
 if __name__ == "__main__":

@@ -159,8 +159,8 @@ def _calc_similarity(text1: str, text2: str) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 
-_PREFILTER_QUOTA = {"direct": None, "sector": 20, "macro": 10}
-_PREFILTER_TOTAL_LIMIT = 40
+_PREFILTER_QUOTA = {"direct": None, "sector": 30, "macro": 15}
+_PREFILTER_TOTAL_LIMIT = 60
 
 
 def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> tuple:
