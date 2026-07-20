@@ -3,11 +3,12 @@ name: 每日资讯推送
 
 on:
   schedule:
-    # 北京时间 09:00 (盘前) 和 15:30 (盘后)
-    # UTC 01:00 和 07:30
-    # 注意: GitHub Actions cron 用 UTC 时间
-    - cron: "0 1 * * 1-5"    # UTC 01:00 = BJT 09:00 周一到周五
-    - cron: "30 7 * * 1-5"   # UTC 07:30 = BJT 15:30 周一到周五
+    # 4个推送时间点（北京时间，GitHub Actions cron 用 UTC，BJT = UTC + 8）
+    # 注意: GitHub Actions cron 是"尽力而为"调度，高峰期(UTC 00:00附近)可能延迟数分钟到数小时
+    - cron: "0 1 * * *"     # UTC 01:00 = BJT 09:00 早盘前
+    - cron: "0 4 * * *"     # UTC 04:00 = BJT 12:00 午盘
+    - cron: "0 8 * * *"     # UTC 08:00 = BJT 16:00 盘后
+    - cron: "0 14 * * *"    # UTC 14:00 = BJT 22:00 晚间
   workflow_dispatch:        # 支持手动触发测试
 
 # 防止 cron 延迟导致两个时段的推送并发执行
