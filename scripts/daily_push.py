@@ -104,29 +104,42 @@ def _build_title() -> str:
     """按当前时段生成推送标题，附带延迟标注（GitHub Actions cron 可能有延迟）
 
     4个推送时段: 09:00 早盘前 / 12:00 午盘 / 16:00 盘后 / 22:00 晚间
+    优先使用 PUSH_SLOT 环境变量（由 cron-job.org 通过 workflow_dispatch inputs 传入），
+    这样标题能精确对应触发的时段，不受 GitHub Actions 调度延迟影响。
     """
     now = datetime.now(BJT)
-    hour = now.hour
     date_str = now.strftime("%m-%d")
 
-    # 4个时段的预期推送时间
-    if hour < 11:
-        slot_name = "早盘前"
-        expected_h, expected_m = 9, 0
-    elif hour < 14:
-        slot_name = "午盘"
-        expected_h, expected_m = 12, 0
-    elif hour < 20:
-        slot_name = "盘后"
-        expected_h, expected_m = 16, 0
+    # slot 映射: 环境变量值 -> (时段名, 预期小时)
+    slot_map = {
+        "morning":   ("早盘前", 9),
+        "noon":      ("午盘", 12),
+        "afternoon": ("盘后", 16),
+        "night":     ("晚间", 22),
+    }
+
+    slot_env = os.getenv("PUSH_SLOT", "").strip().lower()
+    if slot_env in slot_map:
+        # 外部定时服务触发: 用传入的 slot 精确命名
+        slot_name, expected_h = slot_map[slot_env]
+        base_title = f"A股{slot_name}资讯 {date_str} {expected_h:02d}:00"
+        expected = now.replace(hour=expected_h, minute=0, second=0, microsecond=0)
     else:
-        slot_name = "晚间"
-        expected_h, expected_m = 22, 0
+        # GitHub 自带 cron 或手动触发: 按当前小时推断时段
+        hour = now.hour
+        if hour < 11:
+            slot_name, expected_h = "早盘前", 9
+        elif hour < 14:
+            slot_name, expected_h = "午盘", 12
+        elif hour < 20:
+            slot_name, expected_h = "盘后", 16
+        else:
+            slot_name, expected_h = "晚间", 22
+        base_title = f"A股{slot_name}资讯 {date_str} {expected_h:02d}:00"
+        expected = now.replace(hour=expected_h, minute=0, second=0, microsecond=0)
 
-    base_title = f"A股{slot_name}资讯 {date_str} {expected_h:02d}:00"
-    expected = now.replace(hour=expected_h, minute=expected_m, second=0, microsecond=0)
-
-    # 延迟超过30分钟则在标题标注
+    # 延迟超过30分钟则在标题标注（仅对 GitHub 自带 cron 有意义，
+    # cron-job.org 触发时延迟通常 <1分钟）
     delay_min = (now - expected).total_seconds() / 60
     if delay_min > 30:
         base_title += f" (延迟{int(delay_min)}分钟)"
