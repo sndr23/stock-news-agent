@@ -607,9 +607,9 @@ def _has_national_policy(text: str) -> bool:
 
 
 BAND_PRIORITY = {
-    "bullish": 6, "mildly_bullish": 5,
-    "mixed": 4, "neutral": 3,
-    "mildly_bearish": 2, "bearish": 1,
+    "bullish": 6, "bearish": 5,                # 强信号排前(利好略优先)，重大利空不再垫底
+    "mildly_bullish": 4, "mildly_bearish": 3,  # 中等信号
+    "mixed": 2, "neutral": 1,                  # 弱信号/中性排后
 }
 
 CONFIDENCE_WEIGHT = {
@@ -756,13 +756,13 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     # CPO/PCB/半导体等科技硬件词命中：不管利好利空统一显著加成
     # 非科技资讯：国家级政策保持加成，其他统一降权
     if is_tech:
-        total = round(total * 1.35, 4)   # 科技资讯 x1.35 (不管方向)
+        total = round(total * 1.20, 4)   # 科技资讯 x1.20 (降低，避免过度压制非科技)
     elif is_national_auth and is_national_policy:
-        total = round(total * 1.12, 4)   # 国家级政策 x1.12
+        total = round(total * 1.15, 4)   # 国家级政策 x1.15 (提高，央行/财政部等应受重视)
     elif is_national_auth:
-        total = round(total * 1.05, 4)   # 国家级来源 x1.05
+        total = round(total * 1.08, 4)   # 国家级来源 x1.08
     else:
-        total = round(total * 0.70, 4)   # 非科技非国家级资讯降权 x0.70
+        total = round(total * 0.85, 4)   # 非科技非国家级资讯降权 x0.85 (提高基线)
 
     # ---- 沪深300成分股过滤 + ST/退市分级降权 ----
     affected_stocks = news.get("affected_stocks", []) or []
