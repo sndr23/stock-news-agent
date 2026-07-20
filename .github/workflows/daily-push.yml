@@ -2,16 +2,30 @@
 name: 每日资讯推送
 
 on:
+  # 保留 schedule 作为兜底（cron-job.org 失败时仍能触发，只是可能延迟）
+  # 如果只用 cron-job.org，可以注释掉整个 schedule 块
   schedule:
-    # 4个推送时间点（北京时间，GitHub Actions cron 用 UTC，BJT = UTC + 8）
-    # 注意: GitHub Actions cron 是"尽力而为"调度，高峰期(UTC 00:00附近)可能延迟数分钟到数小时
     - cron: "0 1 * * *"     # UTC 01:00 = BJT 09:00 早盘前
     - cron: "0 4 * * *"     # UTC 04:00 = BJT 12:00 午盘
     - cron: "0 8 * * *"     # UTC 08:00 = BJT 16:00 盘后
     - cron: "0 14 * * *"    # UTC 14:00 = BJT 22:00 晚间
-  workflow_dispatch:        # 支持手动触发测试
+  workflow_dispatch:
+    # 支持外部定时服务(cron-job.org)和手动触发
+    # slot 参数用于标注推送时段，可选值: morning/noon/afternoon/night
+    inputs:
+      slot:
+        description: '推送时段 (morning=09:00 / noon=12:00 / afternoon=16:00 / night=22:00)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - morning
+          - noon
+          - afternoon
+          - night
 
-# 防止 cron 延迟导致两个时段的推送并发执行
+# 防止两个时段的推送并发执行
 concurrency:
   group: daily-push
   cancel-in-progress: false
@@ -30,6 +44,8 @@ jobs:
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       PUSH_TOP_N: "20"
+      # 通过 inputs.slot 传递时段，daily_push.py 会读取 PUSH_SLOT 环境变量
+      PUSH_SLOT: ${{ github.event.inputs.slot }}
 
     steps:
       - name: 检出代码
