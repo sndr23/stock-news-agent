@@ -235,14 +235,15 @@ class TestTechWeighting:
         assert s1 > s2, f"科技中性({s1})应高于非科技中性({s2})"
 
     def test_non_tech_downweighted(self):
-        """非科技资讯应被降权（×0.70）"""
+        """非科技资讯应被降权（×0.85）"""
         n = self._make_news("某消费股利好", direction="bullish")
         score = _calc_continuous_score(n, None)
         # 手动计算：无科技、无国家级、非沪深300（hs300=None 不降权）
         # base = 0.15*cred + 0.70*llm_impact + 0 = 0.15*0.89 + 0.70*0.8 = 0.1335 + 0.56 = 0.6935
         # sentiment_factor = 1.0 (bullish)
         # total = 0.6935
-        # 非科技降权 ×0.70 = 0.4855
+        # 非科技降权 ×0.85 = 0.5895
+        # 影响范围: 无 sectors/无 hs300 → stock ×1.00
         # 验证确实被降权了（低于未降权的 0.6935）
         assert score < 0.6935, f"非科技应被降权({score} < 0.6935)"
 
@@ -250,7 +251,7 @@ class TestTechWeighting:
         """CPO关键词命中应获科技加成"""
         n = self._make_news("CPO光模块技术突破", direction="bullish")
         score = _calc_continuous_score(n, None)
-        # 科技加成 ×1.35，应明显高于非科技
+        # 科技加成 ×1.20，应明显高于非科技
         n2 = self._make_news("某服装品牌涨价", direction="bullish")
         score2 = _calc_continuous_score(n2, None)
         assert score > score2
@@ -271,3 +272,83 @@ class TestTechWeighting:
         ]
         ranked = rank_news(news)
         assert ranked[0]["title"] == "半导体芯片涨价利好"
+
+
+class TestInfluenceScope:
+    """影响范围加权：市场级 > 板块级 > 个股级"""
+
+    _HS300_MOCK = {"codes": {"300308"}, "names": {"中际旭创"}}
+
+    def _make_news(self, title, scope="", sectors=None, stocks=None,
+                   direction="bullish", score=8.0, source="财联社"):
+        band = "bullish" if direction == "bullish" else "bearish"
+        d = {
+            "title": title, "source": source, "content": "", "published_at": "",
+            "category": "news", "sentiment": direction, "impact_direction": direction,
+            "market_impact_score": score, "impact_band": band, "confidence": "high",
+            "affected_sectors": sectors or [], "affected_stocks": stocks or [],
+            "cluster_weight": 0,
+        }
+        if scope:
+            d["influence_scope"] = scope
+        return d
+
+    def test_llm_market_above_sector_above_stock(self):
+        """LLM输出influence_scope: market > sector > stock"""
+        n_market = self._make_news("央行降息", scope="market")
+        n_sector = self._make_news("半导体政策利好", scope="sector")
+        n_stock = self._make_news("某股业绩预增", scope="stock")
+        s_m = _calc_continuous_score(n_market, None)
+        s_s = _calc_continuous_score(n_sector, None)
+        s_k = _calc_continuous_score(n_stock, None)
+        assert s_m > s_s > s_k, f"market({s_m}) > sector({s_s}) > stock({s_k})"
+
+    def test_llm_scope_overrides_inference(self):
+        """LLM输出的influence_scope应优先于规则推断"""
+        # LLM说market，但规则推断为stock（无sectors/无hs300）
+        n = self._make_news("某小盘股公告", scope="market")
+        score_llm = _calc_continuous_score(n, None)
+        # 不设influence_scope，走规则推断 → stock
+        n_no_scope = dict(n)
+        del n_no_scope["influence_scope"]
+        score_inferred = _calc_continuous_score(n_no_scope, None)
+        assert score_llm > score_inferred, "LLM market应高于规则推断stock"
+
+    def test_infer_sector_by_sectors(self):
+        """有affected_sectors时推断为sector"""
+        from src.tools.calculators import _infer_influence_scope
+        n = self._make_news("半导体涨价", sectors=["半导体"])
+        assert _infer_influence_scope(n, None) == "sector"
+
+    def test_infer_sector_by_hs300_leader(self):
+        """沪深300龙头股推断为sector（龙头带动效应）"""
+        from src.tools.calculators import _infer_influence_scope
+        n = self._make_news("中际旭创业绩预增", stocks=["中际旭创"])
+        assert _infer_influence_scope(n, self._HS300_MOCK) == "sector"
+
+    def test_infer_stock_no_sectors_no_leader(self):
+        """无板块/非龙头推断为stock"""
+        from src.tools.calculators import _infer_influence_scope
+        n = self._make_news("某小盘股公告", stocks=["某小盘股"])
+        assert _infer_influence_scope(n, self._HS300_MOCK) == "stock"
+
+    def test_rank_news_market_above_stock(self, monkeypatch):
+        """rank_news中市场级应排在个股级前面（同band同score）"""
+        from src.tools import data_fetchers
+        monkeypatch.setattr(data_fetchers, "get_hs300_constituents", lambda: {})
+        news = [
+            self._make_news("某小盘股业绩预增", scope="stock"),
+            self._make_news("央行全面降准0.5个百分点", scope="market"),
+        ]
+        ranked = rank_news(news)
+        assert ranked[0]["title"] == "央行全面降准0.5个百分点"
+        assert ranked[0]["influence_scope"] == "market"
+
+    def test_ranked_item_has_scope_field(self, monkeypatch):
+        """RankedNewsItem应包含influence_scope字段"""
+        from src.tools import data_fetchers
+        monkeypatch.setattr(data_fetchers, "get_hs300_constituents", lambda: {})
+        news = [self._make_news("测试", scope="sector")]
+        ranked = rank_news(news)
+        assert "influence_scope" in ranked[0]
+        assert ranked[0]["influence_scope"] == "sector"

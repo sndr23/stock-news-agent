@@ -47,6 +47,7 @@ class RankedNewsItem(TypedDict):
     impact_band: str
     band_priority: int
     confidence: str
+    influence_scope: str
 
 
 # ============================================================
@@ -612,6 +613,45 @@ BAND_PRIORITY = {
     "mixed": 2, "neutral": 1,                  # 弱信号/中性排后
 }
 
+# 影响范围加权：市场级 > 板块级 > 个股级
+INFLUENCE_SCOPE_WEIGHT = {
+    "market": 1.50,   # 影响整个市场（央行降息/注册制改革等）— 豁免非科技降权
+    "sector": 1.15,   # 影响整个板块（行业政策/龙头股带动板块）
+    "stock": 1.00,    # 仅影响个股
+}
+
+
+def _infer_influence_scope(news: dict, hs300: dict = None) -> str:
+    """推断资讯的影响范围层级（LLM 未输出 influence_scope 时的后备规则）
+
+    判断逻辑：
+    - market: 国家级权威+政策关键词，或跨3+板块
+    - sector: 有受影响板块，或个股是沪深300龙头（龙头带动效应）
+    - stock: 仅个股，无板块关联
+    """
+    title = news.get("title", "")
+    content = news.get("content", "")
+    text = f"{title} {content}"
+    source = news.get("source", "")
+    affected_sectors = news.get("affected_sectors", []) or []
+    affected_stocks = news.get("affected_stocks", []) or []
+    stock_name = news.get("name", "")
+
+    # 市场级：国家级权威 + 政策关键词，或跨3+板块
+    if (_is_national_authority(source) and _has_national_policy(text)) or len(affected_sectors) >= 3:
+        return "market"
+
+    # 板块级：有受影响板块，或个股是沪深300龙头
+    if affected_sectors:
+        return "sector"
+    if hs300 is not None:
+        stocks_to_check = list(affected_stocks) + ([stock_name] if stock_name else [])
+        for s in stocks_to_check:
+            if s and _is_hs300_stock(s, "", hs300):
+                return "sector"
+
+    return "stock"
+
 CONFIDENCE_WEIGHT = {
     "high": 1.0, "medium": 0.85, "low": 0.7,
 }
@@ -752,15 +792,24 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
         or "终止上市" in raw_text
     )
 
+    # ---- 影响范围加权（先于科技加成，确保市场级不被科技叠加超越）----
+    scope = news.get("influence_scope", "")
+    if not scope:
+        scope = _infer_influence_scope(news, hs300)
+    total = round(total * INFLUENCE_SCOPE_WEIGHT.get(scope, 1.0), 4)
+
     # ---- 科技板块统一加权 / 非科技统一降权 ----
     # CPO/PCB/半导体等科技硬件词命中：不管利好利空统一显著加成
     # 非科技资讯：国家级政策保持加成，其他统一降权
+    # 市场级资讯豁免非科技降权（央行降息等不应因无科技关键词被降权）
     if is_tech:
         total = round(total * 1.20, 4)   # 科技资讯 x1.20 (降低，避免过度压制非科技)
     elif is_national_auth and is_national_policy:
         total = round(total * 1.15, 4)   # 国家级政策 x1.15 (提高，央行/财政部等应受重视)
     elif is_national_auth:
         total = round(total * 1.08, 4)   # 国家级来源 x1.08
+    elif scope == "market":
+        pass  # 市场级豁免非科技降权
     else:
         total = round(total * 0.85, 4)   # 非科技非国家级资讯降权 x0.85 (提高基线)
 
@@ -851,6 +900,10 @@ def rank_news(news_list: list) -> list:
 
         tf = calculate_time_factor(news.get("published_at", ""))
 
+        scope = news.get("influence_scope", "")
+        if not scope:
+            scope = _infer_influence_scope(news, hs300)
+
         ranked.append(RankedNewsItem(
             title=news.get("title", ""),
             source=news.get("source", ""),
@@ -870,6 +923,7 @@ def rank_news(news_list: list) -> list:
             impact_band=band,
             band_priority=BAND_PRIORITY.get(band, 3),
             confidence=conf,
+            influence_scope=scope,
         ))
 
     ranked.sort(

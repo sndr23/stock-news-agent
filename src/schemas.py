@@ -24,6 +24,13 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+class InfluenceScope(str, Enum):
+    """影响范围层级"""
+    MARKET = "market"    # 影响整个市场/大盘
+    SECTOR = "sector"    # 影响整个板块/行业
+    STOCK = "stock"      # 仅影响个股本身
+
+
 class NewsAnalysisItem(BaseModel):
     """单条资讯的 LLM 分析结果"""
     title: str
@@ -39,6 +46,7 @@ class NewsAnalysisItem(BaseModel):
     affected_sectors: list[str] = Field(default=[], description="影响板块，必填")
     affected_stocks: list[str] = Field(default=[], description="明确提及的个股")
     impact_reason: str = Field(default="", description="一句话影响逻辑")
+    influence_scope: str = Field(default="stock", description="影响范围: market=全市场 / sector=板块 / stock=个股")
     sentiment: str = Field(default="", description="与 impact_band 对齐")
 
 
