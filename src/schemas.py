@@ -47,6 +47,7 @@ class NewsAnalysisItem(BaseModel):
     affected_stocks: list[str] = Field(default=[], description="明确提及的个股")
     impact_reason: str = Field(default="", description="一句话影响逻辑")
     influence_scope: str = Field(default="stock", description="影响范围: market=全市场 / sector=板块 / stock=个股")
+    analysis_chain: str = Field(default="", description="5步推理链(箭头连接): 事件识别→影响范围→方向→强度→置信度")
     sentiment: str = Field(default="", description="与 impact_band 对齐")
 
 

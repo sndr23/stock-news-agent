@@ -117,6 +117,13 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         "bearish": "强空",
     }
 
+    # 影响范围标签
+    scope_icon = {
+        "market": "🌍市场",
+        "sector": "🏭板块",
+        "stock": "📌个股",
+    }
+
     for i, n in enumerate(ranked_news[:top_n], 1):
         n_title = str(n.get("title", "") or "")[:60]
         band = n.get("impact_band", "neutral")
@@ -131,20 +138,29 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         stocks = n.get("affected_stocks", []) or []
         stock_str = "、".join(str(s) for s in stocks[:3]) if stocks else ""
         reason = str(n.get("impact_reason", "") or "").strip()[:80]
+        scope = str(n.get("influence_scope", "") or "").strip()
+        scope_label = scope_icon.get(scope, "")
+        chain = str(n.get("analysis_chain", "") or "").strip()[:120]
 
         icon = dir_icon.get(direction, "—")
         band_label = band_icon.get(band, band)
 
-        # 第一行：序号 + 方向 + band + 标题
-        lines.append(f"**{i}. {icon}[{band_label}] {n_title}**\n")
+        # 第一行：序号 + 方向 + band + 影响范围 + 标题
+        title_parts = [f"**{i}. {icon}[{band_label}]"]
+        if scope_label:
+            title_parts.append(scope_label)
+        title_parts.append(f"{n_title}**")
+        lines.append(" ".join(title_parts) + "\n")
         # 第二行：板块 + 个股 + 影响分
         meta_parts = [f"板块: {sector_str}", f"影响分: {score:.1f}"]
         if stock_str:
             meta_parts.append(f"个股: {stock_str}")
         lines.append(f"> {' | '.join(meta_parts)}\n")
-        # 第三行：影响逻辑（如果有）
+        # 第三行：影响逻辑 + 推理链
         if reason:
             lines.append(f"> {reason}\n")
+        if chain:
+            lines.append(f"> 💭 {chain}\n")
 
     # 截断到 39000 字（WxPusher 支持 40000 字，留 1000 字给标题和边距）
     # 注意：PushPlus 免费版限 5000 字，调用方需自行选择后端
