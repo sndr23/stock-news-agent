@@ -232,32 +232,78 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
 # Stage 2: LLM分析 (标签化)
 # ============================================================
 
-ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条分析，输出结构化 JSON。
+ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师。请对以下资讯逐条深度分析，输出结构化 JSON。
 
 ## 资讯列表（共{n}条）
 {news_list}
 
+## 分析框架（请按以下5步逐条思考，并在 analysis_chain 中记录推理过程）
+
+### 第1步：事件识别
+- 事件类型：业绩/政策/并购/技术突破/处罚/融资/减持/...
+- 核心事实：提取关键数据和主体
+- 信息完整性：是否有具体金额/比例/时间？
+
+### 第2步：影响范围判断（最关键步骤）
+按以下顺序逐层判断，取最高层级作为 influence_scope：
+
+1. 市场级(market)：影响整个A股市场/大盘
+   - 央行/财政部/证监会/国务院的全面性政策（降息降准、注册制改革、印花税调整）
+   - 重大地缘政治事件（影响全市场情绪）
+   - 跨3个以上板块的系统性事件
+
+2. 板块级(sector)：影响整个行业/板块
+   - 行业政策（如半导体补贴、新能源规划）→ 整个板块
+   - 龙头股重大事件 → 带动板块情绪和估值
+     * 龙头判断标准：市值前列、板块风向标、机构持仓集中
+     * 典型龙头：中际旭创/新易盛(CPO) | 宁德时代(新能源) | 贵州茅台(白酒) | 招商银行(银行) | 中芯国际(半导体) | 工业富联(算力)
+   - 供应链传导（如上游涨价→下游成本上升→整个链条）
+   - 板块性技术趋势（如CPO技术路线确立）
+
+3. 个股级(stock)：仅影响个股本身
+   - 非龙头股的普通公告（业绩波动、常规经营）
+   - 无板块联动效应的个股事件
+   - 注意：即使是利好，如果只是个股层面且非龙头，不应判为 sector
+
+### 第3步：方向判断
+- 对受影响对象是利好还是利空？
+- 科技板块资讯以"对科技板块的影响"判定方向
+- 含明确多空信号的严禁判 neutral/mixed
+- 同时含利好利空判 mixed
+
+### 第4步：强度评估（0-10分）
+- 0-2: 几乎无影响（常规播报、无关资讯）
+- 3-4: 弱影响（个股普通公告、非龙头常规经营）
+- 5-6: 中等影响（板块政策、龙头常规事件）
+- 7-8: 强影响（重大政策、龙头重大事件、板块性突破）
+- 9-10: 极重大（可能改变市场走势的里程碑事件）
+
+### 第5步：置信度评估
+- high: 多源报道/有具体数据/官方公告
+- medium: 单一来源但有事件细节
+- low: 内容<50字/信息不足/市场传闻
+
+## analysis_chain 写法
+用箭头连接5步结论，简明记录推理过程（一条资讯一行）：
+- "CPO龙头中际旭创业绩预增80%→光模块板块龙头→带动板块估值→强利好→高置信"
+- "央行降准0.5%→全市场流动性宽松→利好大盘→强利好→高置信"
+- "某小盘股获补贴200万→仅个股影响→弱利好→低置信"
+
 ## 输出契约（每条必须包含全部字段）
 1. market_impact_score: 0-10（0无影响/10极重大）
-2. impact_band: 6档之一
-   - bullish(强利好, score 6.5-10): 业绩预增/大额中标/政策扶持/增持回购/技术突破
+2. impact_band: 6档之一（与score区间一致）
+   - bullish(强利好, 6.5-10): 业绩预增/大额中标/政策扶持/增持回购/技术突破
    - mildly_bullish(弱利好, 5.5-6.4): 普通经营利好
    - neutral(中性, 4.5-5.5): 无明显多空的常规播报
    - mixed(多空交织, 4.5-5.5): 同时含利好利空
    - mildly_bearish(弱利空, 3.5-4.4): 普通经营利空
    - bearish(强利空, 0-3.4): 立案/退市/爆雷/违约/重大处罚
 3. confidence: high/medium/low
-   - high: 多源报道/有具体数据/官方源
-   - medium: 单一来源/有事件细节
-   - low: 内容<50字/信息不足
 4. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
 5. affected_stocks: 明确提及的个股
 6. impact_reason: 一句话影响逻辑
-7. influence_scope: 影响范围层级，三选一
-   - market: 影响整个A股市场/大盘（如央行降息、注册制改革、全市场性政策、重大地缘事件）
-   - sector: 影响整个板块/行业（如行业政策变动、龙头股重大事件带动板块、板块性技术趋势）
-   - stock: 仅影响个股本身（如个股普通公告、非龙头股业绩、常规经营事项）
-   判断要点：龙头股（如中际旭创、宁德时代、贵州茅台等）的重大事件通常能带动整个板块，应判为 sector 而非 stock
+7. influence_scope: market/sector/stock（按第2步判断）
+8. analysis_chain: 5步推理链（箭头连接，简明记录思考过程）
 
 ## 规则
 - band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
@@ -285,7 +331,8 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条�
       "affected_sectors": ["半导体"],
       "affected_stocks": ["中芯国际"],
       "impact_reason": "半导体国产替代加速，利好板块龙头",
-      "influence_scope": "sector"
+      "influence_scope": "sector",
+      "analysis_chain": "中芯国际获大额订单→半导体龙头→带动国产替代板块→强利好→高置信"
     }}
   ],
   "removed_count": 0,
@@ -296,6 +343,7 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条�
 注意:
 - filtered_news 中每条必须保留原始字段并新增上述字段
 - affected_sectors 必须尽力提取，仅当完全不涉及行业板块时才设为空数组
+- analysis_chain 必须填写，记录5步推理过程
 """
 
 
@@ -462,7 +510,7 @@ def _build_llm():
     reasoning_models = ("agnes", "o1", "o3", "deepseek-r1", "deepseek-reasoner")
     extra_body = {}
     if any(m in OPENROUTER_MODEL_NAME.lower() for m in reasoning_models):
-        extra_body["reasoning_effort"] = "low"
+        extra_body["reasoning_effort"] = "medium"  # 5步分析框架需要更深推理
     return ChatOpenAI(
         model=OPENROUTER_MODEL_NAME,
         api_key=OPENROUTER_API_KEY,
@@ -732,6 +780,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 if llm_res.get("impact_reason"):
                     news["impact_reason"] = llm_res["impact_reason"]
                 news["influence_scope"] = llm_res.get("influence_scope", "stock")
+                news["analysis_chain"] = llm_res.get("analysis_chain", "")
                 # 根据 direction 同步 impact_band（否则下游 rank_news 默认 neutral 导致排名偏低）
                 direction = news.get("impact_direction", "neutral")
                 if direction == "bullish":
@@ -769,6 +818,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["impact_band"] = "neutral"
                 news["confidence"] = "low"
                 news["influence_scope"] = "stock"
+                news["analysis_chain"] = ""
             else:
                 # 2. 正常 LLM 输出: 尊重 LLM 方向, 但对中性结论做精细纠偏
                 #    仅当 LLM=neutral 且规则发现明确强正向/强负向组合时才纠偏
@@ -809,6 +859,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["impact_band"] = band_val.value if hasattr(band_val, "value") else str(band_val)
                 news["confidence"] = conf_val.value if hasattr(conf_val, "value") else str(conf_val)
                 news["influence_scope"] = llm_res.get("influence_scope", "stock")
+                news["analysis_chain"] = llm_res.get("analysis_chain", "")
 
             final_filtered.append(news)
         else:

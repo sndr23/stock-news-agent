@@ -48,6 +48,7 @@ class RankedNewsItem(TypedDict):
     band_priority: int
     confidence: str
     influence_scope: str
+    analysis_chain: str
 
 
 # ============================================================
@@ -924,6 +925,7 @@ def rank_news(news_list: list) -> list:
             band_priority=BAND_PRIORITY.get(band, 3),
             confidence=conf,
             influence_scope=scope,
+            analysis_chain=news.get("analysis_chain", ""),
         ))
 
     ranked.sort(

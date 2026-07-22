@@ -30,6 +30,7 @@ class RankedNewsItem(TypedDict):
     band_priority: int
     confidence: str
     influence_scope: str
+    analysis_chain: str
 
 
 class AgentState(TypedDict):
