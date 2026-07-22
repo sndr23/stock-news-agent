@@ -148,10 +148,12 @@ def _build_title() -> str:
 
 
 def _already_pushed_recently() -> bool:
-    """检查最近2小时内是否已有成功的推送（仅 schedule 兜底触发时调用）
+    """检查同一时段今天是否已有成功的推送（仅 schedule 兜底触发时调用）
 
-    通过 GitHub API 查询最近的 workflow runs，如果2小时内有成功的 run，
-    说明 cron-job.org 已经推送过，schedule 兜底应跳过避免重复推送。
+    去重逻辑：
+    1. schedule 触发时(无PUSH_SLOT)，按当前小时推断所属时段
+    2. 查GitHub API最近4小时内的成功runs
+    3. 如果该时段(±2小时窗口)已有成功run，跳过避免重复推送
 
     仅在 GitHub Actions 环境中生效（有 GITHUB_TOKEN 和 GITHUB_REPOSITORY）。
     """
@@ -164,10 +166,23 @@ def _already_pushed_recently() -> bool:
     if slot:
         return False  # cron-job.org / 手动触发（有明确 slot），不跳过
 
+    # schedule 触发：按当前小时推断时段，查找同窗口内是否有成功推送
+    # 时段窗口：09:00±1h / 12:00±1h / 16:00±1h / 22:00±1h
+    now = datetime.now(BJT)
+    hour = now.hour
+    if hour < 11:
+        expected_h = 9    # 早盘窗口 08:00-10:59
+    elif hour < 14:
+        expected_h = 12   # 午盘窗口 11:00-13:59
+    elif hour < 20:
+        expected_h = 16   # 盘后窗口 15:00-19:59
+    else:
+        expected_h = 22   # 晚间窗口 20:00-23:59 + 次日00:00-01:59
+
     import urllib.request
     import urllib.error
 
-    api_url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=10&status=completed"
+    api_url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=20&status=completed"
     req = urllib.request.Request(api_url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -179,7 +194,6 @@ def _already_pushed_recently() -> bool:
         logger.warning(f"查询最近 runs 失败(不跳过): {e}")
         return False
 
-    now = datetime.now(BJT)
     for run in data.get("workflow_runs", []):
         if run.get("conclusion") != "success":
             continue
@@ -187,8 +201,20 @@ def _already_pushed_recently() -> bool:
             run["created_at"].replace("Z", "+00:00")
         ).astimezone(BJT)
         elapsed_min = (now - created).total_seconds() / 60
-        if elapsed_min < 120:  # 2小时内有成功的 run
-            logger.info(f"最近 {int(elapsed_min)} 分钟已有成功推送(run #{run['run_number']})，schedule 兜底跳过")
+        # 仅查4小时内的成功推送（覆盖schedule延迟场景）
+        if elapsed_min > 240:
+            continue
+        # 判断该run是否属于同一时段（创建时间在预期小时±2小时内）
+        run_hour = created.hour
+        hour_diff = abs(run_hour - expected_h)
+        # 处理跨午夜（如晚间22点 vs 次日01点，差值21→2）
+        hour_diff = min(hour_diff, 24 - hour_diff)
+        if hour_diff <= 2:
+            logger.info(
+                f"同时段已有成功推送(run #{run['run_number']}, "
+                f"{int(elapsed_min)}分钟前, run_hour={run_hour}, expected={expected_h})，"
+                f"schedule 兜底跳过"
+            )
             return True
     return False
 
