@@ -253,6 +253,11 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条�
 4. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
 5. affected_stocks: 明确提及的个股
 6. impact_reason: 一句话影响逻辑
+7. influence_scope: 影响范围层级，三选一
+   - market: 影响整个A股市场/大盘（如央行降息、注册制改革、全市场性政策、重大地缘事件）
+   - sector: 影响整个板块/行业（如行业政策变动、龙头股重大事件带动板块、板块性技术趋势）
+   - stock: 仅影响个股本身（如个股普通公告、非龙头股业绩、常规经营事项）
+   判断要点：龙头股（如中际旭创、宁德时代、贵州茅台等）的重大事件通常能带动整个板块，应判为 sector 而非 stock
 
 ## 规则
 - band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
@@ -279,7 +284,8 @@ ANALYSIS_PROMPT = """你是资深A股资讯分析师。请对以下资讯逐条�
       "confidence": "high",
       "affected_sectors": ["半导体"],
       "affected_stocks": ["中芯国际"],
-      "impact_reason": "半导体国产替代加速，利好板块龙头"
+      "impact_reason": "半导体国产替代加速，利好板块龙头",
+      "influence_scope": "sector"
     }}
   ],
   "removed_count": 0,
@@ -725,6 +731,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["affected_stocks"] = llm_res.get("affected_stocks", news.get("affected_stocks", []))
                 if llm_res.get("impact_reason"):
                     news["impact_reason"] = llm_res["impact_reason"]
+                news["influence_scope"] = llm_res.get("influence_scope", "stock")
                 # 根据 direction 同步 impact_band（否则下游 rank_news 默认 neutral 导致排名偏低）
                 direction = news.get("impact_direction", "neutral")
                 if direction == "bullish":
@@ -761,6 +768,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["sentiment"] = direction
                 news["impact_band"] = "neutral"
                 news["confidence"] = "low"
+                news["influence_scope"] = "stock"
             else:
                 # 2. 正常 LLM 输出: 尊重 LLM 方向, 但对中性结论做精细纠偏
                 #    仅当 LLM=neutral 且规则发现明确强正向/强负向组合时才纠偏
@@ -800,6 +808,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 conf_val = llm_res.get("confidence", "medium")
                 news["impact_band"] = band_val.value if hasattr(band_val, "value") else str(band_val)
                 news["confidence"] = conf_val.value if hasattr(conf_val, "value") else str(conf_val)
+                news["influence_scope"] = llm_res.get("influence_scope", "stock")
 
             final_filtered.append(news)
         else:
