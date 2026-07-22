@@ -815,6 +815,8 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
         total = round(total * 0.85, 4)   # 非科技非国家级资讯降权 x0.85 (提高基线)
 
     # ---- 沪深300成分股过滤 + ST/退市分级降权 ----
+    # 仅对个股级资讯生效：sector/market 级资讯的影响范围是整个板块/市场，
+    # affected_stocks 可能含海外公司（如OpenAI/微软），不应因此降权
     affected_stocks = news.get("affected_stocks", []) or []
     stock_name = news.get("name", "")
     stock_code = news.get("code", "")
@@ -832,8 +834,10 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
                 all_non_hs300 = False
                 break
 
-    if has_individual_stock and all_non_hs300 and hs300 is not None:
-        # 非沪深300个股：温和降权
+    # scope 已在上方计算，此处复用
+    is_stock_scope = (scope == "stock")
+    if is_stock_scope and has_individual_stock and all_non_hs300 and hs300 is not None:
+        # 非沪深300个股：温和降权（仅个股级资讯）
         total = round(total * 0.7, 4)
         # 叠加 ST/退市：强力降权 (0.7 × 0.6 = 0.42)
         if is_st_delist:
@@ -858,11 +862,14 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
                     break
             if hit_watchlist:
                 break
-        # 检查板块命中
+        # 检查板块命中（模糊匹配：如"算力/AI基础设施/光模块"命中"算力"）
         if not hit_watchlist:
             for sec in news.get("affected_sectors", []) or []:
-                if sec in watchlist["sectors"]:
-                    hit_watchlist = True
+                for watch_sec in watchlist["sectors"]:
+                    if watch_sec in sec or sec in watch_sec:
+                        hit_watchlist = True
+                        break
+                if hit_watchlist:
                     break
         if hit_watchlist:
             total = round(total * 1.2, 4)
