@@ -102,19 +102,30 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         return f"## {title}\n\n今日暂无重要资讯。"
 
     lines = [f"## {title}\n"]
-    # 方向 emoji 映射（PushPlus Markdown 支持 emoji）
+    # A股惯例：红涨绿跌
+    # 方向颜色映射（HTML font 标签，WxPusher markdown 渲染器支持内联 HTML）
+    _RED = "#e23a3a"    # 利好红
+    _GREEN = "#2e7d32"  # 利空绿
+    _GRAY = "#888888"   # 中性灰
+
     dir_icon = {
         "bullish": "▲",
         "bearish": "▼",
         "neutral": "—",
     }
-    band_icon = {
-        "bullish": "强多",
-        "mildly_bullish": "偏多",
+    band_label_map = {
+        "bullish": "强利好",
+        "mildly_bullish": "弱利好",
         "neutral": "中性",
         "mixed": "多空交织",
-        "mildly_bearish": "偏空",
-        "bearish": "强空",
+        "mildly_bearish": "弱利空",
+        "bearish": "强利空",
+    }
+    # band → 颜色（以 band 为准，它比 direction 更精确）
+    band_color = {
+        "bullish": _RED, "mildly_bullish": _RED,
+        "bearish": _GREEN, "mildly_bearish": _GREEN,
+        "neutral": _GRAY, "mixed": _GRAY,
     }
 
     # 影响范围标签
@@ -143,12 +154,15 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         chain = str(n.get("analysis_chain", "") or "").strip()[:120]
 
         icon = dir_icon.get(direction, "—")
-        band_label = band_icon.get(band, band)
+        b_label = band_label_map.get(band, band)
+        b_color = band_color.get(band, _GRAY)
 
-        # 第一行：序号 + 方向 + band + 影响范围 + 标题
-        title_parts = [f"**{i}. {icon}[{band_label}]"]
+        # 第一行：序号 + 彩色方向标签 + 影响范围 + 标题
+        # 方向标签用 HTML font 着色：红=利好 绿=利空 灰=中性
+        colored_tag = f'<font color="{b_color}">{icon} {b_label}</font>'
+        title_parts = [f"**{i}. {colored_tag}"]
         if scope_label:
-            title_parts.append(scope_label)
+            title_parts.append(f'<font color="{_GRAY}">{scope_label}</font>')
         title_parts.append(f"{n_title}**")
         lines.append(" ".join(title_parts) + "\n")
         # 第二行：板块 + 个股 + 影响分
