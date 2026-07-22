@@ -2,16 +2,16 @@
 name: 每日资讯推送
 
 on:
-  # 保留 schedule 作为兜底（cron-job.org 失败时仍能触发，只是可能延迟）
-  # 如果只用 cron-job.org，可以注释掉整个 schedule 块
+  # 主力：cron-job.org 外部定时服务通过 workflow_dispatch 触发（延迟<1分钟）
+  # 兜底：GitHub Actions schedule 作为备用，延后1小时避免与 cron-job.org 并发冲突
+  # （GitHub schedule 高峰期可能延迟30分钟~数小时，仅作为 cron-job.org 故障时的保险）
   schedule:
-    - cron: "0 1 * * *"     # UTC 01:00 = BJT 09:00 早盘前
-    - cron: "0 4 * * *"     # UTC 04:00 = BJT 12:00 午盘
-    - cron: "0 8 * * *"     # UTC 08:00 = BJT 16:00 盘后
-    - cron: "0 14 * * *"    # UTC 14:00 = BJT 22:00 晚间
+    - cron: "0 2 * * *"     # UTC 02:00 = BJT 10:00 早盘兜底（cron-job.org 09:00 失败时）
+    - cron: "0 5 * * *"     # UTC 05:00 = BJT 13:00 午盘兜底（cron-job.org 12:00 失败时）
+    - cron: "0 9 * * *"     # UTC 09:00 = BJT 17:00 盘后兜底（cron-job.org 16:00 失败时）
+    - cron: "0 15 * * *"    # UTC 15:00 = BJT 23:00 晚间兜底（cron-job.org 22:00 失败时）
   workflow_dispatch:
-    # 支持外部定时服务(cron-job.org)和手动触发
-    # slot 参数用于标注推送时段，可选值: morning/noon/afternoon/night
+    # 主力触发方式：cron-job.org 定时调用，slot 参数标注推送时段
     inputs:
       slot:
         description: '推送时段 (morning=09:00 / noon=12:00 / afternoon=16:00 / night=22:00)'
@@ -46,6 +46,9 @@ jobs:
       PUSH_TOP_N: "20"
       # 通过 inputs.slot 传递时段，daily_push.py 会读取 PUSH_SLOT 环境变量
       PUSH_SLOT: ${{ github.event.inputs.slot }}
+      # GITHUB_TOKEN 用于 schedule 兜底去重检查（查最近 runs 避免重复推送）
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
       - name: 检出代码

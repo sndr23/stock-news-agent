@@ -147,6 +147,52 @@ def _build_title() -> str:
     return base_title
 
 
+def _already_pushed_recently() -> bool:
+    """检查最近2小时内是否已有成功的推送（仅 schedule 兜底触发时调用）
+
+    通过 GitHub API 查询最近的 workflow runs，如果2小时内有成功的 run，
+    说明 cron-job.org 已经推送过，schedule 兜底应跳过避免重复推送。
+
+    仅在 GitHub Actions 环境中生效（有 GITHUB_TOKEN 和 GITHUB_REPOSITORY）。
+    """
+    token = os.getenv("GITHUB_TOKEN", "")
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    if not token or not repo:
+        return False  # 本地运行或无 token，不跳过
+
+    slot = os.getenv("PUSH_SLOT", "").strip().lower()
+    if slot:
+        return False  # cron-job.org / 手动触发（有明确 slot），不跳过
+
+    import urllib.request
+    import urllib.error
+
+    api_url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=10&status=completed"
+    req = urllib.request.Request(api_url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        logger.warning(f"查询最近 runs 失败(不跳过): {e}")
+        return False
+
+    now = datetime.now(BJT)
+    for run in data.get("workflow_runs", []):
+        if run.get("conclusion") != "success":
+            continue
+        created = datetime.fromisoformat(
+            run["created_at"].replace("Z", "+00:00")
+        ).astimezone(BJT)
+        elapsed_min = (now - created).total_seconds() / 60
+        if elapsed_min < 120:  # 2小时内有成功的 run
+            logger.info(f"最近 {int(elapsed_min)} 分钟已有成功推送(run #{run['run_number']})，schedule 兜底跳过")
+            return True
+    return False
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -186,6 +232,11 @@ def main():
     # 非交易日跳过推送（避免节假日浪费 LLM 配额）
     if not _is_trading_day():
         logger.info("今日非A股交易日，跳过推送")
+        _force_exit(0)
+
+    # schedule 兜底去重：如果2小时内已有成功推送（cron-job.org 已跑过），跳过
+    if _already_pushed_recently():
+        logger.info("schedule 兜底触发，但近期已有成功推送，跳过避免重复")
         _force_exit(0)
 
     # 运行 pipeline
