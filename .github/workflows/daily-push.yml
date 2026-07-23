@@ -2,16 +2,9 @@
 name: 每日资讯推送
 
 on:
-  # 主力：cron-job.org 通过 workflow_dispatch 触发（延迟<1分钟，4个时段已全部配置）
-  # 兜底：GitHub Actions schedule 延后1小时，cron-job.org 失败时自动补位
-  # daily_push.py 的 _already_pushed_recently() 确保不重复推送
-  schedule:
-    - cron: "0 2 * * *"     # UTC 02:00 = BJT 10:00 早盘兜底
-    - cron: "0 5 * * *"     # UTC 05:00 = BJT 13:00 午盘兜底
-    - cron: "0 9 * * *"     # UTC 09:00 = BJT 17:00 盘后兜底
-    - cron: "0 15 * * *"    # UTC 15:00 = BJT 23:00 晚间兜底
+  # 唯一触发方式：cron-job.org 定时调用 workflow_dispatch（延迟<1分钟）
+  # 4个时段均已配置：09:00/12:00/16:00/22:00 BJT
   workflow_dispatch:
-    # cron-job.org 定时调用 + 手动触发
     inputs:
       slot:
         description: '推送时段 (morning=09:00 / noon=12:00 / afternoon=16:00 / night=22:00)'
@@ -46,9 +39,6 @@ jobs:
       PUSH_TOP_N: "20"
       # 通过 inputs.slot 传递时段，daily_push.py 会读取 PUSH_SLOT 环境变量
       PUSH_SLOT: ${{ github.event.inputs.slot }}
-      # GITHUB_TOKEN 用于 schedule 兜底去重检查（查最近 runs 避免重复推送）
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
       - name: 检出代码
