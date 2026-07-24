@@ -242,9 +242,10 @@ def push_via_wxpusher(
     """
     # summary 限制 20 字，不传则自动截取
     if not summary:
-        # 去掉 Markdown 标记后截取前 20 字作为摘要
+        # 去掉 HTML 标签 + Markdown 标记后截取前 20 字作为摘要
         import re
-        plain = re.sub(r"[#*>\n\s]", "", content)
+        plain = re.sub(r"<[^>]+>", "", content)      # 去 HTML 标签 <font ...>
+        plain = re.sub(r"[#*>\n\s]", "", plain)       # 去 Markdown 标记
         summary = plain[:20]
     if len(summary) > 20:
         summary = summary[:20]
@@ -344,6 +345,18 @@ def push_news(
     # 推送前标题相似度去重（保留排名靠前的）
     ranked_news = dedup_ranked_by_title(ranked_news)
     content = format_ranked_news_md(ranked_news, top_n=top_n, title=title)
+
+    # 自动生成有意义的摘要（如未传入）：取推送条数 + 最高分资讯
+    if not summary:
+        push_count = min(len(ranked_news), top_n)
+        top_title = ""
+        if ranked_news:
+            raw = str(ranked_news[0].get("title", "") or "")
+            import re as _re
+            top_title = _re.sub(r"<[^>]+>", "", raw)[:15]
+        summary = f"今日{push_count}条重要资讯" + (f"｜{top_title}" if top_title else "")
+        if len(summary) > 20:
+            summary = summary[:20]
 
     if wxpusher_token and wxpusher_uid:
         return push_via_wxpusher(wxpusher_token, wxpusher_uid, title, content, summary=summary)
