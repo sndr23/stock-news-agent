@@ -14,6 +14,7 @@ A股资讯监测 Agent 节点实现
     - 影响板块/个股提取
 """
 import json
+import re
 import socket
 import time
 import logging
@@ -22,7 +23,7 @@ from langchain_core.messages import AIMessage
 logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
-from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news三层
+from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
 from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
@@ -127,7 +128,7 @@ def fetch_news_node(state: AgentState) -> dict:
 
     # 三层去重（URL/标题/SimHash）
     before_dedup = len(all_news)
-    all_news = dedup_news三层(all_news)
+    all_news = dedup_news_3layer(all_news)
     logger.info(f"[fetch_news] 三层去重: {before_dedup} -> {len(all_news)}条")
 
     # 哨兵：全部核心源失败
@@ -180,7 +181,7 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     注：噪音过滤交由权重表负责——零关联度且 sector 类的条目视为纯噪音丢弃，
         不再使用 nodes.py 内的 NOISE_KEYWORDS 黑名单（已删除）。
     """
-    deduped = dedup_news三层(news_list)
+    deduped = dedup_news_3layer(news_list)
     dup_count = len(news_list) - len(deduped)
 
     for news in deduped:
@@ -718,20 +719,27 @@ HIGH_SIGNAL_KEYWORDS = [
     "IPO", "定增", "可转债",
 ]
 
+# 预编译信号关键词正则：合并 HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS，
+# 用 re.escape 转义 "*ST" 等含正则元字符的关键词，
+# 正则引擎一次扫描即可匹配全部关键词，替代逐词 `in` 遍历（O(n×kw_count) → O(n)）
+_ALL_SIGNAL_KEYWORDS = HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS
+_SIGNAL_PATTERN = re.compile("|".join(re.escape(kw) for kw in _ALL_SIGNAL_KEYWORDS))
+
 
 def _has_high_signal(news_list: list) -> bool:
-    """检测资讯列表中是否存在任何重磅信号关键词 (含科技硬件)"""
+    """检测资讯列表中是否存在任何重磅信号关键词 (含科技硬件)
+
+    性能优化: 预编译正则 _SIGNAL_PATTERN 一次扫描所有关键词，
+    替代原先对每条 news 遍历两个关键词列表的逐词 `in` 检查。
+    """
     for news in news_list:
         title = news.get("title", "")
         content = news.get("content", "")
         name = news.get("name", "")
-        clean_title = title.replace(name, "") if name else title
-        clean_content = content.replace(name, "") if name else content
-        clean_text = f"{clean_title} {clean_content}"
-        
-        if any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS):
-            return True
-        if any(kw in clean_text for kw in HIGH_SIGNAL_KEYWORDS):
+        text = f"{title} {content}"
+        if name:
+            text = text.replace(name, "")
+        if _SIGNAL_PATTERN.search(text):
             return True
     return False
 
@@ -810,10 +818,17 @@ def llm_filter_node(state: AgentState) -> dict:
                 results_map[idx] = _llm_analyze_batch_structured(batch)
                 logger.info(f"LLM 批次 {idx} 分析完成")
             except Exception as e:
-                results_map[idx] = None
-                batch_errors += 1
-                error_details.append(f"批次{idx}: {str(e)[:80]}")
-                logger.warning(f"LLM 批次 {idx} 失败: {e}")
+                # 首次失败后重试一次（超时/限流等瞬时错误常可通过重试解决）
+                logger.warning(f"LLM 批次 {idx} 首次失败: {e}, 5s后重试...")
+                time.sleep(5)
+                try:
+                    results_map[idx] = _llm_analyze_batch_structured(batch)
+                    logger.info(f"LLM 批次 {idx} 重试成功")
+                except Exception as e2:
+                    results_map[idx] = None
+                    batch_errors += 1
+                    error_details.append(f"批次{idx}(重试仍失败): {str(e2)[:80]}")
+                    logger.warning(f"LLM 批次 {idx} 重试仍失败: {e2}")
             # 批次间限流间隔（最后一批不需要等）
             if idx < len(batches) - 1 and rate_limit_interval > 0:
                 logger.info(f"限流等待 {rate_limit_interval}s（中转平台: 1分钟最多3次请求）...")
