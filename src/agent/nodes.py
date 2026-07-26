@@ -28,7 +28,7 @@ from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
 
-def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2) -> str:
+def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 180, max_retries: int = 2) -> str:
     """直接用 requests 调用 LLM API
 
     关键: trust_env=False 禁止 requests 读取系统代理设置(Windows注册表/env vars),
@@ -510,7 +510,7 @@ def _build_llm():
     reasoning_models = ("agnes", "o1", "o3", "deepseek-r1", "deepseek-reasoner")
     extra_body = {}
     if any(m in OPENROUTER_MODEL_NAME.lower() for m in reasoning_models):
-        extra_body["reasoning_effort"] = "medium"  # 5步分析框架需要更深推理
+        extra_body["reasoning_effort"] = "low"  # 限流接口需快速返回，避免524超时
     return ChatOpenAI(
         model=OPENROUTER_MODEL_NAME,
         api_key=OPENROUTER_API_KEY,
@@ -518,6 +518,7 @@ def _build_llm():
         temperature=0.1,  # 结构化输出场景降低温度提升一致性
         max_tokens=16384,
         extra_body=extra_body,
+        timeout=180,  # 推理模型响应较慢，增大超时
     )
 
 
@@ -558,7 +559,7 @@ def _llm_analyze_batch_structured(batch: list) -> list:
 
     # 方式B：降级到 _call_llm_api + _safe_parse_json
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=2)
+        content = _call_llm_api(system_msg, prompt, timeout=180, max_retries=2)
         parsed = _safe_parse_json(content)
         raw_items = parsed.get("filtered_news", [])
         items = []
@@ -695,40 +696,29 @@ def llm_filter_node(state: AgentState) -> dict:
     batch_errors = 0
     error_details = []
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = 10
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
     old_socket_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(None)
 
     try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        max_workers = min(len(batches), 4)
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = {executor.submit(_llm_analyze_batch_structured, batch): idx for idx, batch in enumerate(batches)}
-
+        # 串行调用（qwqtao 等接口限流1分钟3次，并发会导致大量429）
+        # 批次间间隔 21 秒，确保 1 分钟内不超过 3 次请求
         results_map = {}
-        try:
-            for future in as_completed(futures, timeout=120):
-                idx = futures[future]
-                try:
-                    results_map[idx] = future.result(timeout=90)
-                    logger.info(f"LLM 批次 {idx} 分析完成")
-                except Exception as e:
-                    results_map[idx] = None
-                    batch_errors += 1
-                    error_details.append(f"批次{idx}: {str(e)[:80]}")
-                    logger.warning(f"LLM 批次 {idx} 失败: {e}")
-        except Exception as e:
-            logger.warning(f"LLM 并行超时: {e}")
-        finally:
-            # 取消未完成的 futures（运行中的线程无法中断，由 daily_push 的 os._exit 兜底）
-            for f in futures:
-                f.cancel()
+        for idx, batch in enumerate(batches):
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                executor.shutdown(wait=False)
+                results_map[idx] = _llm_analyze_batch_structured(batch)
+                logger.info(f"LLM 批次 {idx} 分析完成")
+            except Exception as e:
+                results_map[idx] = None
+                batch_errors += 1
+                error_details.append(f"批次{idx}: {str(e)[:80]}")
+                logger.warning(f"LLM 批次 {idx} 失败: {e}")
+            # 批次间限流间隔（最后一批不需要等）
+            if idx < len(batches) - 1:
+                logger.info(f"限流等待 21s（qwqtao: 1分钟最多3次请求）...")
+                time.sleep(21)
 
         # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
         for idx in range(len(batches)):
