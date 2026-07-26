@@ -515,19 +515,56 @@ def predict_direction_by_rules(title: str, content: str) -> str:
     """通过规则快速兜底判定多空方向"""
     text = f"{title} {content}"
 
-    # 否定词前缀：若关键词前接这些词，方向反转或不触发
-    negation_prefixes = ["不", "未", "取消", "终止", "失败", "撤销"]
-    def _has_negation(kw: str) -> bool:
-        """检查关键词前是否有否定前缀"""
+    # 否定词表（扩展）：覆盖单字否定、双字否定及隐含否定动词
+    # 奇数个否定 = 取反；偶数个 = 双重否定表肯定（如"未能否认"=承认）
+    _NEGATION_WORDS = [
+        "不", "未", "没", "无", "非", "勿", "莫",
+        "没有", "未能", "不能", "不会", "不再", "无从",
+        "取消", "终止", "撤销", "撤回", "中止", "停止", "废除", "解除",
+        "失败", "拒绝", "否认", "否定", "驳回", "推翻",
+    ]
+
+    def _count_negations_before(kw: str, window: int = 8) -> int:
+        """统计关键词前 window 字符窗口内的否定词数量
+
+        双重否定处理：奇数个否定词 → 取反；偶数个 → 互相抵消（表肯定）。
+        窗口式扫描替代原先的"紧邻完全匹配"，能捕获"未能否认业绩预增"
+        这类中间隔字词的语境。
+
+        非重叠计数：按长度降序贪心匹配，长否定词优先消耗字符位，
+        避免"未"与"未能"、"不"与"不再"等包含关系导致同一否定被重复计数。
+
+        Args:
+            kw: 目标关键词
+            window: 关键词向前扫描的字符窗口大小
+
+        Returns:
+            窗口内否定词总数（0 表示无否定）
+        """
+        count = 0
         idx = text.find(kw)
+        # 按长度降序：长否定词优先匹配，防止单字否定与双字否定重叠计数
+        sorted_neg = sorted(_NEGATION_WORDS, key=len, reverse=True)
         while idx >= 0:
-            for prefix in negation_prefixes:
-                # 检查关键词前 1-4 字是否是否定词
-                before = text[max(0, idx - len(prefix)):idx]
-                if before == prefix:
-                    return True
+            start = max(0, idx - window)
+            prefix_text = text[start:idx]
+            consumed = [False] * len(prefix_text)
+            for i in range(len(prefix_text)):
+                if consumed[i]:
+                    continue
+                for neg in sorted_neg:
+                    end = i + len(neg)
+                    if end <= len(prefix_text) and prefix_text[i:end] == neg:
+                        for j in range(i, end):
+                            consumed[j] = True
+                        count += 1
+                        break
             idx = text.find(kw, idx + 1)
-        return False
+        return count
+
+    def _has_negation(kw: str) -> bool:
+        """关键词前窗口内否定词数量为奇数则视为否定（双重否定抵消）"""
+        return _count_negations_before(kw) % 2 == 1
 
     strong_bullish = [
         "撤销退市", "撤销*ST", "撤销ST", "撤销风险警示", "申请撤销", "摘帽",
@@ -851,22 +888,30 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     if watchlist["stocks"] or watchlist["sectors"]:
         hit_watchlist = False
         # 检查个股命中（affected_stocks + stock_name），支持模糊匹配（如"寒武纪-U"匹配"寒武纪"）
+        # 短名（<2字）只做精确匹配，避免"AI"等短词误命中含"ai"的任意个股名
         stocks_to_check = list(affected_stocks) + ([stock_name] if stock_name else [])
         for s in stocks_to_check:
             if not s:
                 continue
             for watch_stock in watchlist["stocks"]:
-                # 精确匹配或包含匹配（处理科创板后缀 -U/-W 等）
-                if s == watch_stock or watch_stock in s or s in watch_stock:
+                if s == watch_stock:
+                    hit_watchlist = True
+                    break
+                # 模糊匹配仅对长度>=2的名字生效，防止短名子串误命中
+                if len(watch_stock) >= 2 and len(s) >= 2 and (watch_stock in s or s in watch_stock):
                     hit_watchlist = True
                     break
             if hit_watchlist:
                 break
         # 检查板块命中（模糊匹配：如"算力/AI基础设施/光模块"命中"算力"）
+        # 板块名通常>=2字，但仍对单字板块名只做精确匹配
         if not hit_watchlist:
             for sec in news.get("affected_sectors", []) or []:
                 for watch_sec in watchlist["sectors"]:
-                    if watch_sec in sec or sec in watch_sec:
+                    if sec == watch_sec:
+                        hit_watchlist = True
+                        break
+                    if len(watch_sec) >= 2 and (watch_sec in sec or sec in watch_sec):
                         hit_watchlist = True
                         break
                 if hit_watchlist:

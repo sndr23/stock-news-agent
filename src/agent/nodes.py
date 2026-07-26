@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
-from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, _load_watchlist
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
@@ -165,17 +165,62 @@ def _calc_similarity(text1: str, text2: str) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 
-_PREFILTER_QUOTA = {"direct": None, "sector": 30, "macro": 15}
 _PREFILTER_TOTAL_LIMIT = 60
+# 各类最小保底配额：确保冷门类别不被自适应比例饿死
+_PREFILTER_MIN_QUOTA = {"sector": 10, "macro": 5}
+
+
+def _adaptive_quota(buckets: dict, total_limit: int = _PREFILTER_TOTAL_LIMIT) -> dict:
+    """按实际命中数量比例分配 sector/macro 配额（direct 过多时也参与截断）
+
+    自适应逻辑：
+      1. direct 数量未超 total_limit - min_quota_sum 时全留；
+         超过时 direct 截断到 total_limit - min_quota_sum，保证 sector/macro 保底
+      2. 剩余配额 = total_limit - direct_quota（不低于 min_quota_sum）
+      3. sector/macro 按实际命中数比例瓜分剩余配额
+      4. sector 保底提升后重新计算 macro，防止保底提升导致总和超过 remaining
+
+    Returns:
+        {"direct": int|None, "sector": int, "macro": int}  # None 表示不截断
+    """
+    direct_count = len(buckets["direct"])
+    min_total = _PREFILTER_MIN_QUOTA["sector"] + _PREFILTER_MIN_QUOTA["macro"]
+
+    # direct 数量过多时也参与截断，保证 sector/macro 保底不被全局截断吃掉
+    if direct_count > total_limit - min_total:
+        direct_quota = total_limit - min_total
+        remaining = min_total
+    else:
+        direct_quota = None  # 全留
+        remaining = max(total_limit - direct_count, min_total)
+
+    sector_avail = len(buckets["sector"])
+    macro_avail = len(buckets["macro"])
+    total_avail = sector_avail + macro_avail
+
+    if total_avail == 0:
+        return {"direct": direct_quota, "sector": 0, "macro": 0}
+
+    if total_avail <= remaining:
+        return {"direct": direct_quota, "sector": sector_avail, "macro": macro_avail}
+
+    # 按比例分配
+    sector_quota = round(remaining * sector_avail / total_avail)
+    # 保底提升后重新计算 macro，防止保底提升导致总和超过 remaining
+    sector_quota = max(min(sector_quota, sector_avail), min(_PREFILTER_MIN_QUOTA["sector"], sector_avail))
+    macro_quota = remaining - sector_quota
+    macro_quota = max(min(macro_quota, macro_avail), min(_PREFILTER_MIN_QUOTA["macro"], macro_avail))
+
+    return {"direct": direct_quota, "sector": sector_quota, "macro": macro_quota}
 
 
 def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> tuple:
-    """Python 预筛：权重表打分 + 分类配额截断 + 聚类热度
+    """Python 预筛：权重表打分 + 自适应配额截断 + 聚类热度
 
     流程：
       1. 三层去重（URL/标题/SimHash）
       2. 对每条调 score_news_relevance 打分分类
-      3. 按分类配额截断：direct全留, sector取top20, macro取top10
+      3. 按自适应配额截断：direct全留, sector/macro按命中比例瓜分剩余配额
       4. 计算聚类热度 cluster_weight
 
     注：噪音过滤交由权重表负责——零关联度且 sector 类的条目视为纯噪音丢弃，
@@ -184,8 +229,23 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     deduped = dedup_news_3layer(news_list)
     dup_count = len(news_list) - len(deduped)
 
+    # 加载关注列表：命中关注个股的新闻提升为 direct 类
+    watchlist = _load_watchlist()
+    watch_stocks = list(watchlist.get("stocks", []))
+
     for news in deduped:
         score, category = score_news_relevance(news)
+        # 检查是否命中 watchlist 个股，命中则用股票名重新打分
+        if watch_stocks:
+            title = news.get("title", "")
+            content = news.get("content", "")
+            text = f"{title} {content}"
+            for ws in watch_stocks:
+                if ws in text:
+                    s, c = score_news_relevance(news, stock_name=ws)
+                    if s > score:
+                        score, category = s, c
+                    break
         news["_prefilter_score"] = score
         news["_prefilter_category"] = category
 
@@ -201,24 +261,35 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     for cat in buckets:
         buckets[cat].sort(key=lambda x: x["_prefilter_score"], reverse=True)
 
-    kept = []
-    for cat, quota in _PREFILTER_QUOTA.items():
-        if quota is not None:
-            kept.extend(buckets[cat][:quota])
-        else:
-            kept.extend(buckets[cat])
+    # 自适应配额：按实际命中比例分配，替代原先硬编码的 sector30/macro15
+    quota = _adaptive_quota(buckets, total_limit=top_n)
 
+    kept = []
+    for cat, q in quota.items():
+        if q is None:
+            kept.extend(buckets[cat])
+        else:
+            kept.extend(buckets[cat][:q])
+
+    # 安全兜底：配额分配已保证不超 top_n，此处仅防御性截断
     if len(kept) > top_n:
+        logger.warning(f"预筛配额分配后仍超限: {len(kept)} > {top_n}, 按score截断")
         kept.sort(key=lambda x: x["_prefilter_score"], reverse=True)
         kept = kept[:top_n]
 
+    # 聚类热度：预计算 2-gram 集合，避免 O(n²) 重复构建
+    gram_sets = []
+    for news in kept:
+        title = news.get("title", "")
+        gram_sets.append(set(title[i:i+2] for i in range(len(title)-1)) if len(title) > 1 else set())
+
     for i, news1 in enumerate(kept):
         cluster_size = 1
-        title1 = news1.get("title", "")
-        for j, news2 in enumerate(kept):
-            if i != j:
-                title2 = news2.get("title", "")
-                if _calc_similarity(title1, title2) > 0.35:
+        gs1 = gram_sets[i]
+        for j, gs2 in enumerate(gram_sets):
+            if i != j and gs1 and gs2:
+                union = len(gs1 | gs2)
+                if union > 0 and len(gs1 & gs2) / union > 0.35:
                     cluster_size += 1
         news1["cluster_weight"] = min(cluster_size - 1, 10)
 
@@ -464,8 +535,10 @@ def _safe_parse_json(content: str) -> dict:
 
     # 截断JSON修复：LLM输出被max_tokens截断时，JSON不完整
     # 策略：逐字符扫描filtered_news数组，提取所有完整的{}对象
+    # 长度上限保护：max_tokens=16384 限制了输出长度，超过 200KB 的文本几乎不可能出现，
+    # 加上限防御恶意/异常输入导致逐字符扫描 O(n) 性能问题
     fn_match = re.search(r'"filtered_news"\s*:\s*\[', cleaned)
-    if fn_match:
+    if fn_match and len(cleaned) <= 200_000:
         array_start = fn_match.end()  # 指向 [ 后第一个字符
         recovered_items = []
         i = array_start
@@ -812,13 +885,29 @@ def llm_filter_node(state: AgentState) -> dict:
         _slow_providers = ("qwqtao",)
         _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
         rate_limit_interval = 21 if _is_slow else 0
+        # 总超时熔断：60条/8批 × (90s+重试) 理论最坏 540s+，
+        # 设 deadline=240s 超时后剩余批次降级为原始预筛数据，避免云端 cron 超杀
+        _LLM_TOTAL_DEADLINE = 240
+        deadline = time.monotonic() + _LLM_TOTAL_DEADLINE
         results_map = {}
         for idx, batch in enumerate(batches):
+            if time.monotonic() >= deadline:
+                logger.warning(f"LLM 总超时熔断({_LLM_TOTAL_DEADLINE}s): 批次{idx}及后续共{len(batches)-idx}批降级")
+                batch_errors += len(batches) - idx
+                error_details.append(f"批次{idx}~{len(batches)-1}(总超时降级)")
+                break
             try:
                 results_map[idx] = _llm_analyze_batch_structured(batch)
                 logger.info(f"LLM 批次 {idx} 分析完成")
             except Exception as e:
                 # 首次失败后重试一次（超时/限流等瞬时错误常可通过重试解决）
+                # 重试前检查 deadline，避免重试本身突破总超时
+                if time.monotonic() >= deadline:
+                    logger.warning(f"LLM 批次 {idx} 失败且已达总超时，跳过重试降级")
+                    results_map[idx] = None
+                    batch_errors += 1
+                    error_details.append(f"批次{idx}(总超时降级)")
+                    continue
                 logger.warning(f"LLM 批次 {idx} 首次失败: {e}, 5s后重试...")
                 time.sleep(5)
                 try:
