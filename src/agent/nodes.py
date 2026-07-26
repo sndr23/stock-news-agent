@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage
 
 logger = logging.getLogger(__name__)
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL
+from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news三层
 from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS
 from src.agent.state import AgentState, NO_DATA_SENTINEL
@@ -50,6 +50,10 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
+    # OpenRouter 官方要求 HTTP-Referer 和 X-Title 请求头，否则返回 402
+    if IS_OPENROUTER_OFFICIAL:
+        headers["HTTP-Referer"] = "https://github.com/stock-news-agent"
+        headers["X-Title"] = "StockNewsAgent"
     payload = {
         "model": OPENROUTER_MODEL_NAME,
         "messages": [
@@ -63,7 +67,8 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
     last_error = None
     for attempt in range(max_retries + 1):
         session = requests.Session()
-        session.trust_env = False
+        # OpenRouter 官方需科学上网，保留系统代理；国内中转平台禁用代理避免 ConnectionRefused
+        session.trust_env = IS_OPENROUTER_OFFICIAL
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=timeout)
             resp.raise_for_status()
@@ -289,21 +294,22 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 - "央行降准0.5%→全市场流动性宽松→利好大盘→强利好→高置信"
 - "某小盘股获补贴200万→仅个股影响→弱利好→低置信"
 
-## 输出契约（每条必须包含全部字段）
-1. market_impact_score: 0-10（0无影响/10极重大）
-2. impact_band: 6档之一（与score区间一致）
+## 输出契约（每条只输出以下字段，不要重复content/source等原始字段）
+1. title: 原标题（用于匹配，必须与输入一致）
+2. market_impact_score: 0-10（0无影响/10极重大）
+3. impact_band: 6档之一（与score区间一致）
    - bullish(强利好, 6.5-10): 业绩预增/大额中标/政策扶持/增持回购/技术突破
    - mildly_bullish(弱利好, 5.5-6.4): 普通经营利好
    - neutral(中性, 4.5-5.5): 无明显多空的常规播报
    - mixed(多空交织, 4.5-5.5): 同时含利好利空
    - mildly_bearish(弱利空, 3.5-4.4): 普通经营利空
    - bearish(强利空, 0-3.4): 立案/退市/爆雷/违约/重大处罚
-3. confidence: high/medium/low
-4. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
-5. affected_stocks: 明确提及的个股
-6. impact_reason: 一句话影响逻辑
-7. influence_scope: market/sector/stock（按第2步判断）
-8. analysis_chain: 5步推理链（箭头连接，简明记录思考过程）
+4. confidence: high/medium/low
+5. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
+6. affected_stocks: 明确提及的个股
+7. impact_reason: 一句话影响逻辑
+8. influence_scope: market/sector/stock（按第2步判断）
+9. analysis_chain: 5步推理链（箭头连接，简明记录思考过程）
 
 ## 规则
 - band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
@@ -315,16 +321,12 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
   - 纯宏观经济评论（无具体板块/个股影响逻辑）
   - 重复报道同一事件（只保留信息量最大的一条）
 
-请以JSON格式返回（只返回JSON）:
+请以JSON格式返回（只返回JSON，不要输出content/source/published_at等原始字段）:
 ```json
 {{
   "filtered_news": [
     {{
       "title": "原标题",
-      "source": "原来源",
-      "content": "原内容",
-      "published_at": "原时间",
-      "category": "原分类",
       "market_impact_score": 8,
       "impact_band": "bullish",
       "confidence": "high",
@@ -341,9 +343,10 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 ```
 
 注意:
-- filtered_news 中每条必须保留原始字段并新增上述字段
+- filtered_news 中每条只输出title和分析字段，不要输出content/source/published_at/category
 - affected_sectors 必须尽力提取，仅当完全不涉及行业板块时才设为空数组
 - analysis_chain 必须填写，记录5步推理过程
+- analysis_chain尽量简短（一行内完成），impact_reason不超过30字
 """
 
 
@@ -363,9 +366,36 @@ def _repair_json(text: str) -> str:
     text = text.replace('\u3001', ',')
     # 替换不可见字符
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-    # 替换未转义的换行符
-    text = re.sub(r'(?<=": ")[^\n"]*(?=\n)', lambda m: m.group(0).replace('\n', '\\n').replace('\r', '\\r'), text, flags=re.DOTALL)
-    return text
+    # 转义JSON字符串值内的换行符（Claude等模型常返回未转义的换行）
+    # 逐字符扫描：在双引号字符串内，把裸 \n \r \t 转义
+    result = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            result.append(ch)
+            escape = False
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string:
+            if ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        else:
+            result.append(ch)
+    return ''.join(result)
 
 
 def _safe_parse_json(content: str) -> dict:
@@ -377,11 +407,14 @@ def _safe_parse_json(content: str) -> dict:
     import re
     cleaned = content
     cleaned = cleaned.replace('\u0000', '')  # 移除null字符
-    # 先提取代码块（避免代码块标记被破坏）
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json")[1].split("```")[0]
+    # 先提取代码块（避免代码块标记被破坏），处理 ```json / ``` 等变体
+    cb_match = re.search(r'```(?:json)?\s*\n?(.*?)```', cleaned, re.DOTALL)
+    if cb_match:
+        cleaned = cb_match.group(1)
     elif "```" in cleaned:
-        cleaned = cleaned.split("```")[1].split("```")[0]
+        parts = cleaned.split("```")
+        if len(parts) >= 3:
+            cleaned = parts[1]
     # 先修复中文标点（中文引号/冒号/逗号等），再做不可见字符清理
     cleaned = _repair_json(cleaned)
     # 清理不可见字符，但保留中文引号/标点（已转换为ASCII）和中文汉字
@@ -427,6 +460,51 @@ def _safe_parse_json(content: str) -> dict:
                         return {"filtered_news": news_array, "removed_count": 0}
                     except json.JSONDecodeError:
                         break
+
+    # 截断JSON修复：LLM输出被max_tokens截断时，JSON不完整
+    # 策略：逐字符扫描filtered_news数组，提取所有完整的{}对象
+    fn_match = re.search(r'"filtered_news"\s*:\s*\[', cleaned)
+    if fn_match:
+        array_start = fn_match.end()  # 指向 [ 后第一个字符
+        recovered_items = []
+        i = array_start
+        obj_depth = 0
+        obj_start = -1
+        in_str = False
+        escape = False
+        while i < len(cleaned):
+            ch = cleaned[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == '\\':
+                escape = True
+                i += 1
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == '{':
+                    if obj_depth == 0:
+                        obj_start = i
+                    obj_depth += 1
+                elif ch == '}':
+                    obj_depth -= 1
+                    if obj_depth == 0 and obj_start >= 0:
+                        obj_text = cleaned[obj_start:i+1]
+                        try:
+                            recovered_items.append(json.loads(obj_text))
+                        except json.JSONDecodeError:
+                            try:
+                                recovered_items.append(json.loads(_repair_json(obj_text)))
+                            except json.JSONDecodeError:
+                                pass
+                        obj_start = -1
+            i += 1
+        if recovered_items:
+            logger.info(f"截断JSON修复: 恢复了 {len(recovered_items)} 条完整记录")
+            return {"filtered_news": recovered_items, "removed_count": 0}
 
     # 最终降级: 返回空结果而不是抛出异常
     logger.warning(f"JSON解析最终失败，降级返回空结果: {cleaned[:100]}...")
@@ -511,6 +589,13 @@ def _build_llm():
     extra_body = {}
     if any(m in OPENROUTER_MODEL_NAME.lower() for m in reasoning_models):
         extra_body["reasoning_effort"] = "low"  # 限流接口需快速返回，避免524超时
+    # OpenRouter 官方要求 HTTP-Referer 和 X-Title 请求头
+    default_headers = {}
+    if IS_OPENROUTER_OFFICIAL:
+        default_headers = {
+            "HTTP-Referer": "https://github.com/stock-news-agent",
+            "X-Title": "StockNewsAgent",
+        }
     return ChatOpenAI(
         model=OPENROUTER_MODEL_NAME,
         api_key=OPENROUTER_API_KEY,
@@ -518,7 +603,8 @@ def _build_llm():
         temperature=0.1,  # 结构化输出场景降低温度提升一致性
         max_tokens=16384,
         extra_body=extra_body,
-        timeout=90,  # 非推理模型响应快
+        default_headers=default_headers,
+        timeout=90,  # Agnes 2.5 Flash 响应快
     )
 
 
@@ -544,18 +630,27 @@ def _llm_analyze_batch_structured(batch: list) -> list:
     借鉴 TradingAgents bind_structured + invoke_structured_or_freetext
     """
     prompt = _build_analysis_prompt(batch)
-    system_msg = "你是资深A股资讯分析师。请只返回JSON，不要在JSON字符串中使用换行符。"
+    system_msg = "你是资深A股资讯分析师。请直接返回纯JSON，不要使用```json代码块包裹，不要在JSON字符串中使用换行符。"
 
-    # 方式A：with_structured_output
+    # 直接调用 + _safe_parse_json（绕过 with_structured_output，避免 Claude 代码块包裹导致解析失败）
     try:
+        from langchain_core.messages import HumanMessage, SystemMessage
         llm = _build_llm()
-        structured_llm = llm.with_structured_output(NewsAnalysisBatch)
-        result = structured_llm.invoke(prompt)
-        if result and result.filtered_news is not None:
-            items = result.filtered_news
+        resp = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=prompt)])
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        parsed = _safe_parse_json(content)
+        raw_items = parsed.get("filtered_news", [])
+        items = []
+        for raw in raw_items:
+            try:
+                items.append(NewsAnalysisItem(**raw))
+            except Exception as e:
+                logger.warning(f"解析单条失败，跳过: {e}")
+        if items:
             return _apply_guardrails(items)
+        logger.warning(f"LLM返回内容解析为空，原始前200字: {content[:200]}")
     except Exception as e:
-        logger.warning(f"结构化输出失败，降级自由文本: {e}")
+        logger.warning(f"LLM直接调用失败: {e}")
 
     # 方式B：降级到 _call_llm_api + _safe_parse_json
     try:
@@ -696,15 +791,19 @@ def llm_filter_node(state: AgentState) -> dict:
     batch_errors = 0
     error_details = []
 
-    BATCH_SIZE = 15
+    BATCH_SIZE = 8
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
     old_socket_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(None)
 
     try:
-        # 串行调用（qwqtao 等接口限流1分钟3次，并发会导致大量429）
-        # 批次间间隔 21 秒，确保 1 分钟内不超过 3 次请求
+        # 串行调用（避免并发触发限流）
+        # 仅 qwqtao 等慢速中转平台需间隔21秒(1分钟3次)
+        # 硅基流动/OpenRouter官方等主流平台限流宽松，无需间隔
+        _slow_providers = ("qwqtao",)
+        _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
+        rate_limit_interval = 21 if _is_slow else 0
         results_map = {}
         for idx, batch in enumerate(batches):
             try:
@@ -716,9 +815,9 @@ def llm_filter_node(state: AgentState) -> dict:
                 error_details.append(f"批次{idx}: {str(e)[:80]}")
                 logger.warning(f"LLM 批次 {idx} 失败: {e}")
             # 批次间限流间隔（最后一批不需要等）
-            if idx < len(batches) - 1:
-                logger.info(f"限流等待 21s（qwqtao: 1分钟最多3次请求）...")
-                time.sleep(21)
+            if idx < len(batches) - 1 and rate_limit_interval > 0:
+                logger.info(f"限流等待 {rate_limit_interval}s（中转平台: 1分钟最多3次请求）...")
+                time.sleep(rate_limit_interval)
 
         # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
         for idx in range(len(batches)):
@@ -871,21 +970,119 @@ def llm_filter_node(state: AgentState) -> dict:
 
 
 # ============================================================
-# 节点3: rank_news - 纯Python评分排名
+# 节点3: rank_news - Python评分排名 + LLM智能重排
 # ============================================================
 
+RANK_PROMPT = """你是资深A股投研总监。以下资讯已经过初步筛选和评分，请综合判断后给出最终排序。
+
+## 资讯列表（共{n}条，按初步评分排序）
+{news_list}
+
+## 重排原则
+1. 市场影响力大的优先（央行政策 > 板块龙头事件 > 个股常规公告）
+2. 时效性强的优先（当日突发 > 前日资讯）
+3. 信息确定性高的优先（官方公告 > 市场传闻）
+4. 利好利空均可排前，关键是影响程度
+5. 噪音类（庆典/外交寒暄/无关国际事件）排到最后
+
+## 输出格式
+只返回JSON，不要代码块包裹:
+```json
+{{
+  "ranking": [
+    {{"title": "原标题", "final_rank": 1, "reason": "一句话排序理由"}}
+  ]
+}}
+```
+
+注意: final_rank 从1开始，1最重要。只返回 ranking 数组中的条目，数量与输入一致。
+"""
+
+
+def _llm_rerank(ranked_news: list, top_n: int = 20) -> list:
+    """用 LLM 对 top N 资讯进行智能重排序
+
+    Args:
+        ranked_news: Python 初步排名结果
+        top_n: 取前 N 条让 LLM 重排
+
+    Returns:
+        重排后的列表（若 LLM 失败则返回原始排名）
+    """
+    if len(ranked_news) <= 3:
+        return ranked_news
+
+    candidates = ranked_news[:top_n]
+    tail = ranked_news[top_n:]
+
+    # 构建精简资讯列表（只保留排序所需字段）
+    slim_list = []
+    for i, n in enumerate(candidates, 1):
+        slim_list.append({
+            "init_rank": i,
+            "title": n.get("title", ""),
+            "impact_band": n.get("impact_band", ""),
+            "market_impact_score": n.get("market_impact_score", 0),
+            "influence_scope": n.get("influence_scope", ""),
+            "impact_direction": n.get("impact_direction", ""),
+            "confidence": n.get("confidence", ""),
+            "published_at": n.get("published_at", ""),
+            "impact_reason": n.get("impact_reason", ""),
+        })
+
+    prompt = RANK_PROMPT.format(
+        n=len(slim_list),
+        news_list=json.dumps(slim_list, ensure_ascii=False, indent=2)
+    )
+    system_msg = "你是资深A股投研总监。请直接返回纯JSON，不要使用代码块包裹。"
+
+    try:
+        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=1)
+        parsed = _safe_parse_json(content)
+        ranking = parsed.get("ranking", [])
+        if not ranking:
+            logger.warning("[llm_rerank] LLM返回空排序，使用原始排名")
+            return ranked_news
+
+        # 构建 title -> final_rank 映射
+        title_to_rank = {}
+        for item in ranking:
+            title = item.get("title", "").strip()
+            rank = item.get("final_rank", 0)
+            if title and rank:
+                title_to_rank[title] = int(rank)
+
+        # 按 LLM 给的 final_rank 重排 candidates
+        def get_rank(n):
+            return title_to_rank.get(n.get("title", "").strip(), 999)
+
+        reranked_candidates = sorted(candidates, key=get_rank)
+        logger.info(f"[llm_rerank] LLM重排完成: {len(title_to_rank)}/{len(candidates)}条匹配")
+
+        # 合并: 重排的 top + 未参与重排的 tail
+        return reranked_candidates + tail
+    except Exception as e:
+        logger.warning(f"[llm_rerank] LLM重排失败，使用原始排名: {e}")
+        return ranked_news
+
+
 def rank_news_node(state: AgentState) -> dict:
-    """纯Python评分排名: 可信度 x 重要度 + 时间衰减"""
+    """Python评分排名 + LLM智能重排"""
     filtered_news = state.get("filtered_news", [])
     if not filtered_news:
         filtered_news = state.get("prefiltered_news", [])
 
+    # Stage 1: Python 初步排名
     ranked = rank_news(filtered_news)
+
+    # Stage 2: LLM 智能重排 top 20
+    if ranked:
+        ranked = _llm_rerank(ranked, top_n=20)
 
     top_score = ranked[0]["total_score"] if ranked else 0
 
     # 如果最终结果为空，提供明确的用户反馈
-    msg_parts = [f"[rank_news] 排名完成: 共{len(ranked)}条, 最高分: {top_score:.4f}"]
+    msg_parts = [f"[rank_news] 排名完成: 共{len(ranked)}条, 最高分: {top_score:.4f} (Python排名+LLM重排)"]
     if not ranked:
         raw_count = len(state.get("raw_news", []))
         pre_count = len(state.get("prefiltered_news", []))
