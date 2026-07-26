@@ -24,6 +24,7 @@ env/
 # 日志（保留 history 子目录用于历史推送记录）
 logs/*.log
 logs/*.log.*
+logs/local_test_result.json
 logs/!history/
 
 # IDE / 编辑器
