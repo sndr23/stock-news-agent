@@ -28,7 +28,7 @@ from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
 
-def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 180, max_retries: int = 2) -> str:
+def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2) -> str:
     """直接用 requests 调用 LLM API
 
     关键: trust_env=False 禁止 requests 读取系统代理设置(Windows注册表/env vars),
@@ -518,7 +518,7 @@ def _build_llm():
         temperature=0.1,  # 结构化输出场景降低温度提升一致性
         max_tokens=16384,
         extra_body=extra_body,
-        timeout=180,  # 推理模型响应较慢，增大超时
+        timeout=90,  # 非推理模型响应快
     )
 
 
@@ -559,7 +559,7 @@ def _llm_analyze_batch_structured(batch: list) -> list:
 
     # 方式B：降级到 _call_llm_api + _safe_parse_json
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=180, max_retries=2)
+        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=2)
         parsed = _safe_parse_json(content)
         raw_items = parsed.get("filtered_news", [])
         items = []
@@ -696,7 +696,7 @@ def llm_filter_node(state: AgentState) -> dict:
     batch_errors = 0
     error_details = []
 
-    BATCH_SIZE = 10
+    BATCH_SIZE = 15
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
     old_socket_timeout = socket.getdefaulttimeout()
