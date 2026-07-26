@@ -131,8 +131,14 @@ def _simhash(text: str, bits: int = 32) -> int:
     会导致测试不可复现）。bits=32：64-bit 下短文本单字符差异海明距离过大
     （实测"半导体板块大涨创历史新高"与加"！"-版距离 8），32-bit 在区分度与
     容差间平衡（相似文本距离 2，不同文本距离 13）。
+
+    超短标题（<5字）3-gram 数量不足，SimHash 区分度急剧下降（单字符差异
+    可能导致海明距离接近 bits/2），返回 0 让三层去重依赖前两层（URL+精确标题）。
     """
     if not text:
+        return 0
+    # 超短标题 3-gram 不足，SimHash 不可靠，跳过近似去重
+    if len(text) < 5:
         return 0
     grams = [text[i:i + 3] for i in range(max(len(text) - 2, 0))]
     if not grams:
@@ -274,8 +280,10 @@ def _fetch_cls_news():
     旧接口 nodeapi/telegraphList 已废弃(404)，akshare 的 stock_info_global_cls 响应极慢/失败
     新接口返回最近20条电报，无分页参数
 
-    含重试机制: 财联社 API 稳定性较差，日志显示频繁超时，
-    单次请求失败时重试最多2次（共3次尝试），每次间隔递增。
+    超时优化: 财联社 API 稳定性差且偶发连接挂起，原先单值超时 15s + 重试2次
+    最坏耗时 51s，超过 _parallel_fetch 的 per_source_timeout=30，拖垮整体等满
+    total_timeout=120s。改为 (connect,read)=(5,8) 元组 + 重试1次，最坏 28s < 30s，
+    快速失败让并行框架隔离该源，避免拖慢东财/新浪/同花顺已成功的批次。
     """
     import time as _time
 
@@ -291,11 +299,13 @@ def _fetch_cls_news():
         "sv": "8.7.9",
     }
 
-    max_retries = 2
+    # (connect, read) 元组：连接阶段 5s 防挂起，读取阶段 8s 防慢响应
+    _CLS_TIMEOUT = (5, 8)
+    max_retries = 1
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            resp = requests.get(url, params=params, headers=headers, timeout=_CLS_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             # 防御 API 返回 {"data": null} 的情况
@@ -554,21 +564,40 @@ def _fetch_lhb_signal():
 
 
 def _fetch_yjyg_signal():
-    """业绩预告 (stock_yjyg_em)"""
+    """业绩预告 (stock_yjyg_em)
+
+    日期回查逻辑：按"距今天最近且已过"的报告期排序尝试，
+    避免查到未来日期（1月运行时 today.replace(month=12) 产生今年12/31）
+    和过期数据（非财报季查到上季度旧数据全部被 _in_news_window 过滤为空）。
+    """
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         today = datetime.now(BJT)
-        for month_day in [(6, 30), (3, 31), (9, 30), (12, 31)]:
+        # 报告期固定为季度末：3/31, 6/30, 9/30, 12/31
+        # 按距今天数升序排列，优先查最近的已过报告期
+        quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
+        candidates = []
+        for m, d in quarter_ends:
+            report_date = today.replace(month=m, day=d)
+            # 未来日期回退到去年（1月运行时12/31应为去年）
+            if report_date > today:
+                report_date = report_date.replace(year=today.year - 1)
+            days_ago = (today - report_date).days
+            candidates.append((days_ago, m, d, report_date))
+        candidates.sort(key=lambda x: x[0])  # 按距今天数升序
+
+        df = None
+        for days_ago, m, d, report_date in candidates:
             try:
-                date_str = today.replace(month=month_day[0], day=month_day[1]).strftime("%Y%m%d")
+                date_str = report_date.strftime("%Y%m%d")
                 df = ak.stock_yjyg_em(date=date_str)
-                if len(df) > 0:
+                if df is not None and len(df) > 0:
                     break
             except Exception:
                 continue
-        else:
+        if df is None or len(df) == 0:
             return []
 
         signals = []
