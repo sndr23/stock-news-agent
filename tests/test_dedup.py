@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from src.tools.data_fetchers import (
     _normalize_url, _simhash, _hamming, _in_news_window,
-    dedup_news三层, NO_DATA_SENTINEL,
+    dedup_news_3layer, NO_DATA_SENTINEL,
 )
 
 
@@ -60,13 +60,13 @@ class TestInNewsWindow:
         assert _in_news_window("") is False
 
 
-class TestDedup三层:
+class TestDedup3Layer:
     def test_url_dedup(self):
         news = [
             {"title": "标题A", "url": "https://a.com/path?q=1", "content": ""},
             {"title": "标题A不同", "url": "https://a.com/path?q=2", "content": ""},
         ]
-        result = dedup_news三层(news)
+        result = dedup_news_3layer(news)
         assert len(result) == 1
 
     def test_title_exact_dedup(self):
@@ -74,7 +74,7 @@ class TestDedup三层:
             {"title": "相同标题", "url": "", "content": ""},
             {"title": "相同标题", "url": "", "content": ""},
         ]
-        result = dedup_news三层(news)
+        result = dedup_news_3layer(news)
         assert len(result) == 1
 
     def test_simhash_near_dedup(self):
@@ -82,7 +82,7 @@ class TestDedup三层:
             {"title": "半导体板块大涨创历史新高", "url": "https://x.com/1", "content": ""},
             {"title": "半导体板块大涨创历史新高！", "url": "https://y.com/2", "content": ""},
         ]
-        result = dedup_news三层(news, simhash_threshold=3)
+        result = dedup_news_3layer(news, simhash_threshold=3)
         assert len(result) == 1
 
     def test_keep_both_different(self):
@@ -90,5 +90,5 @@ class TestDedup三层:
             {"title": "半导体板块大涨", "url": "https://x.com/1", "content": ""},
             {"title": "央行降准释放流动性", "url": "https://y.com/2", "content": ""},
         ]
-        result = dedup_news三层(news)
+        result = dedup_news_3layer(news)
         assert len(result) == 2

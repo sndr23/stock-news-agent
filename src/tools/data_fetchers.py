@@ -185,7 +185,7 @@ def _in_news_window(published_at: str, look_back_days: int = 1) -> bool:
     return False
 
 
-def dedup_news三层(news_list: list, simhash_threshold: int = _SIMHASH_THRESHOLD) -> list:
+def dedup_news_3layer(news_list: list, simhash_threshold: int = _SIMHASH_THRESHOLD) -> list:
     """三层去重：URL 精确 → 标题精确 → SimHash 近似"""
     seen_urls = set()
     after_url = []
@@ -273,7 +273,12 @@ def _fetch_cls_news():
     新接口: https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9
     旧接口 nodeapi/telegraphList 已废弃(404)，akshare 的 stock_info_global_cls 响应极慢/失败
     新接口返回最近20条电报，无分页参数
+
+    含重试机制: 财联社 API 稳定性较差，日志显示频繁超时，
+    单次请求失败时重试最多2次（共3次尝试），每次间隔递增。
     """
+    import time as _time
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.cls.cn/telegraph",
@@ -285,61 +290,72 @@ def _fetch_cls_news():
         "os": "web",
         "sv": "8.7.9",
     }
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        # 防御 API 返回 {"data": null} 的情况
-        data_obj = data.get("data") or {}
-        roll_data = data_obj.get("roll_data") or []
-        if not roll_data:
-            logger.warning("财联社电报: API返回空 roll_data")
-            return []
 
-        news = []
-        today_str = datetime.now(BJT).strftime("%Y-%m-%d")
-        for item in roll_data:
-            ctime = item.get("ctime", "")
-            if not ctime:
-                continue
-            try:
-                # 兼容秒级(10位)和毫秒级(13位)时间戳
-                ctime_int = int(ctime)
-                if ctime_int > 1e12:  # 毫秒级
-                    ctime_int = ctime_int // 1000
-                dt = datetime.fromtimestamp(ctime_int, BJT)
-                pub_date = dt.strftime("%Y-%m-%d")
-                pub_time = dt.strftime("%H:%M:%S")
-            except (ValueError, TypeError):
-                continue
+    max_retries = 2
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            # 防御 API 返回 {"data": null} 的情况
+            data_obj = data.get("data") or {}
+            roll_data = data_obj.get("roll_data") or []
+            if not roll_data:
+                logger.warning("财联社电报: API返回空 roll_data")
+                return []
 
-            # 保留今天+昨天的电报（财联社API只返回20条，零点后当日可能只有1-2条）
-            yesterday_str = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y-%m-%d")
-            if pub_date not in (today_str, yesterday_str):
-                continue
+            news = []
+            today_str = datetime.now(BJT).strftime("%Y-%m-%d")
+            for item in roll_data:
+                ctime = item.get("ctime", "")
+                if not ctime:
+                    continue
+                try:
+                    # 兼容秒级(10位)和毫秒级(13位)时间戳
+                    ctime_int = int(ctime)
+                    if ctime_int > 1e12:  # 毫秒级
+                        ctime_int = ctime_int // 1000
+                    dt = datetime.fromtimestamp(ctime_int, BJT)
+                    pub_date = dt.strftime("%Y-%m-%d")
+                    pub_time = dt.strftime("%H:%M:%S")
+                except (ValueError, TypeError):
+                    continue
 
-            # 标题: 优先 title 字段，没有则取 content 前40字
-            title = item.get("title", "").strip()
-            content = item.get("content", "").strip()
-            if not title:
-                title = content[:40] + ("..." if len(content) > 40 else "")
-            if not title:
-                continue
+                # 保留今天+昨天的电报（财联社API只返回20条，零点后当日可能只有1-2条）
+                yesterday_str = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y-%m-%d")
+                if pub_date not in (today_str, yesterday_str):
+                    continue
 
-            news.append({
-                "title": title,
-                "source": "财联社电报",
-                "content": content,
-                "published_at": f"{pub_date} {pub_time}",
-                "category": "news",
-                "sentiment": "neutral",
-            })
+                # 标题: 优先 title 字段，没有则取 content 前40字
+                title = item.get("title", "").strip()
+                content = item.get("content", "").strip()
+                if not title:
+                    title = content[:40] + ("..." if len(content) > 40 else "")
+                if not title:
+                    continue
 
-        logger.info(f"财联社电报: 原始{len(roll_data)}条, 当日{len(news)}条")
-        return news
-    except Exception as e:
-        logger.warning(f"财联社电报获取失败: {e}")
-        return []
+                news.append({
+                    "title": title,
+                    "source": "财联社电报",
+                    "content": content,
+                    "published_at": f"{pub_date} {pub_time}",
+                    "category": "news",
+                    "sentiment": "neutral",
+                })
+
+            logger.info(f"财联社电报: 原始{len(roll_data)}条, 当日{len(news)}条"
+                        + (f" (第{attempt+1}次尝试成功)" if attempt > 0 else ""))
+            return news
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 * (attempt + 1)
+                logger.warning(f"财联社电报第{attempt+1}次请求失败: {e}, {wait}s后重试...")
+                _time.sleep(wait)
+            else:
+                logger.warning(f"财联社电报获取失败(已重试{max_retries}次): {e}")
+    return []
 
 
 def _fetch_sina_news():
