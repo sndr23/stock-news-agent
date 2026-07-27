@@ -1,7 +1,7 @@
 # filepath: tests/test_llm_structured.py
 """测试 LLM 结构化输出构建与降级逻辑（mock LLM，不发真实请求）"""
 from unittest.mock import patch, MagicMock
-from src.agent.nodes import _build_analysis_prompt, _llm_analyze_batch_structured
+from src.agent.nodes import _build_analysis_prompt, _llm_analyze_batch_structured, _normalize_llm_item
 from src.schemas import NewsAnalysisItem, ImpactBand, Confidence
 
 
@@ -34,7 +34,10 @@ def test_structured_output_success_via_mock():
         result = _llm_analyze_batch_structured([{"title": "测试", "content": "", "source": ""}])
 
     assert len(result) == 1
-    assert result[0].impact_band == ImpactBand.BULLISH
+    # 返回类型为 dict（容错版 _parse_llm_items 返回标准化 dict）
+    assert isinstance(result[0], dict)
+    assert result[0]["impact_band"] == "bullish"
+    assert result[0]["market_impact_score"] == 8.0
 
 
 def test_structured_output_fallback_to_freetext():
@@ -48,4 +51,44 @@ def test_structured_output_fallback_to_freetext():
             result = _llm_analyze_batch_structured([{"title": "测试", "content": "", "source": ""}])
 
     assert len(result) == 1
-    assert result[0].impact_band == ImpactBand.BULLISH
+    assert isinstance(result[0], dict)
+    assert result[0]["impact_band"] == "bullish"
+
+
+def test_normalize_llm_item_field_aliases():
+    """字段名变体（band/score 等）应被正确映射"""
+    # 用 band 而非 impact_band，用 score 而非 market_impact_score
+    raw = {"title": "测试", "band": "bearish", "score": 3.5, "sectors": ["新能源"], "stocks": "比亚迪,宁德时代"}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is not None
+    assert normalized["impact_band"] == "bearish"
+    assert normalized["market_impact_score"] == 3.5
+    assert normalized["affected_sectors"] == ["新能源"]
+    assert normalized["affected_stocks"] == ["比亚迪", "宁德时代"]
+    # 缺失字段有默认值
+    assert normalized["confidence"] == "medium"
+    assert normalized["impact_reason"] == ""
+    assert normalized["sentiment"] == "bearish"
+
+
+def test_normalize_llm_item_missing_band_infers_from_score():
+    """impact_band 缺失时应从 score 推断"""
+    raw = {"title": "测试", "score": 7.5}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is not None
+    assert normalized["impact_band"] == "bullish"  # 7.5 >= 6.5
+
+
+def test_normalize_llm_item_no_title_returns_none():
+    """没有 title 时返回 None（无法匹配原始新闻）"""
+    raw = {"score": 5.0, "impact_band": "neutral"}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is None
+
+
+def test_normalize_llm_item_invalid_band_infers_from_score():
+    """无效的 band 值应从 score 推断，而非丢弃整条"""
+    raw = {"title": "测试", "impact_band": "positive", "score": 6.0}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is not None
+    assert normalized["impact_band"] == "mildly_bullish"  # 6.0 对应 5.5-6.499 = mildly_bullish
