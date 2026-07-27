@@ -1,7 +1,8 @@
-﻿# filepath: src/tools/data_fetchers.py
+# filepath: src/tools/data_fetchers.py
 """
 A股资讯数据获取工具
-多源并行聚合: 东财快讯 + 财联社电报 + 交易所公告
+多源并行聚合: 东财快讯 + 财联社电报 + 新浪/同花顺 + 富途全球 + 华尔街见闻 + 交易所公告
+国际资讯覆盖: 富途全球(美股/港股/国际宏观) + 华尔街见闻(地缘政治/外围股市/大宗商品)
 抓取全部可用数据, 按当日日期过滤 + 去重
 """
 import json
@@ -434,6 +435,133 @@ def _fetch_ths_news():
         socket.setdefaulttimeout(old_timeout)
 
 
+def _fetch_futu_news():
+    """富途全球快讯 (stock_info_global_futu)
+
+    富途牛牛全球财经快讯，覆盖美股/港股/A股及国际宏观，
+    固定返回最近50条，国际资讯覆盖度优于东财/新浪/同花顺。
+    用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
+    """
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
+    try:
+        import akshare as ak
+        df = ak.stock_info_global_futu()
+        news = []
+        for _, row in df.iterrows():
+            pub_time = str(row.get("发布时间", ""))
+            if not _in_news_window(pub_time, look_back_days=1):
+                continue
+            content = str(row.get("内容", ""))
+            title = str(row.get("标题", ""))
+            # 富途标题可能为空，用内容前40字兜底
+            if not title:
+                title = content[:40] + ("..." if len(content) > 40 else "")
+            if not title:
+                continue
+            news.append({
+                "title": title,
+                "source": "富途全球快讯",
+                "content": content,
+                "published_at": pub_time,
+                "category": "news",
+                "sentiment": "neutral"
+            })
+        logger.info(f"富途全球快讯: 原始{len(df)}行, 当日{len(news)}条")
+        return news
+    except Exception as e:
+        logger.warning(f"富途全球快讯获取失败: {e}")
+        return []
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+def _fetch_wallstreetcn_news():
+    """华尔街见闻实时快讯 (直接API)
+
+    华尔街见闻 global-channel 涵盖全球宏观/地缘政治/外围股市/大宗商品，
+    国际资讯覆盖度最优。API返回最近30条，无分页。
+    内容字段可能含 HTML 标签，需清洗。
+    """
+    import time as _time
+    import re as _re
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    url = "https://api-one-wscn.awtmt.com/apiv1/content/lives"
+    params = {"channel": "global-channel", "limit": 30}
+
+    _WSCN_TIMEOUT = (5, 10)
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=_WSCN_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("data", {}).get("items", [])
+            if not items:
+                logger.warning("华尔街见闻: API返回空 items")
+                return []
+
+            news = []
+            today_str = datetime.now(BJT).strftime("%Y-%m-%d")
+            yesterday_str = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y-%m-%d")
+            for item in items:
+                # display_time 是秒级时间戳
+                display_time = item.get("display_time", 0)
+                if not display_time:
+                    continue
+                try:
+                    dt = datetime.fromtimestamp(int(display_time), BJT)
+                    pub_date = dt.strftime("%Y-%m-%d")
+                    pub_time = dt.strftime("%H:%M:%S")
+                except (ValueError, TypeError, OSError):
+                    continue
+
+                if pub_date not in (today_str, yesterday_str):
+                    continue
+
+                # 标题优先 title 字段，没有则从 content 提取纯文本
+                title = item.get("title", "").strip()
+                content_raw = item.get("content", "")
+                # content 可能是 list[{content: "..."}] 或 string
+                if isinstance(content_raw, list):
+                    content_text = " ".join(
+                        str(c.get("content", "")) for c in content_raw if isinstance(c, dict)
+                    )
+                else:
+                    content_text = str(content_raw)
+
+                # 清洗 HTML 标签
+                content_text = _re.sub(r'<[^>]+>', '', content_text).strip()
+                if not title:
+                    title = content_text[:40] + ("..." if len(content_text) > 40 else "")
+                if not title:
+                    continue
+
+                news.append({
+                    "title": title,
+                    "source": "华尔街见闻",
+                    "content": content_text,
+                    "published_at": f"{pub_date} {pub_time}",
+                    "category": "news",
+                    "sentiment": "neutral",
+                })
+
+            logger.info(f"华尔街见闻: 原始{len(items)}条, 当日{len(news)}条"
+                        + (f" (第{attempt+1}次尝试成功)" if attempt > 0 else ""))
+            return news
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 * (attempt + 1)
+                logger.warning(f"华尔街见闻第{attempt+1}次请求失败: {e}, {wait}s后重试...")
+                _time.sleep(wait)
+            else:
+                logger.warning(f"华尔街见闻获取失败(已重试{max_retries}次): {e}")
+    return []
+
+
 def _fetch_announcements():
     """交易所公告 (stock_notice_report)
 
@@ -745,8 +873,9 @@ def get_hs300_constituents() -> dict:
 
 @tool
 def get_stock_news(data_mode: str = "live") -> list:
-    """获取当日全部A股财经新闻（多源聚合: 东财快讯 + 财联社电报）。
+    """获取当日全部A股财经新闻（多源聚合: 东财快讯 + 财联社电报 + 富途全球 + 华尔街见闻）。
     自动按当日过滤 + 去重。
+    国际资讯覆盖：富途全球快讯(美股/港股/国际宏观) + 华尔街见闻(地缘政治/外围股市/大宗商品)。
     """
     today = datetime.now(BJT).strftime("%Y-%m-%d")
     cache_key = f"stock_news_{data_mode}"
@@ -759,6 +888,8 @@ def get_stock_news(data_mode: str = "live") -> list:
         _fetch_cls_news: "财联社电报",
         _fetch_sina_news: "新浪财经",
         _fetch_ths_news: "同花顺快讯",
+        _fetch_futu_news: "富途全球快讯",
+        _fetch_wallstreetcn_news: "华尔街见闻",
     })
 
     all_news = []
