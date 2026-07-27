@@ -233,7 +233,12 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
 
     # 公告预过滤：非龙头股的低影响常规公告直接丢弃
     # 避免大量 *ST 小票的董事会决议/章程修订/独董声明等占用预筛配额
-    hs300 = get_hs300_constituents()
+    # get_hs300_constituents 失败时返回空集合，is_leader_or_high_impact 保守不过滤
+    try:
+        hs300 = get_hs300_constituents()
+    except Exception as e:
+        logger.warning(f"[prefilter] 获取沪深300成分股失败，跳过公告预过滤: {e}")
+        hs300 = {"codes": set(), "names": set()}
     before_ann_filter = len(deduped)
     filtered = []
     ann_removed = 0
