@@ -678,7 +678,7 @@ def _build_llm():
         max_tokens=16384,
         extra_body=extra_body,
         default_headers=default_headers,
-        timeout=90,  # Agnes 2.5 Flash 响应快
+        timeout=120,  # 推理模型偶发慢响应，90s不够（日志证实7/26 22:11超时）
     )
 
 
@@ -698,49 +698,115 @@ def _build_analysis_prompt(news_batch: list) -> str:
     )
 
 
-def _llm_analyze_batch_structured(batch: list) -> list:
-    """结构化输出 + 自由文本降级
+def _build_simple_prompt(news_batch: list) -> str:
+    """构建简化版分析提示词（JSON解析失败时重试用）
 
-    借鉴 TradingAgents bind_structured + invoke_structured_or_freetext
+    去掉 analysis_chain / influence_scope / confidence 等复杂字段，
+    只保留核心分析字段，降低推理模型的输出复杂度，提高 JSON 合规率。
+    """
+    truncated_batch = []
+    for n in news_batch:
+        item = dict(n)
+        content = item.get("content", "")
+        if len(content) > 200:
+            item["content"] = content[:200] + "..."
+        truncated_batch.append(item)
+
+    simple_prompt = """你是资深A股资讯分析师。对以下资讯逐条分析，输出简洁JSON。
+
+## 资讯列表（共{n}条）
+{news_list}
+
+## 输出格式（每条只输出以下字段）
+```json
+{{
+  "filtered_news": [
+    {{
+      "title": "原标题",
+      "market_impact_score": 7,
+      "impact_band": "bullish",
+      "affected_sectors": ["半导体"],
+      "affected_stocks": ["中芯国际"],
+      "impact_reason": "一句话影响逻辑"
+    }}
+  ],
+  "removed_count": 0
+}}
+```
+
+band取值: bullish(强利好,6.5-10) / mildly_bullish(弱利好,5.5-6.4) / neutral(中性,4.5-5.5) / mixed(多空交织,4.5-5.5) / mildly_bearish(弱利空,3.5-4.4) / bearish(强利空,0-3.4)
+
+只返回JSON，不要代码块包裹。"""
+    return simple_prompt.format(
+        n=len(truncated_batch),
+        news_list=json.dumps(truncated_batch, ensure_ascii=False, indent=2)
+    )
+
+
+def _parse_llm_items(content: str) -> list:
+    """解析 LLM 返回内容为 NewsAnalysisItem 列表"""
+    parsed = _safe_parse_json(content)
+    raw_items = parsed.get("filtered_news", [])
+    items = []
+    for raw in raw_items:
+        try:
+            items.append(NewsAnalysisItem(**raw))
+        except Exception as e:
+            logger.warning(f"解析单条失败，跳过: {e}")
+    return items
+
+
+def _llm_analyze_batch_structured(batch: list) -> list:
+    """结构化输出 + 自由文本降级 + 简化prompt重试
+
+    三级调用策略：
+      方式A: LangChain ChatOpenAI（timeout=120s）
+      方式B: requests 直调 _call_llm_api（timeout=120s, max_retries=2）
+      方式C: 简化prompt重试（去掉 analysis_chain 等复杂字段，降低输出复杂度）
+
+    全部失败时抛异常（不静默返回原始数据），让 llm_filter_node 的重试机制生效。
     """
     prompt = _build_analysis_prompt(batch)
     system_msg = "你是资深A股资讯分析师。请直接返回纯JSON，不要使用```json代码块包裹，不要在JSON字符串中使用换行符。"
 
-    # 直接调用 + _safe_parse_json（绕过 with_structured_output，避免 Claude 代码块包裹导致解析失败）
+    # 方式A：LangChain 直接调用 + _safe_parse_json
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
         llm = _build_llm()
         resp = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=prompt)])
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
-        parsed = _safe_parse_json(content)
-        raw_items = parsed.get("filtered_news", [])
-        items = []
-        for raw in raw_items:
-            try:
-                items.append(NewsAnalysisItem(**raw))
-            except Exception as e:
-                logger.warning(f"解析单条失败，跳过: {e}")
+        items = _parse_llm_items(content)
         if items:
             return _apply_guardrails(items)
-        logger.warning(f"LLM返回内容解析为空，原始前200字: {content[:200]}")
+        logger.warning(f"方式A解析为空，原始前200字: {content[:200]}")
     except Exception as e:
-        logger.warning(f"LLM直接调用失败: {e}")
+        logger.warning(f"方式A(LLM直接调用)失败: {e}")
 
-    # 方式B：降级到 _call_llm_api + _safe_parse_json
+    # 方式B：requests 直调 + _safe_parse_json
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=2)
-        parsed = _safe_parse_json(content)
-        raw_items = parsed.get("filtered_news", [])
-        items = []
-        for raw in raw_items:
-            try:
-                items.append(NewsAnalysisItem(**raw))
-            except Exception as e:
-                logger.warning(f"解析单条失败，跳过: {e}")
-        return _apply_guardrails(items)
+        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=2)
+        items = _parse_llm_items(content)
+        if items:
+            return _apply_guardrails(items)
+        logger.warning(f"方式B解析为空，原始前200字: {content[:200]}")
     except Exception as e:
-        logger.error(f"LLM 分析完全失败: {e}")
-        return batch
+        logger.warning(f"方式B(requests直调)失败: {e}")
+
+    # 方式C：简化prompt重试（降低输出复杂度，提高JSON合规率）
+    try:
+        simple_prompt = _build_simple_prompt(batch)
+        simple_sys = "你是资深A股资讯分析师。直接返回简洁JSON，不要代码块包裹。"
+        content = _call_llm_api(simple_sys, simple_prompt, timeout=120, max_retries=1)
+        items = _parse_llm_items(content)
+        if items:
+            logger.info(f"方式C(简化prompt)成功恢复{len(items)}条")
+            return _apply_guardrails(items)
+        logger.warning(f"方式C解析为空，原始前200字: {content[:200]}")
+    except Exception as e:
+        logger.warning(f"方式C(简化prompt)失败: {e}")
+
+    # 全部失败：抛异常让 llm_filter_node 重试机制生效（不再静默返回原始数据）
+    raise Exception("LLM三级调用全部失败(方式A/B/C)，需上层重试或降级")
 
 
 # ============================================================
@@ -1141,7 +1207,7 @@ def _llm_rerank(ranked_news: list, top_n: int = 20) -> list:
     system_msg = "你是资深A股投研总监。请直接返回纯JSON，不要使用代码块包裹。"
 
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=1)
+        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=1)
         parsed = _safe_parse_json(content)
         ranking = parsed.get("ranking", [])
         if not ranking:
