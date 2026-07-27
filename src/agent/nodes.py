@@ -1067,7 +1067,11 @@ def llm_filter_node(state: AgentState) -> dict:
     batch_errors = 0
     error_details = []
 
-    BATCH_SIZE = 8
+    # 限流平台用小批次(8条/批, 21s间隔), 主流平台用大批次(15条/批, 2s间隔)
+    # 减少批次数=减少LLM调用次数=降低总耗时和限流风险
+    _slow_providers = ("qwqtao",)
+    _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
+    BATCH_SIZE = 8 if _is_slow else 15
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
     old_socket_timeout = socket.getdefaulttimeout()
@@ -1075,13 +1079,10 @@ def llm_filter_node(state: AgentState) -> dict:
 
     try:
         # 串行调用（避免并发触发限流）
-        # 仅 qwqtao 等慢速中转平台需间隔21秒(1分钟3次)
-        # 硅基流动/OpenRouter官方等主流平台限流宽松，但也加2s间隔避免瞬时限流
-        _slow_providers = ("qwqtao",)
-        _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
+        # _slow_providers / _is_slow 已在 BATCH_SIZE 处定义
         rate_limit_interval = 21 if _is_slow else 2
-        # 总超时熔断：60条/8批 × (120s+重试) 理论最坏 960s+，
-        # 设 deadline=300s 超时后剩余批次降级为原始预筛数据，避免云端 cron 超杀
+        # 总超时熔断：60条/4批 × (120s+重试) 主流平台理论最坏 480s+，
+        # 设 deadline=300s 超时后剩余批次降级为规则分析，避免云端 cron 超杀
         _LLM_TOTAL_DEADLINE = 300
         deadline = time.monotonic() + _LLM_TOTAL_DEADLINE
         results_map = {}
@@ -1131,8 +1132,29 @@ def llm_filter_node(state: AgentState) -> dict:
                     else:
                         all_llm_results.append(item)
             else:
-                # 失败降级处理
+                # 失败降级处理：对原始news补全方向/板块/band字段，
+                # 避免下游rank_news用默认neutral/3.0导致排名偏低
                 for n in batch:
+                    if n.get("category") == "signal":
+                        # 信号情报已有方向，直接保留
+                        all_llm_results.append(n)
+                        continue
+                    direction = predict_direction_by_rules(n.get("title", ""), n.get("content", ""))
+                    n["market_impact_score"] = 5.0 if direction != "neutral" else 3.0
+                    n["impact_direction"] = direction
+                    n["affected_sectors"] = infer_sectors_by_rules(
+                        n.get("title", ""), n.get("content", ""), n.get("name", ""))
+                    n["impact_reason"] = "大模型调用降级：基于规则系统自动分析"
+                    n["sentiment"] = direction
+                    if direction == "bullish":
+                        n["impact_band"] = "mildly_bullish"
+                    elif direction == "bearish":
+                        n["impact_band"] = "mildly_bearish"
+                    else:
+                        n["impact_band"] = "neutral"
+                    n["confidence"] = "low"
+                    n["influence_scope"] = "stock"
+                    n["analysis_chain"] = ""
                     all_llm_results.append(n)
 
     except Exception as e:
@@ -1203,7 +1225,13 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["affected_stocks"] = news.get("affected_stocks", [])
                 news["impact_reason"] = "大模型调用降级：基于规则系统自动分析"
                 news["sentiment"] = direction
-                news["impact_band"] = "neutral"
+                # band 与 direction 同步：避免降级时利好资讯被排到最后
+                if direction == "bullish":
+                    news["impact_band"] = "mildly_bullish"
+                elif direction == "bearish":
+                    news["impact_band"] = "mildly_bearish"
+                else:
+                    news["impact_band"] = "neutral"
                 news["confidence"] = "low"
                 news["influence_scope"] = "stock"
                 news["analysis_chain"] = ""
