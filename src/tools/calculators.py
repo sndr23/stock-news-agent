@@ -334,15 +334,30 @@ def score_news_relevance(item: dict, stock_code: str = "", stock_name: str = "")
     is_macro = any(t in text for t in _MACRO_NEWS_TERMS)
     # 政策性词汇（央行/降准/降息等）不罚分，只有纯宏观评论才罚分
     has_policy = any(kw in text for kw in POLICY_KEYWORDS)
-    # 外围风险事件检测：地缘冲突/外围暴跌/大宗商品剧变等
-    # 命中风险关键词的 macro 资讯不罚分——这些事件对A股有直接传导效应
-    global_risk_hits = sum(1 for kw in HIGH_IMPACT_KEYWORDS if kw in text and kw not in POLICY_KEYWORDS)
-    if is_macro and direct_signal == 0 and not has_policy and global_risk_hits == 0:
+
+    # 外围资讯精细化分层：只对"影响全球或A股科技板块"的外围资讯加分
+    # 核心外围关键词：直接传导A股科技/全球系统性风险
+    _GLOBAL_TECH_RISK_TERMS = [
+        # 科技管制（直接传导A股科技板块）
+        "制裁", "出口管制", "禁运", "技术封锁", "实体清单", "关税", "贸易战",
+        # 全球系统性风险（影响全球市场）
+        "美联储", "加息", "降息", "缩表", "QE", "鲍威尔", "非农",
+        "熔断", "崩盘", "债务危机", "银行危机", "金融风险", "系统性风险",
+        "原油暴涨", "原油暴跌",
+        # 地缘冲突（影响全球风险偏好）
+        "战争", "军事冲突", "冲突", "地缘",
+        # 外围股市剧变（传导A股情绪）
+        "暴跌",
+    ]
+    global_tech_hits = sum(1 for kw in _GLOBAL_TECH_RISK_TERMS if kw in text)
+
+    # 纯外围资讯罚分条件：是 macro 类 + 无 direct_signal + 无政策词 + 无核心外围关键词
+    if is_macro and direct_signal == 0 and not has_policy and global_tech_hits == 0:
         score -= 12
 
-    # 外围风险事件加分：让 macro 桶内的外围风险资讯在排序中靠前
-    if global_risk_hits > 0:
-        score += min(global_risk_hits * 5, 15)
+    # 核心外围事件加分：只对影响全球/A股科技板块的外围资讯加分
+    if global_tech_hits > 0:
+        score += min(global_tech_hits * 5, 15)
 
     score = max(0, min(100, score))
 
@@ -794,6 +809,86 @@ def _is_hs300_stock(stock_name: str, stock_code: str, hs300: dict) -> bool:
     if stock_code and stock_code in codes:
         return True
     if stock_name and stock_name in names:
+        return True
+    return False
+
+
+# 高影响公告关键词：即使非龙头股，命中这些词的公告也保留
+_HIGH_IMPACT_ANN_KEYWORDS = [
+    "立案调查", "重大违法", "破产重整", "破产清算", "强制解散", "被接管",
+    "业绩预告", "业绩预增", "业绩预减", "业绩修正", "业绩扭亏", "业绩盈转亏",
+    "重大资产重组", "借壳上市", "重大收购", "重大出售",
+    "债务违约", "债务展期", "巨额亏损",
+    "监管处罚", "行政处罚", "警示函", "监管措施",
+    "股票停牌", "复牌", "退市", "终止上市", "实施退市风险",
+    "撤销退市", "撤销*ST", "撤销ST", "摘帽",
+]
+
+
+def is_high_impact_announcement(news: dict) -> bool:
+    """判断公告是否为高影响公告（无论是否龙头股都应保留）
+
+    判断标准：命中高影响关键词（立案/退市/重组/业绩预告/债务违约等）
+    """
+    title = news.get("title", "")
+    content = news.get("content", "")
+    text = f"{title} {content}"
+    return any(kw in text for kw in _HIGH_IMPACT_ANN_KEYWORDS)
+
+
+# 科技龙头股名单（沪深300可能未覆盖的科创板/创业板科技龙头）
+# 这些个股的公告即使非高影响也保留，因为其动向对科技板块有风向标意义
+_TECH_LEADER_STOCKS = {
+    # 代码集合
+    "688256",  # 寒武纪
+    "688041",  # 海光信息
+    "300308",  # 中际旭创
+    "300502",  # 新易盛
+    "002371",  # 北方华创
+    "603501",  # 韦尔股份
+    "300661",  # 圣邦股份
+    "688008",  # 澜起科技
+    "002463",  # 沪电股份
+    "300394",  # 天孚通信
+    "002281",  # 光迅科技
+    "688599",  # 天合储能
+    "688036",  # 传音控股
+    "688185",  # 康希诺
+    "300274",  # 阳光电源
+    "688590",  # 新致软件
+    "300750",  # 宁德时代
+    "688981",  # 中芯国际
+    "601138",  # 工业富联
+    "600584",  # 长电科技
+}
+_TECH_LEADER_NAMES = {
+    "寒武纪", "海光信息", "中际旭创", "新易盛", "北方华创",
+    "韦尔股份", "圣邦股份", "澜起科技", "沪电股份", "天孚通信",
+    "光迅科技", "传音控股", "阳光电源", "宁德时代", "中芯国际",
+    "工业富联", "长电科技", "中兴通讯", "紫光国微", "兆易创新",
+}
+
+
+def is_leader_or_high_impact(news: dict, hs300: dict) -> bool:
+    """判断公告是否来自龙头股或是高影响公告
+
+    Returns:
+        True = 龙头股公告或高影响公告，应保留
+        False = 非龙头股的低影响常规公告，应过滤
+    """
+    # 高影响公告始终保留
+    if is_high_impact_announcement(news):
+        return True
+    # 龙头股（沪深300）的公告保留
+    name = news.get("name", "")
+    code = news.get("code", "")
+    if _is_hs300_stock(name, code, hs300):
+        return True
+    # 科技龙头股（沪深300可能未覆盖的科创板/创业板龙头）保留
+    code_filled = (code or "").strip().zfill(6)
+    if code_filled in _TECH_LEADER_STOCKS:
+        return True
+    if name and name in _TECH_LEADER_NAMES:
         return True
     return False
 

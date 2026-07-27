@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
-from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, _load_watchlist
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, _load_watchlist, is_leader_or_high_impact
+from src.tools.data_fetchers import get_hs300_constituents
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
@@ -230,6 +231,22 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     deduped = dedup_news_3layer(news_list)
     dup_count = len(news_list) - len(deduped)
 
+    # 公告预过滤：非龙头股的低影响常规公告直接丢弃
+    # 避免大量 *ST 小票的董事会决议/章程修订/独董声明等占用预筛配额
+    hs300 = get_hs300_constituents()
+    before_ann_filter = len(deduped)
+    filtered = []
+    ann_removed = 0
+    for news in deduped:
+        if news.get("category") == "announcement":
+            if not is_leader_or_high_impact(news, hs300):
+                ann_removed += 1
+                continue
+        filtered.append(news)
+    deduped = filtered
+    if ann_removed > 0:
+        logger.info(f"[prefilter] 非龙头低影响公告过滤: 移除{ann_removed}条, 剩余{len(deduped)}条")
+
     # 加载关注列表：命中关注个股的新闻提升为 direct 类
     watchlist = _load_watchlist()
     watch_stocks = list(watchlist.get("stocks", []))
@@ -390,9 +407,12 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 - 科技板块资讯以"对科技板块的影响"判定方向
 - 噪音不输出到 filtered_news，计入 removed_count。噪音定义：
   - 庆典/八卦/软文/公关稿
-  - 与A股无直接关联的纯国际资讯（如海外天气、非涉华国际事件）
+  - 与A股无直接关联的纯国际资讯（如海外天气、韩国外汇案、非涉华国际事件）
+    * 例外：影响全球市场或A股科技板块的外围资讯必须保留（如美联储政策、美对华科技制裁、地缘冲突升级、全球金融风险）
   - 纯宏观经济评论（无具体板块/个股影响逻辑）
   - 重复报道同一事件（只保留信息量最大的一条）
+  - 非龙头股的常规公告（董事会决议/章程修订/独董声明/高管变更/会议通知等）
+    * 例外：龙头股（沪深300成分股）的公告保留，非龙头股的高影响公告（立案/退市/重组/业绩预告/债务违约）也保留
 
 请以JSON格式返回（只返回JSON，不要输出content/source/published_at等原始字段）:
 ```json
