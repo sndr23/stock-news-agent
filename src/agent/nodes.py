@@ -167,7 +167,8 @@ def _calc_similarity(text1: str, text2: str) -> float:
 
 _PREFILTER_TOTAL_LIMIT = 60
 # 各类最小保底配额：确保冷门类别不被自适应比例饿死
-_PREFILTER_MIN_QUOTA = {"sector": 10, "macro": 5}
+# macro 提升到8：外围资讯（地缘/大宗商品/外围股市）对A股传导效应显著，需保证配额
+_PREFILTER_MIN_QUOTA = {"sector": 10, "macro": 8}
 
 
 def _adaptive_quota(buckets: dict, total_limit: int = _PREFILTER_TOTAL_LIMIT) -> dict:
@@ -951,6 +952,14 @@ HIGH_SIGNAL_KEYWORDS = [
     # 中等信号
     "北向资金", "回购", "增持", "减持", "分红", "股权激励",
     "IPO", "定增", "可转债",
+    # 外围风险事件（对A股有传导效应）
+    "熔断", "暴跌", "崩盘", "债务危机", "银行危机", "金融风险",
+    "战争", "军事冲突", "制裁", "地缘", "俄乌", "中东", "台海",
+    "关税", "贸易战", "出口管制", "禁运",
+    "美联储", "鲍威尔", "非农",
+    "原油暴跌", "原油暴涨", "油价",
+    "韩指", "日经", "美股暴跌", "纳指",
+    "汇率", "人民币贬值", "美元飙升",
 ]
 
 # 预编译信号关键词正则：合并 HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS，
