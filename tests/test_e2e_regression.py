@@ -1,9 +1,17 @@
 # filepath: tests/test_e2e_regression.py
 """端到端回归：mock 数据源 → 全链路 → 验证 band 排序与 confidence"""
+import pytest
 from unittest.mock import patch
 from src.agent.nodes import _python_prefilter, _apply_guardrails
 from src.tools.calculators import rank_news
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem
+
+
+@pytest.fixture(autouse=True)
+def mock_hs300():
+    """mock get_hs300_constituents 避免测试中发起网络请求"""
+    with patch("src.agent.nodes.get_hs300_constituents", return_value={"codes": set(), "names": set()}):
+        yield
 
 
 def test_e2e_mock_pipeline():

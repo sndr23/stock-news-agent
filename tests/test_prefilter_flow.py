@@ -1,6 +1,15 @@
 # filepath: tests/test_prefilter_flow.py
 """测试预筛流程 _python_prefilter 改造后行为"""
+import pytest
+from unittest.mock import patch
 from src.agent.nodes import _python_prefilter
+
+
+@pytest.fixture(autouse=True)
+def mock_hs300():
+    """mock get_hs300_constituents 避免测试中发起网络请求"""
+    with patch("src.agent.nodes.get_hs300_constituents", return_value={"codes": set(), "names": set()}):
+        yield
 
 
 def test_basic_filter_keeps_important():
