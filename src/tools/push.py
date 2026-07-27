@@ -87,19 +87,30 @@ def dedup_ranked_by_title(ranked_news: list, threshold: float = 0.6) -> list:
     return kept
 
 
-def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股资讯日报") -> str:
+def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股资讯日报", max_chars: int = 0) -> str:
     """将排名后的资讯格式化为 Markdown 文本
 
     Args:
         ranked_news: rank_news 返回的列表
         top_n: 取前 N 条
         title: 推送标题
+        max_chars: 最大字符数限制（0=不限）。
+                   PushPlus 免费版限 5000 字，传入 max_chars=4800 可在格式化阶段
+                   就动态减少条数，避免最终粗暴截断导致内容不完整。
 
     Returns:
-        Markdown 格式的资讯文本（≤5000字，适配 PushPlus 免费版）
+        Markdown 格式的资讯文本
     """
     if not ranked_news:
         return f"## {title}\n\n今日暂无重要资讯。"
+
+    # 有字数限制时，动态计算可推送的条数（每条约150-200字）
+    effective_top_n = top_n
+    if max_chars > 0:
+        # 预估每条约占180字（标题+标签+板块+影响分+理由+推理链）
+        estimated_per_item = 180
+        max_by_chars = max(1, max_chars // estimated_per_item)
+        effective_top_n = min(top_n, max_by_chars)
 
     lines = [f"## {title}\n"]
     # A股惯例：红涨绿跌
@@ -135,7 +146,7 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         "stock": "📌个股",
     }
 
-    for i, n in enumerate(ranked_news[:top_n], 1):
+    for i, n in enumerate(ranked_news[:effective_top_n], 1):
         n_title = str(n.get("title", "") or "")[:60]
         band = n.get("impact_band", "neutral")
         direction = n.get("impact_direction", "neutral")
@@ -344,7 +355,17 @@ def push_news(
     """
     # 推送前标题相似度去重（保留排名靠前的）
     ranked_news = dedup_ranked_by_title(ranked_news)
-    content = format_ranked_news_md(ranked_news, top_n=top_n, title=title)
+
+    # 按推送后端限制动态控制字数：
+    # PushPlus 免费版限5000字 → 格式化阶段就限制条数，避免最终粗暴截断
+    # WxPusher/企业微信 字数限制宽松，不需预限制
+    _max_chars = 0
+    if pushplus_token and not (wxpusher_token and wxpusher_uid):
+        _max_chars = 4800  # PushPlus 免费版限5000字，留200字余量
+    elif wecom_webhook and not (wxpusher_token and wxpusher_uid) and not pushplus_token:
+        _max_chars = 3800  # 企业微信 markdown 限4096字节
+
+    content = format_ranked_news_md(ranked_news, top_n=top_n, title=title, max_chars=_max_chars)
 
     # 自动生成有意义的摘要（如未传入）：取推送条数 + 最高分资讯
     if not summary:
