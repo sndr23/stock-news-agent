@@ -743,16 +743,111 @@ band取值: bullish(强利好,6.5-10) / mildly_bullish(弱利好,5.5-6.4) / neut
     )
 
 
+def _normalize_llm_item(raw: dict) -> dict | None:
+    """将 LLM 返回的原始 dict 标准化为 NewsAnalysisItem 兼容格式
+
+    容错处理：
+    - 字段名变体（band/impact_band, score/market_impact_score 等）自动映射
+    - 必填字段缺失时用规则推断补全，而不是整条丢弃
+    - 返回 None 表示完全无法识别（连 title 都没有）
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    # 字段别名映射（LLM 可能输出不同的字段名）
+    _field_aliases = {
+        "title": ["title", "标题", "news_title"],
+        "market_impact_score": ["market_impact_score", "score", "impact_score", "评分", "影响力评分"],
+        "impact_band": ["impact_band", "band", "档位", "方向", "sentiment_band"],
+        "confidence": ["confidence", "置信度", "confidence_level"],
+        "affected_sectors": ["affected_sectors", "sectors", "板块", "影响板块", "related_sectors"],
+        "affected_stocks": ["affected_stocks", "stocks", "个股", "影响个股", "related_stocks"],
+        "impact_reason": ["impact_reason", "reason", "原因", "逻辑", "分析理由"],
+        "influence_scope": ["influence_scope", "scope", "影响范围", "level"],
+        "analysis_chain": ["analysis_chain", "推理链", "reasoning", "chain"],
+        "sentiment": ["sentiment", "情绪", "情绪方向"],
+        "source": ["source", "来源"],
+        "content": ["content", "内容", "摘要"],
+        "published_at": ["published_at", "publish_time", "发布时间", "time"],
+        "category": ["category", "分类", "类别"],
+    }
+
+    normalized = {}
+    for std_field, aliases in _field_aliases.items():
+        for alias in aliases:
+            if alias in raw and raw[alias] is not None:
+                normalized[std_field] = raw[alias]
+                break
+
+    # title 是唯一硬性要求——没有 title 无法匹配原始新闻
+    if not normalized.get("title"):
+        return None
+
+    # score 缺失 → 默认 5.0（中性）
+    try:
+        score = float(normalized.get("market_impact_score", 5.0))
+        score = max(0.0, min(10.0, score))
+    except (ValueError, TypeError):
+        score = 5.0
+    normalized["market_impact_score"] = score
+
+    # impact_band 缺失 → 从 score 推断
+    if not normalized.get("impact_band"):
+        normalized["impact_band"] = _band_from_score(score).value
+    else:
+        # 规范化 band 值
+        band_str = str(normalized["impact_band"]).lower().strip()
+        try:
+            normalized["impact_band"] = ImpactBand(band_str).value
+        except ValueError:
+            # 无法识别的 band → 从 score 推断
+            normalized["impact_band"] = _band_from_score(score).value
+
+    # confidence 缺失 → 默认 medium
+    if not normalized.get("confidence"):
+        normalized["confidence"] = "medium"
+    else:
+        conf_str = str(normalized["confidence"]).lower().strip()
+        if conf_str not in ("high", "medium", "low"):
+            normalized["confidence"] = "medium"
+
+    # 列表字段兜底
+    for list_field in ("affected_sectors", "affected_stocks"):
+        if list_field not in normalized or normalized[list_field] is None:
+            normalized[list_field] = []
+        elif isinstance(normalized[list_field], str):
+            # 字符串形式的列表，按逗号/顿号分隔
+            normalized[list_field] = [
+                s.strip() for s in normalized[list_field].replace("、", ",").split(",")
+                if s.strip()
+            ]
+
+    # 字符串字段兜底
+    for str_field in ("impact_reason", "influence_scope", "analysis_chain", "sentiment",
+                      "source", "content", "published_at", "category"):
+        if str_field not in normalized or normalized[str_field] is None:
+            normalized[str_field] = ""
+
+    # sentiment 与 band 对齐
+    if not normalized["sentiment"]:
+        normalized["sentiment"] = normalized["impact_band"]
+
+    return normalized
+
+
 def _parse_llm_items(content: str) -> list:
-    """解析 LLM 返回内容为 NewsAnalysisItem 列表"""
+    """解析 LLM 返回内容为标准化 dict 列表（容错版）
+
+    不再用 NewsAnalysisItem(**raw) 硬校验——字段缺失或命名有偏差时，
+    通过 _normalize_llm_item 推断补全，避免因单条格式问题导致整个批次被判定为解析失败。
+    """
     parsed = _safe_parse_json(content)
     raw_items = parsed.get("filtered_news", [])
     items = []
     for raw in raw_items:
-        try:
-            items.append(NewsAnalysisItem(**raw))
-        except Exception as e:
-            logger.warning(f"解析单条失败，跳过: {e}")
+        normalized = _normalize_llm_item(raw)
+        if normalized:
+            items.append(normalized)
     return items
 
 
@@ -761,7 +856,7 @@ def _llm_analyze_batch_structured(batch: list) -> list:
 
     三级调用策略：
       方式A: LangChain ChatOpenAI（timeout=120s）
-      方式B: requests 直调 _call_llm_api（timeout=120s, max_retries=2）
+      方式B: requests 直调 _call_llm_api（timeout=120s, max_retries=3）
       方式C: 简化prompt重试（去掉 analysis_chain 等复杂字段，降低输出复杂度）
 
     全部失败时抛异常（不静默返回原始数据），让 llm_filter_node 的重试机制生效。
@@ -782,9 +877,9 @@ def _llm_analyze_batch_structured(batch: list) -> list:
     except Exception as e:
         logger.warning(f"方式A(LLM直接调用)失败: {e}")
 
-    # 方式B：requests 直调 + _safe_parse_json
+    # 方式B：requests 直调 + _safe_parse_json（3次重试，应对瞬时网络/限流问题）
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=2)
+        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=3)
         items = _parse_llm_items(content)
         if items:
             return _apply_guardrails(items)
@@ -796,7 +891,7 @@ def _llm_analyze_batch_structured(batch: list) -> list:
     try:
         simple_prompt = _build_simple_prompt(batch)
         simple_sys = "你是资深A股资讯分析师。直接返回简洁JSON，不要代码块包裹。"
-        content = _call_llm_api(simple_sys, simple_prompt, timeout=120, max_retries=1)
+        content = _call_llm_api(simple_sys, simple_prompt, timeout=120, max_retries=2)
         items = _parse_llm_items(content)
         if items:
             logger.info(f"方式C(简化prompt)成功恢复{len(items)}条")
@@ -947,13 +1042,13 @@ def llm_filter_node(state: AgentState) -> dict:
     try:
         # 串行调用（避免并发触发限流）
         # 仅 qwqtao 等慢速中转平台需间隔21秒(1分钟3次)
-        # 硅基流动/OpenRouter官方等主流平台限流宽松，无需间隔
+        # 硅基流动/OpenRouter官方等主流平台限流宽松，但也加2s间隔避免瞬时限流
         _slow_providers = ("qwqtao",)
         _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
-        rate_limit_interval = 21 if _is_slow else 0
-        # 总超时熔断：60条/8批 × (90s+重试) 理论最坏 540s+，
-        # 设 deadline=240s 超时后剩余批次降级为原始预筛数据，避免云端 cron 超杀
-        _LLM_TOTAL_DEADLINE = 240
+        rate_limit_interval = 21 if _is_slow else 2
+        # 总超时熔断：60条/8批 × (120s+重试) 理论最坏 960s+，
+        # 设 deadline=300s 超时后剩余批次降级为原始预筛数据，避免云端 cron 超杀
+        _LLM_TOTAL_DEADLINE = 300
         deadline = time.monotonic() + _LLM_TOTAL_DEADLINE
         results_map = {}
         for idx, batch in enumerate(batches):
