@@ -649,13 +649,53 @@ def _band_to_direction(band: ImpactBand) -> str:
     return "neutral"
 
 
+# 利空/利好文本信号词（用于检测 LLM band 与分析文本自相矛盾）
+_BEARISH_TEXT_SIGNALS = {"利空", "暴跌", "下跌", "亏损", "减持", "处罚", "立案", "退市",
+                         "爆雷", "违约", "承压", "下滑", "萎缩", "受挫", "受阻", "负面",
+                         "恶化", "巨亏", "重挫", "闪崩", "崩盘", "跌停", "大亏"}
+_BULLISH_TEXT_SIGNALS = {"利好", "暴涨", "上涨", "盈利", "增持", "回购", "补贴", "扶持",
+                         "突破", "超预期", "预增", "增长", "提振", "刺激", "宽松", "涨停",
+                         "大涨", "走强", "回暖"}
+
+
+def _infer_direction_from_text(reason: str, chain: str) -> str:
+    """从 impact_reason + analysis_chain 文本推断多空方向
+
+    用于检测 LLM band 标签与分析文本自相矛盾的情况
+    （如 band=bullish 但 reason 写"业绩暴雷利空"）
+
+    Returns:
+        "bullish" / "bearish" / "neutral"（neutral=无法确定，不纠偏）
+    """
+    text = f"{reason} {chain}"
+    bearish_hits = sum(1 for kw in _BEARISH_TEXT_SIGNALS if kw in text)
+    bullish_hits = sum(1 for kw in _BULLISH_TEXT_SIGNALS if kw in text)
+    if bearish_hits > 0 and bullish_hits == 0:
+        return "bearish"
+    if bullish_hits > 0 and bearish_hits == 0:
+        return "bullish"
+    return "neutral"
+
+
 def _apply_guardrails(items: list) -> list:
-    """band 与 score 冲突时按 score 强制校正 band，并同步 direction/sentiment"""
+    """band 与 score 冲突时按 score 强制校正 band，并同步 direction/sentiment
+
+    额外校验：LLM 可能 band 标 bullish 但 reason/chain 文本写利空（score 误打高分），
+    此时以分析文本方向为准校正 band，避免推送标题与推理结论自相矛盾。
+    """
     for item in items:
         if isinstance(item, NewsAnalysisItem):
             lo, hi = BAND_SCORE_RANGE[item.impact_band]
             if not (lo <= item.market_impact_score <= hi):
                 item.impact_band = _band_from_score(item.market_impact_score)
+            # 文本方向校验：band 与 reason/chain 文本矛盾时以文本为准
+            text_dir = _infer_direction_from_text(
+                str(getattr(item, "impact_reason", "")),
+                str(getattr(item, "analysis_chain", "")))
+            if text_dir == "bearish" and item.impact_band.value in ("bullish", "mildly_bullish", "mixed"):
+                item.impact_band = ImpactBand.BEARISH if item.market_impact_score >= 6.5 else ImpactBand.MILDLY_BEARISH
+            elif text_dir == "bullish" and item.impact_band.value in ("bearish", "mildly_bearish", "mixed"):
+                item.impact_band = ImpactBand.BULLISH if item.market_impact_score >= 6.5 else ImpactBand.MILDLY_BULLISH
             item.sentiment = item.impact_band.value
         elif isinstance(item, dict):
             band_str = item.get("impact_band", "neutral")
@@ -670,6 +710,13 @@ def _apply_guardrails(items: list) -> list:
                 score = 3.0
             if not (lo <= score <= hi):
                 band = _band_from_score(score)
+            # 文本方向校验：band 与 reason/chain 文本矛盾时以文本为准
+            text_dir = _infer_direction_from_text(
+                str(item.get("impact_reason", "")), str(item.get("analysis_chain", "")))
+            if text_dir == "bearish" and band.value in ("bullish", "mildly_bullish", "mixed"):
+                band = ImpactBand.BEARISH if score >= 6.5 else ImpactBand.MILDLY_BEARISH
+            elif text_dir == "bullish" and band.value in ("bearish", "mildly_bearish", "mixed"):
+                band = ImpactBand.BULLISH if score >= 6.5 else ImpactBand.MILDLY_BULLISH
             item["impact_band"] = band.value
             item["sentiment"] = band.value
             item["impact_direction"] = _band_to_direction(band)
@@ -1273,6 +1320,12 @@ def llm_filter_node(state: AgentState) -> dict:
                 band_val = llm_res.get("impact_band", "neutral")
                 conf_val = llm_res.get("confidence", "medium")
                 news["impact_band"] = band_val.value if hasattr(band_val, "value") else str(band_val)
+                # 规则纠偏后 band 与 direction 同步：direction 被 rules 改为 bullish/bearish 时，
+                # band 也必须同步，否则推送标题显示"强利好"但方向箭头朝下
+                if direction == "bullish" and "bullish" not in str(news["impact_band"]):
+                    news["impact_band"] = "mildly_bullish"
+                elif direction == "bearish" and "bearish" not in str(news["impact_band"]):
+                    news["impact_band"] = "mildly_bearish"
                 news["confidence"] = conf_val.value if hasattr(conf_val, "value") else str(conf_val)
                 news["influence_scope"] = llm_res.get("influence_scope", "stock")
                 news["analysis_chain"] = llm_res.get("analysis_chain", "")

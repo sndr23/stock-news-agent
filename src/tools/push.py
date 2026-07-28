@@ -124,6 +124,12 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         "bearish": "▼",
         "neutral": "—",
     }
+    # band → 图标（统一从 band 推导，避免 direction 与 band 不一致时标题行自相矛盾）
+    band_icon = {
+        "bullish": "▲", "mildly_bullish": "▲",
+        "bearish": "▼", "mildly_bearish": "▼",
+        "neutral": "—", "mixed": "◆",
+    }
     band_label_map = {
         "bullish": "强利好",
         "mildly_bullish": "弱利好",
@@ -164,7 +170,8 @@ def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股
         scope_label = scope_icon.get(scope, "")
         chain = str(n.get("analysis_chain", "") or "").strip()[:120]
 
-        icon = dir_icon.get(direction, "—")
+        # 统一从 band 推导图标/标签/颜色，避免 direction 与 band 不一致时标题行自相矛盾
+        icon = band_icon.get(band, "—")
         b_label = band_label_map.get(band, band)
         b_color = band_color.get(band, _GRAY)
 
