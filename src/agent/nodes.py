@@ -681,21 +681,29 @@ def _apply_guardrails(items: list) -> list:
     """band 与 score 冲突时按 score 强制校正 band，并同步 direction/sentiment
 
     额外校验：LLM 可能 band 标 bullish 但 reason/chain 文本写利空（score 误打高分），
-    此时以分析文本方向为准校正 band，避免推送标题与推理结论自相矛盾。
+    此时以分析文本方向为准校正 band 方向，但保持 LLM 判断的强度级别（镜像翻转）。
+    强弱档位由 LLM 的 impact_band 决定，不用 score 阈值重新计算：
+      bullish(强利好)↔bearish(强利空), mildly_bullish(弱利好)↔mildly_bearish(弱利空)
     """
+    # 方向镜像翻转表：保持 LLM 判断的强度级别，只翻转多空方向
+    _FLIP_TO_BEARISH = {"bullish": ImpactBand.BEARISH, "mildly_bullish": ImpactBand.MILDLY_BEARISH,
+                        "mixed": ImpactBand.MILDLY_BEARISH}
+    _FLIP_TO_BULLISH = {"bearish": ImpactBand.BULLISH, "mildly_bearish": ImpactBand.MILDLY_BULLISH,
+                        "mixed": ImpactBand.MILDLY_BULLISH}
+
     for item in items:
         if isinstance(item, NewsAnalysisItem):
             lo, hi = BAND_SCORE_RANGE[item.impact_band]
             if not (lo <= item.market_impact_score <= hi):
                 item.impact_band = _band_from_score(item.market_impact_score)
-            # 文本方向校验：band 与 reason/chain 文本矛盾时以文本为准
+            # 文本方向校验：band 与 reason/chain 文本矛盾时，镜像翻转方向保持强度级别
             text_dir = _infer_direction_from_text(
                 str(getattr(item, "impact_reason", "")),
                 str(getattr(item, "analysis_chain", "")))
-            if text_dir == "bearish" and item.impact_band.value in ("bullish", "mildly_bullish", "mixed"):
-                item.impact_band = ImpactBand.BEARISH if item.market_impact_score >= 6.5 else ImpactBand.MILDLY_BEARISH
-            elif text_dir == "bullish" and item.impact_band.value in ("bearish", "mildly_bearish", "mixed"):
-                item.impact_band = ImpactBand.BULLISH if item.market_impact_score >= 6.5 else ImpactBand.MILDLY_BULLISH
+            if text_dir == "bearish" and item.impact_band.value in _FLIP_TO_BEARISH:
+                item.impact_band = _FLIP_TO_BEARISH[item.impact_band.value]
+            elif text_dir == "bullish" and item.impact_band.value in _FLIP_TO_BULLISH:
+                item.impact_band = _FLIP_TO_BULLISH[item.impact_band.value]
             item.sentiment = item.impact_band.value
         elif isinstance(item, dict):
             band_str = item.get("impact_band", "neutral")
@@ -710,13 +718,13 @@ def _apply_guardrails(items: list) -> list:
                 score = 3.0
             if not (lo <= score <= hi):
                 band = _band_from_score(score)
-            # 文本方向校验：band 与 reason/chain 文本矛盾时以文本为准
+            # 文本方向校验：band 与 reason/chain 文本矛盾时，镜像翻转方向保持强度级别
             text_dir = _infer_direction_from_text(
                 str(item.get("impact_reason", "")), str(item.get("analysis_chain", "")))
-            if text_dir == "bearish" and band.value in ("bullish", "mildly_bullish", "mixed"):
-                band = ImpactBand.BEARISH if score >= 6.5 else ImpactBand.MILDLY_BEARISH
-            elif text_dir == "bullish" and band.value in ("bearish", "mildly_bearish", "mixed"):
-                band = ImpactBand.BULLISH if score >= 6.5 else ImpactBand.MILDLY_BULLISH
+            if text_dir == "bearish" and band.value in _FLIP_TO_BEARISH:
+                band = _FLIP_TO_BEARISH[band.value]
+            elif text_dir == "bullish" and band.value in _FLIP_TO_BULLISH:
+                band = _FLIP_TO_BULLISH[band.value]
             item["impact_band"] = band.value
             item["sentiment"] = band.value
             item["impact_direction"] = _band_to_direction(band)
