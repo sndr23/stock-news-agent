@@ -10,7 +10,7 @@ A股资讯业务计算工具
       信号: 可信度0.10 + LLM重要度0.90
   - 方向折扣: 非中性=1.0; 中性按 LLM 重要度分级 (高分不折/中分轻折/低分重折)
   - 科技加成 (方向敏感, 以对科技板块的影响为准): 科技利好×1.20 / 科技中性×1.10 / 科技利空×1.05 (封顶 0.99)
-  - time_factor 仅作展示与次排序键, 不参与主评分
+  - time_factor 纳入主评分(小幅): total × (0.90 + 0.10×tf), 最新×1.00 ~ 更早×0.96
 
 预筛重要度 (calculate_prefilter_importance): 多因子叠加 + Sigmoid 压缩, 仅用于预过滤阶段
 方向兜底 (predict_direction_by_rules): 强正向组合优先, 避免利空短词误判
@@ -1052,6 +1052,12 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
                     break
         if hit_watchlist:
             total = round(total * 1.2, 4)
+
+    # ---- 时间新鲜度加权 ----
+    # 将 time_factor 纳入主评分（小幅），让突发新闻在同 band 同分时优先排前
+    # 映射区间 0.90~1.00：最新×1.00, 24小时内×0.98, 更早×0.96（最大差异4%）
+    tf = calculate_time_factor(news.get("published_at", ""))
+    total = round(total * (0.90 + 0.10 * tf), 4)
 
     # 不在此处封顶，留给 rank_news 在 confidence 加权后统一封顶
     return total
