@@ -1292,13 +1292,12 @@ def llm_filter_node(state: AgentState) -> dict:
                 news["analysis_chain"] = ""
             else:
                 # 2. 正常 LLM 输出: 尊重 LLM 方向, 但对中性结论做精细纠偏
-                #    仅当 LLM=neutral 且规则发现明确强正向/强负向组合时才纠偏
-                #    (使用改进后的规则: 强正向组合优先, 不会利空优先误判)
+                #    LLM 推理链为标题方向的最终权威，规则仅加分不改方向
                 if direction == "neutral":
                     rule_dir = predict_direction_by_rules(news.get("title", ""), news.get("content", ""))
                     if rule_dir != "neutral":
-                        direction = rule_dir
-                        # 适度提升分数(+1), 不再无脑抬到5.0
+                        # 规则检测到信号：仅提升排名分数，不覆写 LLM 判定的方向
+                        # 标题标签(利好/利空)以 LLM 推理链为准，最终一致性校验统一对齐
                         orig_score = llm_res.get("market_impact_score", 3.0)
                         try:
                             orig_score = float(orig_score)
@@ -1306,7 +1305,7 @@ def llm_filter_node(state: AgentState) -> dict:
                             orig_score = 3.0
                         news["market_impact_score"] = min(orig_score + 1.0, 10.0)
                         llm_reason = llm_res.get("impact_reason", "")
-                        news["impact_reason"] = (llm_reason + " | 规则纠偏: 检测到明确多空信号").strip(" |")
+                        news["impact_reason"] = (llm_reason + " | 规则补充: 检测到多空信号词").strip(" |")
                     else:
                         news["market_impact_score"] = llm_res.get("market_impact_score", 3.0)
                         news["impact_reason"] = llm_res.get("impact_reason", "")
@@ -1343,7 +1342,34 @@ def llm_filter_node(state: AgentState) -> dict:
             # LLM 在分析中判定为噪音并排除了该条目
             total_llm_removed += 1
 
-    # 4. 生成返回状态
+    # 4. 最终一致性校验：band 方向 vs reason/chain 文本方向
+    #    合并过程中多次修改 band/direction/reason，可能产生最终不一致
+    #    （如 band=bullish 但 reason 写"利空"），此处做最后一道校正
+    _FLIP_TO_BEARISH_FINAL = {"bullish": "bearish", "mildly_bullish": "mildly_bearish", "mixed": "mildly_bearish"}
+    _FLIP_TO_BULLISH_FINAL = {"bearish": "bullish", "mildly_bearish": "mildly_bullish", "mixed": "mildly_bullish"}
+    consistency_fixes = 0
+    for news in final_filtered:
+        # 信号情报方向由交易所官方数据锁定，不做文本方向翻转
+        if news.get("category") == "signal":
+            continue
+        band = str(news.get("impact_band", "neutral"))
+        reason = str(news.get("impact_reason", ""))
+        chain = str(news.get("analysis_chain", ""))
+        text_dir = _infer_direction_from_text(reason, chain)
+        if text_dir == "bearish" and band in _FLIP_TO_BEARISH_FINAL:
+            news["impact_band"] = _FLIP_TO_BEARISH_FINAL[band]
+            news["impact_direction"] = "bearish"
+            news["sentiment"] = news["impact_band"]
+            consistency_fixes += 1
+        elif text_dir == "bullish" and band in _FLIP_TO_BULLISH_FINAL:
+            news["impact_band"] = _FLIP_TO_BULLISH_FINAL[band]
+            news["impact_direction"] = "bullish"
+            news["sentiment"] = news["impact_band"]
+            consistency_fixes += 1
+    if consistency_fixes:
+        logger.info(f"[llm_filter] 最终一致性校验: 修正{consistency_fixes}条 band↔文本方向冲突")
+
+    # 5. 生成返回状态
     msg = (
         f"[llm_filter] 完成：深度分析{len(prefiltered)}条，"
         f"保留{len(final_filtered)}条，过滤噪音{total_llm_removed}条。"
