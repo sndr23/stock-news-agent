@@ -32,7 +32,8 @@ class TestConfidenceWeight:
         assert CONFIDENCE_WEIGHT["low"] == 0.7
 
     def test_medium_between(self):
-        assert CONFIDENCE_WEIGHT["medium"] == 0.85
+        # medium 惩罚 0.90（修复 confidence 惩罚抵消 LLM 1 分差距导致的感知倒挂）
+        assert CONFIDENCE_WEIGHT["medium"] == 0.90
 
 
 class TestBandDirectionConflict:
@@ -302,7 +303,14 @@ class TestInfluenceScope:
 
     def _make_news(self, title, scope="", sectors=None, stocks=None,
                    direction="bullish", score=8.0, source="财联社"):
-        band = "bullish" if direction == "bullish" else "bearish"
+        # band 与 direction 正确映射（原实现 neutral 被误映射为 bearish，
+        # 导致 band 主序测试在同档内竞争，无法验证设计意图）
+        if direction == "bullish":
+            band = "bullish"
+        elif direction == "bearish":
+            band = "bearish"
+        else:
+            band = "neutral"
         d = {
             "title": title, "source": source, "content": "", "published_at": "",
             "category": "news", "sentiment": direction, "impact_direction": direction,
