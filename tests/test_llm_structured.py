@@ -71,12 +71,12 @@ def test_normalize_llm_item_field_aliases():
     assert normalized["sentiment"] == "bearish"
 
 
-def test_normalize_llm_item_missing_band_infers_from_score():
-    """impact_band 缺失时应从 score 推断"""
+def test_normalize_llm_item_missing_band_defaults_neutral():
+    """impact_band 缺失时默认 neutral（score 推不出多空方向）"""
     raw = {"title": "测试", "score": 7.5}
     normalized = _normalize_llm_item(raw)
     assert normalized is not None
-    assert normalized["impact_band"] == "bullish"  # 7.5 >= 6.5
+    assert normalized["impact_band"] == "neutral"
 
 
 def test_normalize_llm_item_no_title_returns_none():
@@ -86,9 +86,26 @@ def test_normalize_llm_item_no_title_returns_none():
     assert normalized is None
 
 
-def test_normalize_llm_item_invalid_band_infers_from_score():
-    """无效的 band 值应从 score 推断，而非丢弃整条"""
+def test_normalize_llm_item_invalid_band_defaults_neutral():
+    """无效的 band 值默认 neutral，而非用 score 反推方向"""
     raw = {"title": "测试", "impact_band": "positive", "score": 6.0}
     normalized = _normalize_llm_item(raw)
     assert normalized is not None
-    assert normalized["impact_band"] == "mildly_bullish"  # 6.0 对应 5.5-6.499 = mildly_bullish
+    assert normalized["impact_band"] == "neutral"
+
+
+def test_normalize_llm_item_idx_mapped_and_int():
+    """LLM 回显的 idx 字段应被正确映射并归整为 int（P0-1: idx 精确 merge 的基础）"""
+    raw = {"idx": "3", "title": "测试", "score": 7.0}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is not None
+    assert normalized["idx"] == 3
+    assert isinstance(normalized["idx"], int)
+
+
+def test_normalize_llm_item_idx_underscore_alias():
+    """idx 别名（_idx / 编号）也应被识别"""
+    raw = {"_idx": 7, "title": "测试", "score": 5.0}
+    normalized = _normalize_llm_item(raw)
+    assert normalized is not None
+    assert normalized["idx"] == 7
