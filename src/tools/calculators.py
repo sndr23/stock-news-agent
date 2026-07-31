@@ -9,18 +9,19 @@ A股资讯业务计算工具
       公告: 可信度0.05 + LLM重要度0.95
       信号: 可信度0.10 + LLM重要度0.90
   - 方向折扣: 非中性=1.0; 中性按 LLM 重要度分级 (高分不折/中分轻折/低分重折)
-  - 科技加成 (方向敏感, 以对科技板块的影响为准): 科技利好×1.20 / 科技中性×1.10 / 科技利空×1.05 (封顶 0.99)
+  - 科技加成: 科技资讯统一×1.20; 非科技非国家级×0.85; 市场级豁免降权; 不封顶
   - time_factor 纳入主评分(小幅): total × (0.90 + 0.10×tf), 最新×1.00 ~ 更早×0.96
 
 预筛重要度 (calculate_prefilter_importance): 多因子叠加 + Sigmoid 压缩, 仅用于预过滤阶段
 方向兜底 (predict_direction_by_rules): 强正向组合优先, 避免利空短词误判
 """
 from typing import TypedDict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
 import logging
 import math
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -504,16 +505,24 @@ def calculate_prefilter_importance(news: dict) -> float:
 # ============================================================
 
 def calculate_time_factor(published_at: str) -> float:
-    """计算时间新鲜度 (仅展示用, 不参与评分)"""
+    """计算时间新鲜度 (参与主评分: total × (0.90 + 0.10×tf), 也用于排序第三键)
+
+    使用北京时间(BJT)比较，避免云端 GitHub Actions 运行在 UTC 时区时
+    因 naive datetime.now() 与北京时间新闻串产生 8 小时偏差，
+    导致当日资讯 hours_diff 恒为负 → 钳位 0 → time_factor 全部顶格 1.00。
+    """
     if not published_at or not published_at.strip():
         return 0.0
 
-    now = datetime.now()
+    BJT = timezone(timedelta(hours=8))
+    now = datetime.now(BJT)
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
                 "%Y-%m-%d", "%Y%m%d", "%Y/%m/%d %H:%M:%S"]:
         try:
             pub_time = datetime.strptime(published_at.strip(), fmt)
+            # strptime 返回 naive datetime，加 BJT 时区才能与 aware now 正确比较
+            pub_time = pub_time.replace(tzinfo=BJT)
             hours_diff = (now - pub_time).total_seconds() / 3600
             if hours_diff < 0:
                 hours_diff = 0
@@ -628,6 +637,9 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         "中标", "签约", "大额订单", "重大合同",
         "降准", "降息", "减税降费", "减税", "政策利好", "产业扶持", "财政补贴",
         "并购重组", "重大资产重组", "借壳上市",
+        # 价格上涨类（LLM截断兜底: "存储芯片价格涨幅显著"等需正确判方向）
+        "大涨", "暴涨", "飙升", "涨停", "涨幅显著", "涨幅扩大",
+        "价格大涨", "价格暴涨", "价格飙升",
     ]
     for kw in strong_bullish:
         if kw in text and not _has_negation(kw):
@@ -642,6 +654,9 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         "跌停", "跑路", "爆雷", "产品降价", "行业利空",
         "业绩预减", "业绩盈转亏", "首亏",
         "出口管制", "制裁", "禁运", "断供", "贸易摩擦",
+        # 价格下跌类（LLM截断兜底: 对称补充）
+        "大跌", "暴跌", "跳水", "重挫",
+        "价格大跌", "价格暴跌", "价格跳水",
     ]
     for kw in strong_bearish:
         if kw in text and not _has_negation(kw):
@@ -700,16 +715,20 @@ def _has_national_policy(text: str) -> bool:
 
 
 BAND_PRIORITY = {
-    "bullish": 6, "bearish": 5,                # 强信号排前(利好略优先)，重大利空不再垫底
-    "mildly_bullish": 4, "mildly_bearish": 3,  # 中等信号
-    "mixed": 2, "neutral": 1,                  # 弱信号/中性排后
+    "bullish": 6, "bearish": 6, "mixed": 6,     # 有明确多空信号的强资讯并列高位（重要资讯在前）
+    "mildly_bullish": 4, "mildly_bearish": 4,   # 中等信号并列
+    "neutral": 1,                               # 无明确多空方向的弱信号排后
 }
 
-# 影响范围加权：市场级 > 板块级 > 个股级
-INFLUENCE_SCOPE_WEIGHT = {
-    "market": 1.50,   # 影响整个市场（央行降息/注册制改革等）— 豁免非科技降权
-    "sector": 1.15,   # 影响整个板块（行业政策/龙头股带动板块）
-    "stock": 1.00,    # 仅影响个股
+# 影响范围分数加成（融入 total_score，不再作为独立排序主键）
+# 设计意图：market 级事件通常影响面更广，给予适度分数加成使其在同 band 内优先；
+# 但加成幅度（0.12）远小于正常分数差异，确保高分 sector 事件能越过低分 market 事件，
+# 避免"0.37 的 market 压住 0.82 的 sector"的倒挂。
+# stock 级个股资讯轻微降权，让板块/市场级资讯自然前置。
+SCOPE_SCORE_BOOST = {
+    "market": 0.12,
+    "sector": 0.0,
+    "stock": -0.05,
 }
 
 
@@ -761,34 +780,54 @@ def _band_direction_conflict(band: str, direction: str) -> bool:
 
 
 def _downgrade_band(band: str) -> str:
-    """band 降一档"""
-    order = ["bullish", "mildly_bullish", "mixed", "neutral", "mildly_bearish", "bearish"]
-    idx = order.index(band) if band in order else 3
-    return order[min(idx + 1, len(order) - 1)]
+    """band 降一档（向 neutral 方向降级，降低冲突项的排序优先级）
+
+    BAND_PRIORITY: bullish/bearish/mixed=6, mildly_*=4, neutral=1
+    降级 = 向 neutral 方向移动一档，确保冲突项的 band_priority 必然降低。
+    旧实现用线性数组 idx+1，导致 bearish 不降级、mildly_* 反而升级——已修正。
+    """
+    _DOWNGRADE = {
+        "bullish": "mildly_bullish",       # 6 → 4
+        "mildly_bullish": "neutral",       # 4 → 1
+        "mixed": "neutral",                # 6 → 1
+        "neutral": "neutral",              # 1 → 1（已最低，不变）
+        "mildly_bearish": "neutral",       # 4 → 1
+        "bearish": "mildly_bearish",       # 6 → 4
+    }
+    return _DOWNGRADE.get(band, "neutral")
 
 
 def _load_watchlist():
-    """加载自定义关注股票/板块列表（缓存，来自 watchlist.json）"""
+    """加载自定义关注股票/板块列表（来自 watchlist.json，按文件 mtime 缓存失效）
+
+    原实现为进程级永久缓存,修改 watchlist.json 后需重启服务才生效。
+    现记录文件修改时间,mtime 变化时自动重新加载。
+    """
     global _watchlist_cache
-    if _watchlist_cache is not None:
-        return _watchlist_cache
     try:
         # calculators.py 在 src/tools/，需三级 parent 才到项目根
         watchlist_path = Path(__file__).parent.parent.parent / "watchlist.json"
+        mtime = watchlist_path.stat().st_mtime if watchlist_path.exists() else 0
+        # mtime 未变且已缓存 → 直接返回
+        if (_watchlist_cache is not None
+                and _watchlist_cache.get("_mtime") == mtime):
+            return _watchlist_cache
         if watchlist_path.exists():
             with open(watchlist_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             _watchlist_cache = {
                 "stocks": set(data.get("stocks", [])),
                 "sectors": set(data.get("sectors", [])),
+                "_mtime": mtime,
             }
             if _watchlist_cache["stocks"] or _watchlist_cache["sectors"]:
                 logger.info(f"关注列表已加载: {len(_watchlist_cache['stocks'])}只个股, {len(_watchlist_cache['sectors'])}个板块")
         else:
-            _watchlist_cache = {"stocks": set(), "sectors": set()}
+            _watchlist_cache = {"stocks": set(), "sectors": set(), "_mtime": 0}
     except Exception as e:
         logger.warning(f"加载 watchlist.json 失败: {e}")
-        _watchlist_cache = {"stocks": set(), "sectors": set()}
+        if _watchlist_cache is None:
+            _watchlist_cache = {"stocks": set(), "sectors": set(), "_mtime": 0}
     return _watchlist_cache
 
 
@@ -893,15 +932,77 @@ def is_leader_or_high_impact(news: dict, hs300: dict) -> bool:
     return False
 
 
+def _is_self_only_individual_stock(news: dict, hs300: dict) -> bool:
+    """预筛判定：一条资讯是否"仅影响个股自身"（应在预筛剔除）
+
+    用户明确需求：其他个股只能影响自身 → 预筛阶段剔除；最终只保留能带动市场情绪的价值资讯
+    （全球宏观 > 科技板块 > 龙头个股）。
+
+    判定流程：
+      1. 公告类不在此处理（由 is_leader_or_high_impact 决定保留/剔除）
+      2. 龙头股命中（沪深300 名称/代码 或 科技龙头名称/代码）→ 带动板块情绪，保留（非 self-only）
+      3. 是否提及某个具体个股？
+         - 有 name / code 字段，或标题/正文含 A 股 6 位代码（0/3/6/8/4/9 开头）
+         - 未提及具体个股 → 保守保留（不误杀，交由 ranking 的 scope 维度沉底）
+      4. 含板块/宏观关键词 → 具备板块或市场联动，保留
+      全满足（提及具体非龙头个股 + 无板块/宏观联动）→ 仅影响自身，剔除。
+
+    设计取舍：不做"高影响事件"豁免。非龙头股的"中标/业绩预增"等即便数值亮眼，
+    也只影响该股自身、不带动板块情绪，按用户需求剔除，避免噪声稀释头部价值资讯。
+    """
+    if news.get("category") == "announcement":
+        return False
+
+    title = news.get("title", "")
+    content = news.get("content", "")
+    name = news.get("name", "")
+    text = f"{title} {content}"
+    clean_text = text.replace(name, "") if name else text
+
+    # 龙头股命中（沪深300 名称/代码 + 科技龙头名称/代码）→ 带动板块情绪，保留
+    leader_names = set(_TECH_LEADER_NAMES)
+    leader_codes = set(_TECH_LEADER_STOCKS)
+    if hs300 and hs300.get("names"):
+        leader_names |= set(hs300["names"])
+    if hs300 and hs300.get("codes"):
+        leader_codes |= set(hs300["codes"])
+    # 先直接检查本条目自身的 name/code（clean_text 已剥离 name，否则本身是龙头时无法识别）
+    if name and name in leader_names:
+        return False
+    code = news.get("code", "")
+    if code and code in leader_codes:
+        return False
+    # 再扫描文本中是否提及其他龙头股（clean_text 已去除条目自身 name，避免重复触发）
+    for ln in leader_names:
+        if ln and ln in clean_text:
+            return False
+
+    # 是否提及某个具体个股（无板块/市场联动信号的个股新闻才可能是 self-only）
+    mentions_specific_stock = bool(name) or bool(code)
+    if not mentions_specific_stock:
+        # A 股 6 位代码（0/3/6/8/4/9 开头，前后非数字）出现 → 具体个股
+        mentions_specific_stock = bool(re.search(r'(?<!\d)[0-9]{6}(?!\d)', clean_text))
+    if not mentions_specific_stock:
+        # 未提及具体个股 → 保守保留，由 ranking 的 scope 维度处理
+        return False
+
+    # 板块/宏观关键词 → 具备板块或市场联动，保留
+    if any(kw in clean_text for kw in SECTOR_KEYWORDS + _MACRO_NEWS_TERMS):
+        return False
+
+    # 否则：提及某非龙头个股，且无板块/市场联动 → 仅影响自身，剔除
+    return True
+
+
 def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     """连续分数计算 — 保留原 rank_news 循环体内全部计算逻辑
 
     total = (w_cred × 可信度 + w_imp × LLM重要度 [+ w_cluster × 聚类热度]) × 方向折扣 × 科技加成
     - 方向折扣: 非中性=1.0; 中性按 LLM 重要度分级 (高分不折/中分轻折/低分重折)
-    - 科技加成: 科技利好×1.15 / 科技中性×1.05 / 科技利空不加
+    - 科技加成: 科技资讯统一×1.20; 国家级政策×1.15; 非科技非国家级×0.85; 市场级豁免降权
     - 国家级权威来源 + 政策关键词 → 额外加成
     - ST/退市类垃圾股进一步降级
-    - 封顶 0.99
+    - 不封顶：scope 作为排序第一键后，同 scope 内需让 LLM 价值评分充分表达差异
     """
     cred = calculate_credibility(news.get("source", ""))
 
@@ -964,11 +1065,12 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
         or "终止上市" in raw_text
     )
 
-    # ---- 影响范围加权（先于科技加成，确保市场级不被科技叠加超越）----
+    # ---- 影响范围（scope）：不再对分数加权，由 rank_news 排序时统一加成 ----
+    # scope 加成在 rank_news 的排序键中统一应用（SCOPE_SCORE_BOOST），
+    # 此处仅计算 scope 供后续科技/降权逻辑使用。
     scope = news.get("influence_scope", "")
     if not scope:
         scope = _infer_influence_scope(news, hs300)
-    total = round(total * INFLUENCE_SCOPE_WEIGHT.get(scope, 1.0), 4)
 
     # ---- 科技板块统一加权 / 非科技统一降权 ----
     # CPO/PCB/半导体等科技硬件词命中：不管利好利空统一显著加成
@@ -1064,11 +1166,11 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
 
 
 def rank_news(news_list: list) -> list:
-    """综合排名：band 主序 → 连续分数次序 → 时间因子
+    """综合排名：band 主序 → (分数+scope加成) 次序 → 时间因子
 
     改进：
     1. band 6 档作为主排序键（分级评级优先）
-    2. 连续分数（可信度×重要度+聚类+方向折扣+科技加成）作同级内次排序键
+    2. scope 加成融入 total_score 作次排序键（替代原 scope 绝对主键，避免分数倒挂）
     3. confidence 加权（high 1.0 / medium 0.85 / low 0.7）
     4. band 与 direction 冲突时 band 降一档
     5. 沪深300成分股过滤：非沪深300个股资讯降权（入口获取一次，避免循环内重复查询）
@@ -1082,9 +1184,8 @@ def rank_news(news_list: list) -> list:
 
         conf = news.get("confidence", "medium")
         total = round(total * CONFIDENCE_WEIGHT.get(conf, 0.85), 4)
-        # confidence 加权后统一封顶（避免高分低置信被双重惩罚）
-        if total > 0.99:
-            total = 0.99
+        # 注意：不再做 0.99 封顶。scope 加成在排序键中统一应用，同 band 内必须让 LLM 价值评分
+        # 充分表达差异（原封顶导致 sc=7.0 与 sc=8.5 被压成同一值，产生大量倒挂）。
 
         band = news.get("impact_band", "neutral")
         direction = news.get("impact_direction", "neutral")
@@ -1121,10 +1222,288 @@ def rank_news(news_list: list) -> list:
         ))
 
     ranked.sort(
-        key=lambda x: (x["band_priority"], x["total_score"], x["time_factor"]),
+        key=lambda x: (
+            x["band_priority"],                                            # 主序：强信号 > 弱信号 > 中性
+            x["total_score"] + SCOPE_SCORE_BOOST.get(x["influence_scope"], 0),  # 次序：分数 + scope 加成
+            x["time_factor"],                                              # 时效性微调
+        ),
         reverse=True
     )
     return ranked
+
+
+# ============================================================
+# 展示层去重：同股+同事件语义去重 + 同股公告限额
+# 供 rank_news_node（Web UI）与 push.py（微信推送）统一调用，
+# 避免"去重只在推送层生效、UI/有序输出仍有重复"的不一致。
+# ============================================================
+
+# 事件关键词组：同组词命中视为同一事件类型
+_EVENT_KEYWORD_GROUPS = [
+    ("激励", ["股权激励", "股票激励", "激励计划", "限制性股票"]),
+    ("回购", ["回购"]),
+    ("增持", ["增持"]),
+    ("减持", ["减持"]),
+    ("业绩预告", ["业绩预告", "业绩预增", "业绩预减", "业绩快报"]),
+    ("并购重组", ["并购", "重组", "收购"]),
+    ("定增", ["定增", "非公开发行", "定向增发"]),
+    ("分红", ["分红", "派息", "送转", "权益分派"]),
+    ("中标签约", ["中标", "签约", "大额订单", "重大合同"]),
+    ("立案处罚", ["立案", "处罚", "警示函"]),
+    ("退市", ["退市", "终止上市"]),
+    ("龙虎榜", ["龙虎榜", "机构净买入"]),
+    ("调研", ["投资者关系活动", "调研", "投资者交流"]),
+    ("行情下跌", ["走低", "盘前走低", "暴跌", "跌超", "下挫", "重挫", "走弱", "领跌", "跌停", "闪崩", "震荡走弱", "持续走低"]),
+]
+
+
+_MONETARY_RE = re.compile(r'([\d]+(?:\.[\d]+)?)\s*(亿|万)')
+
+
+def _extract_core_numbers(text: str) -> set:
+    """提取金额类核心数字并归一（同事件不同措辞但同金额 → 同事件）
+
+    仅捕获带 亿/万 量词的大额数值（交易额/合同额/募资额等），避免股价、百分比等误命中。
+    单位保留在 key 中（"亿:30.53" 与 "万:30.53" 不互相碰撞），
+    解决"30.53亿" 与 "30.53亿元" 等同事件不同表述的归一
+    （行云科技算力服务补充协议 30.53 亿实证：3 条近重复标题因措辞差异未被合并）。
+    """
+    out = set()
+    for val, unit in _MONETARY_RE.findall(text or ""):
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        out.add(f"{unit}:{v:.4g}")
+    return out
+
+
+def _event_signature(news: dict) -> tuple:
+    """计算资讯的 (个股集合, 事件组集合, 核心金额集合) 签名"""
+    stocks = set(news.get("affected_stocks", []) or [])
+    name = news.get("name", "")
+    if name:
+        stocks.add(name)
+    if not stocks:
+        # 公告标题多为 "股票名：…"，从标题前缀提取个股（兜底）
+        title = news.get("title", "")
+        for sep in ("：", ":"):
+            if sep in title:
+                stocks.add(title.split(sep)[0].strip())
+                break
+    text = f"{news.get('title', '')} {news.get('content', '')}"
+    events = set()
+    for group_name, keywords in _EVENT_KEYWORD_GROUPS:
+        if any(kw in text for kw in keywords):
+            events.add(group_name)
+    numbers = _extract_core_numbers(text)
+    return stocks, events, numbers
+
+
+def dedup_ranked_by_event(ranked_news: list) -> list:
+    """同股+同事件语义去重：同一 affected_stocks 交集 + (同一事件组 或 同一核心金额) → 保留排名靠前者
+
+    标题 Jaccard 去重无法识别"同一事件的不同角度报道"（标题措辞差异大），
+    如"寒武纪股权激励大消息" vs "寒武纪:2026年限制性股票激励计划(草案)摘要公告"。
+    本函数用 (个股 ∩ 非空) + (事件组 ∩ 非空 或 核心金额 ∩ 非空) 判定语义重复。
+
+    保守设计：无个股的条目不参与去重；核心金额仅捕获 亿/万 量级大额数值，避免股价/百分比误命中。
+    """
+    if not ranked_news:
+        return ranked_news
+    kept = []
+    seen_sigs = []
+    removed = 0
+    for news in ranked_news:
+        stocks, events, numbers = _event_signature(news)
+        is_dup = False
+        if stocks and (events or numbers):
+            for ks, ke, kn in seen_sigs:
+                if (stocks & ks) and ((events & ke) or (numbers & kn)):
+                    is_dup = True
+                    break
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(news)
+            seen_sigs.append((stocks, events, numbers))
+    if removed > 0:
+        logger.info(f"[display] 同事件去重: {len(ranked_news)} -> {len(kept)}条, 去除{removed}条同股同事件重复")
+    return kept
+
+
+def _announcement_stock_key(news: dict):
+    """提取公告涉及的个股键（用于同股公告限额）"""
+    stocks = set(news.get("affected_stocks", []) or [])
+    name = news.get("name", "")
+    if name:
+        stocks.add(name)
+    if not stocks:
+        title = news.get("title", "")
+        for sep in ("：", ":"):
+            if sep in title:
+                stocks.add(title.split(sep)[0].strip())
+                break
+    return next(iter(sorted(stocks)), None)
+
+
+def cap_announcements_per_stock(ranked_news: list, max_per_stock: int = 2) -> list:
+    """同股公告限额：单只个股的公告最多保留 max_per_stock 条（按当前排序保留靠前者）
+
+    解决实证问题：寒武纪一日发布 9 条公告（5 条股权激励同事件 + 4 条常规），
+    事件去重后仍有常规公告噪声，按个股限额收敛为最多 2 条。
+    非公告类（news/signal）与无个股归属的公告不参与限额。
+    """
+    if max_per_stock <= 0:
+        return ranked_news
+    stock_counts = {}
+    capped = []
+    removed = 0
+    for news in ranked_news:
+        if news.get("category") != "announcement":
+            capped.append(news)
+            continue
+        key = _announcement_stock_key(news)
+        if key is None:
+            capped.append(news)
+            continue
+        cnt = stock_counts.get(key, 0)
+        if cnt >= max_per_stock:
+            removed += 1
+            continue
+        stock_counts[key] = cnt + 1
+        capped.append(news)
+    if removed > 0:
+        logger.info(f"[display] 同股公告限额: 去除{removed}条, 每股最多{max_per_stock}条公告")
+    return capped
+
+
+# 宏观/板块级主题簇主体词：同一主体（机构/国家/商品/地缘事件）的近重复报道应限流，
+# 避免"摩根大通美联储推演×3""WTI原油涨×2"等同主体报道霸占头部、稀释 A 股实质利好。
+# 仅作用于 market/sector 级；个股级已由同事件去重处理，不再重复限流。
+_MACRO_CLUSTER_SUBJECTS = [
+    "美联储", "摩根大通", "特朗普", "拜登", "伊朗", "以色列", "欧盟", "欧佩克", "OPEC",
+    "WTI", "布伦特", "原油", "黄金", "地缘", "关税", "非农", "CPI", "PPI",
+    "俄乌", "中东", "朝鲜", "日本央行", "英国央行", "美债", "美元指数", "加拿大",
+]
+
+
+def _macro_cluster_key(news: dict) -> str | None:
+    """提取宏观/板块级资讯的主题簇键（主体词），用于同类报道限流。
+
+    命中首个主体词即返回（不同主体 → 不同簇，不误伤）；无主体词返回 None（不参与限流）。
+    """
+    text = f"{news.get('title', '')} {news.get('content', '')}"
+    for subj in _MACRO_CLUSTER_SUBJECTS:
+        if subj in text:
+            return subj
+    return None
+
+
+def dedup_macro_clusters(ranked_news: list, max_per_subject: int = 2) -> list:
+    """宏观/板块级主题簇限流：同一主体（机构/国家/商品/地缘事件）的近重复报道
+    最多保留 max_per_subject 条（保留排名靠前、即综合分更高者），其余沉底/剔除。
+
+    设计取舍：
+    - 仅作用于 market/sector 级（influence_scope），个股级（stock）已由同事件去重处理，
+      不再重复限流，避免误删仅影响个股自身的资讯。
+    - 同主体不同切面（如摩根大通美联储推演的鸽派/鹰派/基准三种分析角度）属于同一事件簇，
+      限流后能给 A 股实质利好（永鼎股份订单、兆易创新增持）腾出头部位置。
+    - 阈值默认 2：同一主体最多 2 条进展示列表，既保留多角度、又防止霸屏。
+    """
+    if max_per_subject <= 0:
+        return ranked_news
+    subject_counts: dict = {}
+    capped = []
+    removed = 0
+    for news in ranked_news:
+        scope = news.get("influence_scope", "")
+        if scope not in ("market", "sector"):
+            capped.append(news)
+            continue
+        key = _macro_cluster_key(news)
+        if key is None:
+            capped.append(news)
+            continue
+        cnt = subject_counts.get(key, 0)
+        if cnt >= max_per_subject:
+            removed += 1
+            continue
+        subject_counts[key] = cnt + 1
+        capped.append(news)
+    if removed > 0:
+        logger.info(f"[display] 宏观主题簇限流: 去除{removed}条, 每主体最多{max_per_subject}条")
+    return capped
+
+
+def _extract_title_core(title: str) -> str:
+    """提取标题核心内容：去掉【】()等括号内容及标点空格，用于相似度比较"""
+    # 防御 None 或非字符串
+    title = str(title) if title else ""
+    # 去掉【...】、(...)、（...）等括号包裹的前缀/后缀
+    t = re.sub(r'[【】\[\]()（）{}<>《》]', '', title)
+    # 去掉所有标点和空白
+    t = re.sub(r'[^\w\u4e00-\u9fff]', '', t)
+    return t
+
+
+def _title_similarity(t1: str, t2: str) -> float:
+    """基于字符集合的 Jaccard 相似度（0-1）"""
+    s1, s2 = set(t1), set(t2)
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+
+def dedup_ranked_by_title(ranked_news: list, threshold: float = 0.6) -> list:
+    """排序后标题相似度去重：保留排名靠前的，去掉后续相似标题
+
+    Args:
+        ranked_news: 已排序的资讯列表
+        threshold: 标题核心内容 Jaccard 相似度阈值，超过则判定重复
+
+    Returns:
+        去重后的列表（保持原排序）
+    """
+    if not ranked_news:
+        return ranked_news
+    kept = []
+    kept_cores = []
+    removed = 0
+    for news in ranked_news:
+        title = news.get("title", "")
+        core = _extract_title_core(title)
+        is_dup = False
+        for kc in kept_cores:
+            # 判定重复：Jaccard 相似度高，或短标题核心是长标题核心的子串
+            if _title_similarity(core, kc) >= threshold:
+                is_dup = True
+                break
+            # 子串包含：短标题(>=6字)完全包含在长标题中
+            shorter, longer = (core, kc) if len(core) <= len(kc) else (kc, core)
+            if len(shorter) >= 6 and shorter in longer:
+                is_dup = True
+                break
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(news)
+            kept_cores.append(core)
+    if removed > 0:
+        logger.info(f"[display] 标题相似度去重: {len(ranked_news)} -> {len(kept)}条, 去除{removed}条重复")
+    return kept
+
+
+def dedup_and_cap_for_display(ranked_news: list, max_announcements_per_stock: int = 2, max_per_subject: int = 2) -> list:
+    """展示层统一去重：同事件去重 → 标题相似度去重 → 宏观主题簇限流 → 同股公告限额。
+
+    Web UI 与微信推送共用，保证两端展示一致，避免"推送已去重但 UI 仍有重复"。
+    标题去重放在事件去重之后，捕获事件去重漏掉的跨源同标题（无个股归属时事件签名无法命中）。
+    """
+    deduped = dedup_ranked_by_event(ranked_news)
+    title_deduped = dedup_ranked_by_title(deduped)
+    clustered = dedup_macro_clusters(title_deduped, max_per_subject)
+    return cap_announcements_per_stock(clustered, max_announcements_per_stock)
 
 
 if __name__ == "__main__":

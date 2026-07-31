@@ -523,13 +523,13 @@
                 return;
             }
 
-            // 前端保险：按综合分降序
-            const sorted = [...rankedNews].sort((a, b) => (b.total_score || 0) - (a.total_score || 0));
+            // 信任后端排序（band_priority → total_score → time_factor + LLM 重排），前端不再二次排序
+            const sorted = rankedNews || [];
             currentRanked = sorted;
 
             empty.classList.add('hidden');
             section.classList.remove('hidden');
-            countEl.textContent = `共 ${sorted.length} 条 · 按综合分降序`;
+            countEl.textContent = `共 ${sorted.length} 条 · 按后端排序`;
 
             const rankColors = [
                 'bg-yellow-100 text-yellow-700 font-bold',
