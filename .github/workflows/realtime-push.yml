@@ -1,0 +1,78 @@
+# filepath: .github/workflows/realtime-push.yml
+name: 实时重大资讯推送
+
+# 触发方式（仅外部定时服务 + 手动，不用 GitHub 自带 cron——自带 cron 有调度延迟）:
+#   1. cron-job.org 每 30 分钟 POST 到 Actions API 触发 workflow_dispatch（延迟 <1 分钟，准时）
+#      URL: https://api.github.com/repos/{owner}/{repo}/actions/workflows/realtime-push.yml/dispatches
+#      Method: POST   Headers: Authorization: Bearer <PAT>、Accept: application/vnd.github+json
+#      Body: {"ref": "main"}
+#   2. 手动 workflow_dispatch 立即执行一轮（验证用）
+#
+# ⚠️ 免费额度提醒:
+#   公开仓库: Actions 分钟数无限
+#   私有仓库: 2000 分钟/月。每次运行约 1.5-2 分钟（含依赖安装+LLM判定），
+#            每 30 分钟一次 ≈ 1440-1900 分钟/月，接近上限。
+#            若为私有仓库且用量吃紧，可在 cron-job.org 改为每小时一次
+#            （"0 * * * *"，约 720-960 分钟/月），或保持 30 分钟但观察 Actions 用量。
+on:
+  workflow_dispatch:
+
+# 防并发: 同一时刻只允许一个运行，后触发的排队等待
+# （cancel-in-progress: false 保证状态文件写回不会被打断，
+#   避免"已推送但未写状态 → 下轮重复推送"）
+concurrency:
+  group: realtime-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # LLM 判定（复用现有 secrets）
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL_NAME: ${{ secrets.OPENROUTER_MODEL_NAME }}
+      OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+      # 推送后端（推荐 PushPlus，无需企业微信）:
+      # PUSHPLUS_TOKEN: pushplus.plus 扫码获取（免费200条/天，严格模式够用）
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      # WECOM_WEBHOOK: 企业微信群机器人（可选替代渠道）
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      # 状态持久化（跨轮次去重，必配！否则 CI 会报错退出）
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+      # 阈值: strict=只推全市场级/板块级重大消息,个股级不推（财联社风格）
+      RT_PUSH_MODE: "strict"
+      # 1=全天7x24推送（含周末/隔夜海外消息）
+      RT_ALWAYS_ON: "1"
+      # 单轮进入 LLM 判定的候选条数上限
+      RT_MAX_CANDIDATES: "40"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      # 实时轮询每次运行都跑全量测试会浪费大量免费分钟额度，故省略
+      - name: 执行实时推送
+        run: python scripts/real_time_push.py
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: realtime-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
