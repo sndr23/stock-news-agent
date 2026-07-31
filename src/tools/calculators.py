@@ -152,6 +152,66 @@ TECH_HARDWARE_KEYWORDS = [
     "英伟达", "AMD", "台积电", "海力士", "三星", "ASML", "中芯国际",
 ]
 
+# 纯英文缩写类科技词：必须用词边界正则匹配，禁止子串匹配。
+# 实证：罗氏制药公告正文含医学缩写 "nAMD"(年龄相关性黄斑变性)，子串命中 "AMD"，
+# 医药新闻被误判为科技资讯获 ×1.20 加成，压过 sc 更高的半导体资讯（7 对倒挂的根因）。
+_TECH_ENGLISH_WORDS = {
+    "CPO", "PCB", "HDI", "FPC", "EDA", "GPU", "CPU",
+    "HBM", "DDR5", "CoWoS", "TSV", "ASML", "AMD",
+}
+# 高歧义缩写的医药/化学语境排除词：文本同时命中缩写与排除词时，不视为科技词。
+# 词边界正则只能防英文/数字相邻（nAMD/hAMD），防不住中文相邻（如"AMD患者"）。
+_TECH_ABBREV_EXCLUDE = {
+    "AMD": ["黄斑变性", "眼底", "眼科", "视网膜", "视力"],
+}
+# 英文缩写词边界正则：前后不能紧跟字母/数字，避免 nAMD/hAMD、STorage 等误命中
+_tech_english_pattern = re.compile(
+    "|".join(
+        rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])" for kw in _TECH_ENGLISH_WORDS
+    )
+)
+
+
+def _has_tech_keyword(text: str) -> bool:
+    """科技硬件词匹配：中文词子串匹配 + 英文缩写词边界匹配
+
+    修复前用 `any(kw in text for kw in TECH_HARDWARE_KEYWORDS)` 全量子串匹配，
+    英文缩写（AMD/CPU 等）在中文文本中极易撞医学/化学缩写（如 nAMD）。
+    """
+    if not text:
+        return False
+    # finditer 精确返回实际命中的缩写（避免全局 search 命中 A 却按 B 查排除词）
+    for m in _tech_english_pattern.finditer(text):
+        kw = m.group(0)
+        exclude_words = _TECH_ABBREV_EXCLUDE.get(kw)
+        if exclude_words and any(w in text for w in exclude_words):
+            continue
+        return True
+    # 中文科技词（含 "三星" 等中文词，与英文缩写分开处理，保持子串匹配）
+    for kw in TECH_HARDWARE_KEYWORDS:
+        if kw not in _TECH_ENGLISH_WORDS and kw in text:
+            return True
+    return False
+
+
+def _tech_hit_count(text: str) -> int:
+    """科技硬件词命中计数（词边界感知，用于 tech_bonus 计算）"""
+    if not text:
+        return 0
+    matched = set()
+    for m in _tech_english_pattern.finditer(text):
+        matched.add(m.group(0))
+    count = 0
+    for kw in matched:
+        exclude_words = _TECH_ABBREV_EXCLUDE.get(kw)
+        if exclude_words and any(w in text for w in exclude_words):
+            continue
+        count += 1
+    for kw in TECH_HARDWARE_KEYWORDS:
+        if kw not in _TECH_ENGLISH_WORDS and kw in text:
+            count += 1
+    return count
+
 MEDIUM_KEYWORDS = [
     "北向资金", "外资", "机构调研", "回购", "增持", "减持",
     "分红", "股权激励", "IPO", "定增", "可转债",
@@ -323,7 +383,7 @@ def score_news_relevance(item: dict, stock_code: str = "", stock_name: str = "")
         else:
             score += 6
 
-    if any(kw in text for kw in TECH_HARDWARE_KEYWORDS):
+    if _has_tech_keyword(text):
         score += 10
 
     if _is_official_source(url, item.get("source", "")):
@@ -415,7 +475,7 @@ def calculate_prefilter_importance(news: dict) -> float:
 
         raw_sum = base + amplitude_bonus + lhb_bonus + stock_bonus
         importance = 0.99 * math.tanh(1.4 * raw_sum)
-        has_tech = any(kw in text for kw in TECH_HARDWARE_KEYWORDS)
+        has_tech = _has_tech_keyword(text)
         if not has_tech:
             source = news.get("source", "")
             exempt = any(es in source for es in ["龙虎榜", "业绩预告"])
@@ -431,7 +491,7 @@ def calculate_prefilter_importance(news: dict) -> float:
         if direction == "neutral" and base >= 0.75:
             base *= 0.6
 
-        tech_hits = sum(1 for kw in TECH_HARDWARE_KEYWORDS if kw in text)
+        tech_hits = _tech_hit_count(text)
         tech_bonus = min(tech_hits * 0.15, 0.40)
 
         llm_bonus = 0.0
@@ -444,7 +504,7 @@ def calculate_prefilter_importance(news: dict) -> float:
 
         raw_sum = base + tech_bonus + llm_bonus
         importance = 0.99 * math.tanh(1.4 * raw_sum)
-        has_tech = any(kw in text for kw in TECH_HARDWARE_KEYWORDS)
+        has_tech = _has_tech_keyword(text)
         if not has_tech:
             source = news.get("source", "")
             exempt_sources = ["央视新闻", "新华社", "人民日报", "经济日报",
@@ -468,7 +528,7 @@ def calculate_prefilter_importance(news: dict) -> float:
     policy_bonus = sum(s for kw, s in POLICY_KEYWORDS.items() if kw in text)
     policy_cat = min(policy_bonus, 0.35)
 
-    tech_hits = sum(1 for kw in TECH_HARDWARE_KEYWORDS if kw in text)
+    tech_hits = _tech_hit_count(text)
     tech_cat = min(tech_hits * 0.20, 0.50)
     other_sector_hits = sum(1 for kw in SECTOR_KEYWORDS if kw in text and kw not in TECH_HARDWARE_KEYWORDS)
     sector_cat = min(other_sector_hits * 0.04, 0.10)
@@ -487,7 +547,7 @@ def calculate_prefilter_importance(news: dict) -> float:
     raw_sum = score + high_cat + policy_cat + tech_cat + sector_cat + medium_cat + llm_bonus
     importance = 0.99 * math.tanh(1.4 * raw_sum)
     is_stock_related = bool(news.get("affected_stocks"))
-    has_tech = any(kw in text for kw in TECH_HARDWARE_KEYWORDS)
+    has_tech = _has_tech_keyword(text)
     if is_stock_related and not has_tech:
         source = news.get("source", "")
         exempt_sources = ["央视新闻", "新华社", "人民日报", "经济日报",
@@ -721,12 +781,14 @@ BAND_PRIORITY = {
 }
 
 # 影响范围分数加成（融入 total_score，不再作为独立排序主键）
-# 设计意图：market 级事件通常影响面更广，给予适度分数加成使其在同 band 内优先；
-# 但加成幅度（0.12）远小于正常分数差异，确保高分 sector 事件能越过低分 market 事件，
+# 设计意图：market 级事件通常影响面更广，给予适度分数加成使其在同 band 内优先。
+# 修复：market 加成 0.12 → 0.20。实证 #1 MSCI AI观点(sector, 0.815) 压过 #2 富达美联储(market, 0.683)，
+# 科技×1.20 与非科技×0.85 的倍率差（1.41x）完全盖过 0.12 加成；+0.20 后同影响强度下 market 反超 sector。
+# 但加成仍远小于正常分数差异，确保高分 sector 事件能越过低分 market 事件，
 # 避免"0.37 的 market 压住 0.82 的 sector"的倒挂。
 # stock 级个股资讯轻微降权，让板块/市场级资讯自然前置。
 SCOPE_SCORE_BOOST = {
-    "market": 0.12,
+    "market": 0.20,
     "sector": 0.0,
     "stock": -0.05,
 }
@@ -764,7 +826,7 @@ def _infer_influence_scope(news: dict, hs300: dict = None) -> str:
     return "stock"
 
 CONFIDENCE_WEIGHT = {
-    "high": 1.0, "medium": 0.85, "low": 0.7,
+    "high": 1.0, "medium": 0.90, "low": 0.7,
 }
 
 
@@ -1053,7 +1115,7 @@ def _calc_continuous_score(news: dict, hs300: dict = None) -> float:
     # ST/退市检测使用原始文本（title+content），避免公司名称含"*ST"前缀被误删
     raw_text = f"{title} {content}"
 
-    is_tech = any(kw in clean_text for kw in TECH_HARDWARE_KEYWORDS)
+    is_tech = _has_tech_keyword(clean_text)
     is_national_auth = _is_national_authority(news.get("source", ""))
     is_national_policy = _has_national_policy(clean_text)
     # ST/退市检测：用正则精确匹配 *ST/ST 前缀（公司名），避免误命中英文缩写如 STorage/STMicroelectronics
