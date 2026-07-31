@@ -8,7 +8,6 @@ A股资讯数据获取工具
 import json
 import socket
 import logging
-import threading
 import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -21,74 +20,10 @@ logger = logging.getLogger(__name__)
 # 北京时区（云端 GitHub Actions 运行在 UTC，必须显式指定 BJT 避免日期过滤错位）
 BJT = timezone(timedelta(hours=8))
 
-# ============================================================
-# 线程安全内存缓存 (带 TTL)
-# ============================================================
-_cache = {}
-_cache_lock = threading.Lock()
-_CACHE_TTL_SECONDS = 3600  # 缓存 1 小时过期
-_CACHE_MAX_SIZE = 50  # 最大缓存条目数，防止长期运行 OOM
-
-
-def _get_cache(key: str, today: str):
-    with _cache_lock:
-        cached = _cache.get(key)
-        if cached and cached.get("date") == today:
-            import time
-            ts = cached.get("_ts", 0)
-            if time.time() - ts < _CACHE_TTL_SECONDS:
-                logger.info(f"命中缓存: {key}")
-                return cached.get("data")
-            else:
-                logger.info(f"缓存过期: {key}")
-                _cache.pop(key, None)
-    return None
-
-
-def _set_cache(key: str, data, today: str):
-    import time
-    with _cache_lock:
-        # 清理过期项，防止长期运行内存泄漏
-        now = time.time()
-        expired_keys = [k for k, v in _cache.items() if now - v.get("_ts", 0) >= _CACHE_TTL_SECONDS]
-        for k in expired_keys:
-            _cache.pop(k, None)
-        # 超出容量时清理最早的条目
-        if len(_cache) >= _CACHE_MAX_SIZE:
-            oldest = sorted(_cache.items(), key=lambda x: x[1].get("_ts", 0))[0][0]
-            _cache.pop(oldest, None)
-        _cache[key] = {"date": today, "data": data, "_ts": now}
-
 
 # ============================================================
 # 当日日期过滤 + 去重工具
 # ============================================================
-
-def _is_today(published_at: str) -> bool:
-    """精确判断时间字符串是否是今天"""
-    if not published_at or not str(published_at).strip():
-        return False
-    text = str(published_at).strip()
-    today = datetime.now(BJT).strftime("%Y-%m-%d")
-    if text == today:
-        return True
-    # 匹配 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD HH:MM (要求日期后有空白分隔)
-    if len(text) >= 11 and text[:10] == today and (text[10] in (' ', 'T', '\t')):
-        return True
-    # 匹配 YYYYMMDD 格式 (正好8位)
-    today_no_dash = today.replace("-", "")
-    if text == today_no_dash:
-        return True
-    if len(text) >= 9 and text[:8] == today_no_dash and text[8] in (' ', 'T', '\t'):
-        return True
-    # 匹配 YYYY/MM/DD 格式
-    today_slash = today.replace("-", "/")
-    if text == today_slash:
-        return True
-    if len(text) >= 11 and text[:10] == today_slash and text[10] in (' ', 'T', '\t'):
-        return True
-    return False
-
 
 def _dedup_by_title(news_list: list) -> list:
     """按标题去重 (完全匹配)"""
@@ -239,6 +174,11 @@ def dedup_news_3layer(news_list: list, simhash_threshold: int = _SIMHASH_THRESHO
 # ============================================================
 
 AKSHARE_TIMEOUT = 20
+# 全局设置一次 socket 超时，避免多线程在 ThreadPoolExecutor 中竞争 setdefaulttimeout
+# 导致的线程安全问题（某些请求无限挂起或过早超时）。
+# akshare 内部不传 timeout 参数，依赖 socket.setdefaulttimeout 作为兜底；
+# requests/LLM 调用均显式传 timeout，不受此全局值影响。
+socket.setdefaulttimeout(AKSHARE_TIMEOUT)
 
 
 def _fetch_em_news():
@@ -247,8 +187,6 @@ def _fetch_em_news():
     akshare 固定返回最近200条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据，
     避免零点后或非交易日运行时当日数据过少。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         df = ak.stock_info_global_em()
@@ -270,8 +208,6 @@ def _fetch_em_news():
     except Exception as e:
         logger.warning(f"东财快讯获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_cls_news():
@@ -293,11 +229,14 @@ def _fetch_cls_news():
         "Referer": "https://www.cls.cn/telegraph",
     }
     url = "https://www.cls.cn/api/cache"
+    # CLS API 版本号: 可从环境变量覆盖，避免 CLS 更新后硬编码版本静默失效
+    import os as _os
+    _CLS_SV = _os.getenv("CLS_API_SV", "8.7.9")
     params = {
         "app": "CailianpressWeb",
         "name": "telegraph",
         "os": "web",
-        "sv": "8.7.9",
+        "sv": _CLS_SV,
     }
 
     # (connect, read) 元组：连接阶段 5s 防挂起，读取阶段 8s 防慢响应
@@ -374,8 +313,6 @@ def _fetch_sina_news():
 
     akshare 固定返回最近20条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         df = ak.stock_info_global_sina()
@@ -399,8 +336,6 @@ def _fetch_sina_news():
     except Exception as e:
         logger.warning(f"新浪财经获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_ths_news():
@@ -408,8 +343,6 @@ def _fetch_ths_news():
 
     akshare 固定返回最近20条，用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         df = ak.stock_info_global_ths()
@@ -431,8 +364,6 @@ def _fetch_ths_news():
     except Exception as e:
         logger.warning(f"同花顺快讯获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_futu_news():
@@ -442,8 +373,6 @@ def _fetch_futu_news():
     固定返回最近50条，国际资讯覆盖度优于东财/新浪/同花顺。
     用 _in_news_window(look_back_days=1) 保留今天+昨天的数据。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         df = ak.stock_info_global_futu()
@@ -472,8 +401,6 @@ def _fetch_futu_news():
     except Exception as e:
         logger.warning(f"富途全球快讯获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_wallstreetcn_news():
@@ -492,7 +419,7 @@ def _fetch_wallstreetcn_news():
     url = "https://api-one-wscn.awtmt.com/apiv1/content/lives"
     params = {"channel": "global-channel", "limit": 30}
 
-    _WSCN_TIMEOUT = (5, 10)
+    _WSCN_TIMEOUT = (3, 5)  # connect 3s + read 5s，最坏 3+5+2+3+5=18s < per_source_timeout=30s
     max_retries = 1
     for attempt in range(max_retries + 1):
         try:
@@ -568,8 +495,6 @@ def _fetch_announcements():
     查询最近3天的公告并合并去重，确保非交易日运行时也能获取到最近交易日的公告。
     交易日盘后某一天可能有 1000+ 条公告，盘前/非交易日可能只有几十条。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         now = datetime.now(BJT)
@@ -587,23 +512,47 @@ def _fetch_announcements():
         if not all_dfs:
             return []
 
-        # 合并多天公告并去重（按 代码+公告标题+公告日期 去重）
+        # 合并多天公告并去重（列名随 akshare 版本变动，用映射兼容）
         import pandas as pd
+        # 列名别名映射：标准名 -> 可能的变体
+        _col_map = {
+            "code": ["代码", "股票代码", "code"],
+            "name": ["名称", "股票简称", "name"],
+            "title": ["公告标题", "标题", "title"],
+            "type": ["公告类型", "类型", "type"],
+            "date": ["公告日期", "日期", "date"],
+        }
+        def _get_col(row, std_name):
+            for alias in _col_map.get(std_name, [std_name]):
+                if alias in row:
+                    return row[alias]
+            return ""
+        def _find_col(df_cols, std_name):
+            for alias in _col_map.get(std_name, [std_name]):
+                if alias in df_cols:
+                    return alias
+            return None
+
         merged_df = pd.concat(all_dfs, ignore_index=True)
-        merged_df = merged_df.drop_duplicates(subset=["代码", "公告标题", "公告日期"], keep="first")
+        # 动态确定去重列名
+        _dedup_cols = [c for c in [_find_col(merged_df.columns, "code"),
+                                    _find_col(merged_df.columns, "title"),
+                                    _find_col(merged_df.columns, "date")] if c]
+        if _dedup_cols:
+            merged_df = merged_df.drop_duplicates(subset=_dedup_cols, keep="first")
 
         announcements = []
         for _, row in merged_df.iterrows():
-            pub_time = str(row.get("公告日期", ""))
+            pub_time = str(_get_col(row, "date"))
             # 保留最近3天窗口内的公告
             if not _in_news_window(pub_time, look_back_days=3):
                 continue
             announcements.append({
-                "code": str(row.get("代码", "")),
-                "name": str(row.get("名称", "")),
-                "title": str(row.get("公告标题", "")),
-                "type": str(row.get("公告类型", "")),
-                "content": str(row.get("公告标题", "")),
+                "code": str(_get_col(row, "code")),
+                "name": str(_get_col(row, "name")),
+                "title": str(_get_col(row, "title")),
+                "type": str(_get_col(row, "type")),
+                "content": str(_get_col(row, "title")),
                 "published_at": pub_time
             })
         logger.info(f"交易所公告: 查询{len(dates_to_query)}天, 合并去重后{len(announcements)}条")
@@ -611,8 +560,6 @@ def _fetch_announcements():
     except Exception as e:
         logger.warning(f"交易所公告获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 # ============================================================
@@ -628,8 +575,6 @@ YJYG_DIRECTION_MAP = {
 
 def _fetch_lhb_signal():
     """龙虎榜机构买卖统计 (stock_lhb_jgmmtj_em)"""
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         end_date = datetime.now(BJT).strftime("%Y%m%d")
@@ -687,8 +632,6 @@ def _fetch_lhb_signal():
     except Exception as e:
         logger.warning(f"龙虎榜信号获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def _fetch_yjyg_signal():
@@ -698,8 +641,6 @@ def _fetch_yjyg_signal():
     避免查到未来日期（1月运行时 today.replace(month=12) 产生今年12/31）
     和过期数据（非财报季查到上季度旧数据全部被 _in_news_window 过滤为空）。
     """
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         today = datetime.now(BJT)
@@ -779,8 +720,6 @@ def _fetch_yjyg_signal():
     except Exception as e:
         logger.warning(f"业绩预告信号获取失败: {e}")
         return []
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 # ============================================================
@@ -832,39 +771,37 @@ def _parallel_fetch(tasks: dict, per_source_timeout: int = 30, total_timeout: in
 # 沪深300成分股 (用于排序时识别优质个股)
 # ============================================================
 
+_hs300_singleton: dict | None = None
+
+
 def get_hs300_constituents() -> dict:
-    """获取沪深300成分股（代码集合 + 名称集合），带内存缓存（1天TTL）。
+    """获取沪深300成分股（代码集合 + 名称集合）。
 
-    用于排序时识别"非垃圾股"：沪深300以内视为优质个股，不降权。
-    失败时返回空集合，调用方应据此跳过降权（保守不降权）。
+    进程内单例：沪深300成分股准静态（季度调整），同进程内只请求一次 akshare，
+    后续调用直接复用。失败时返回空集合，调用方应据此跳过降权（保守不降权）。
     """
-    today = datetime.now(BJT).strftime("%Y-%m-%d")
-    cache_key = "hs300_constituents"
-    cached = _get_cache(cache_key, today)
-    if cached is not None:
-        return cached
+    global _hs300_singleton
+    if _hs300_singleton is not None:
+        return _hs300_singleton
 
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(AKSHARE_TIMEOUT)
     try:
         import akshare as ak
         df = ak.index_stock_cons_csindex(symbol="000300")
         # 防御空 DataFrame 或列名变更
         if df is None or df.empty or "成分券代码" not in df.columns:
             logger.warning(f"沪深300成分股: 返回数据异常, df={df is None and 'None' or (df.empty and 'empty' or 'missing column')}")
-            return {"codes": set(), "names": set()}
+            _hs300_singleton = {"codes": set(), "names": set()}
+            return _hs300_singleton
         codes = set(str(c).zfill(6) for c in df["成分券代码"].dropna().tolist() if str(c).strip())
         names_col = "成分券名称" if "成分券名称" in df.columns else None
         names = set(str(n).strip() for n in df[names_col].dropna().tolist() if str(n).strip()) if names_col else set()
-        result = {"codes": codes, "names": names}
-        _set_cache(cache_key, result, today)
+        _hs300_singleton = {"codes": codes, "names": names}
         logger.info(f"沪深300成分股: 获取成功, {len(codes)}只")
-        return result
+        return _hs300_singleton
     except Exception as e:
         logger.warning(f"沪深300成分股获取失败: {e}")
-        return {"codes": set(), "names": set()}
-    finally:
-        socket.setdefaulttimeout(old_timeout)
+        _hs300_singleton = {"codes": set(), "names": set()}
+        return _hs300_singleton
 
 
 # ============================================================
@@ -878,10 +815,6 @@ def get_stock_news(data_mode: str = "live") -> list:
     国际资讯覆盖：富途全球快讯(美股/港股/国际宏观) + 华尔街见闻(地缘政治/外围股市/大宗商品)。
     """
     today = datetime.now(BJT).strftime("%Y-%m-%d")
-    cache_key = f"stock_news_{data_mode}"
-    cached = _get_cache(cache_key, today)
-    if cached is not None:
-        return cached
 
     results = _parallel_fetch({
         _fetch_em_news: "东财快讯",
@@ -904,24 +837,16 @@ def get_stock_news(data_mode: str = "live") -> list:
         logger.warning("所有实时新闻源失败, 返回空列表")
         return []
 
-    _set_cache(cache_key, all_news, today)
     return all_news
 
 
 @tool
 def get_announcements(data_mode: str = "live") -> list:
     """获取当日全部交易所公告。"""
-    today_fmt = datetime.now(BJT).strftime("%Y-%m-%d")
-    cache_key = f"announcements_{data_mode}"
-    cached = _get_cache(cache_key, today_fmt)
-    if cached is not None:
-        return cached
-
     results = _parallel_fetch({_fetch_announcements: "交易所公告"})
 
     announcements = results.get("交易所公告", [])
     if announcements:
-        _set_cache(cache_key, announcements, today_fmt)
         return announcements
     else:
         logger.warning("akshare获取公告失败, 返回空列表")
@@ -931,12 +856,6 @@ def get_announcements(data_mode: str = "live") -> list:
 @tool
 def get_market_signals(data_mode: str = "live") -> list:
     """获取市场信号情报: 龙虎榜机构动向 + 业绩预告 (交易所官方披露)。"""
-    today = datetime.now(BJT).strftime("%Y-%m-%d")
-    cache_key = f"market_signals_{data_mode}"
-    cached = _get_cache(cache_key, today)
-    if cached is not None:
-        return cached
-
     results = _parallel_fetch({
         _fetch_lhb_signal: "龙虎榜信号",
         _fetch_yjyg_signal: "业绩预告信号",
@@ -945,9 +864,6 @@ def get_market_signals(data_mode: str = "live") -> list:
     all_signals = []
     for label, data in results.items():
         all_signals.extend(data)
-
-    if all_signals:
-        _set_cache(cache_key, all_signals, today)
 
     return all_signals
 

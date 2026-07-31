@@ -53,8 +53,12 @@ async def health_check():
 
 
 @app.get("/api/market_data")
-async def get_market_data():
-    """获取原始资讯数据（直接返回，不经过Agent）"""
+def get_market_data():
+    """获取原始资讯数据（直接返回，不经过Agent）
+
+    用同步 def（非 async def）让 FastAPI 自动放到线程池执行，
+    避免 akshare 同步阻塞调用卡死事件循环（与 generate_report 同理）。
+    """
     try:
         raw_news = get_stock_news.invoke({"data_mode": "live"})
         announcements = get_announcements.invoke({"data_mode": "live"})
