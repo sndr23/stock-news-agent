@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
-from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display, _has_tech_keyword, _TECH_ENGLISH_WORDS
 from src.tools.data_fetchers import get_hs300_constituents
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, NewsAnalysisItem
@@ -311,7 +311,8 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
     relevant = []
     for news in scored:
         text = f"{news.get('title', '')} {news.get('content', '')}"
-        has_tech = any(kw in text for kw in TECH_HARDWARE_KEYWORDS)
+        # 词边界感知的科技词匹配（英文缩写不子串匹配，避免 nAMD 等误命中）
+        has_tech = _has_tech_keyword(text)
         has_tech_sector = any(kw in text for kw in _TECH_SECTOR_TERMS)
         has_macro_transmission = any(kw in text for kw in _CORE_MACRO_TRANSMISSION)
         if not has_tech and not has_tech_sector and not has_macro_transmission:
@@ -355,19 +356,23 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
         kept.sort(key=lambda x: x["_prefilter_score"], reverse=True)
         kept = kept[:top_n]
 
-    # 聚类热度：预计算 2-gram 集合，避免 O(n²) 重复构建
-    gram_sets = []
-    for news in kept:
-        title = news.get("title", "")
-        gram_sets.append(set(title[i:i+2] for i in range(len(title)-1)) if len(title) > 1 else set())
+    # 聚类热度：标题字符集合 Jaccard，阈值 0.35。
+    # 修复前用标题 2-gram Jaccard>0.35：同事件不同角度报道（如"铠侠NAND涨价" vs
+    # "铠侠NAND需求强劲"）字面重合度低，实际数据中 cluster_weight 恒为 0，
+    # NEWS_CLUSTER_WEIGHT=0.15 聚类热度因子名存实亡。
+    # 只比较标题（不含 content）：公告/新闻正文模板化语言（"控股子公司/亿元/签订"）
+    # 会把不同公司的无关事件误聚成高热度簇（实测 cw 虚高到 10）；标题是事件语义核心。
+    # 0.35 低于展示层标题去重阈值 0.6，捕获同事件不同表述，模板化误聚仅产生低热度。
+    _CLUSTER_JACCARD_THRESHOLD = 0.35
+    cluster_sets = [set(news.get("title", "")) for news in kept]
 
     for i, news1 in enumerate(kept):
         cluster_size = 1
-        gs1 = gram_sets[i]
-        for j, gs2 in enumerate(gram_sets):
-            if i != j and gs1 and gs2:
-                union = len(gs1 | gs2)
-                if union > 0 and len(gs1 & gs2) / union > 0.35:
+        cs1 = cluster_sets[i]
+        for j, cs2 in enumerate(cluster_sets):
+            if i != j and cs1 and cs2:
+                union = len(cs1 | cs2)
+                if union > 0 and len(cs1 & cs2) / union > _CLUSTER_JACCARD_THRESHOLD:
                     cluster_size += 1
         news1["cluster_weight"] = min(cluster_size - 1, 10)
 
@@ -402,10 +407,11 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 - 核心事实：提取关键数据和主体
 - 信息完整性：是否有具体金额/比例/时间？
 
-### 第2步：影响范围判断（最关键步骤，决定最终排序层级）
-按以下顺序逐层判断，取最高层级作为 influence_scope。该字段是最终排序的首要维度：
+### 第2步：影响范围判断（影响排序加权，market 级在同强度下优先）
+按以下顺序逐层判断，取最高层级作为 influence_scope。该字段参与最终排序加权：
+market 级影响面最广，在影响强度相近时优先于 sector/stock 级。
 
-1. 市场级(market)：能影响全球或全A股市场的宏观事件（优先级最高，必须排最前）
+1. 市场级(market)：能影响全球或全A股市场的宏观事件（影响面最广，同强度下优先）
    - 美联储政策（加息/降息/缩表/点阵图）、鲍威尔/非农/CPI 等全球货币政策信号
    - 重大地缘政治事件影响全球风险偏好（战争/冲突/制裁/能源危机）
    - 央行/财政部/国务院的全面性政策（降准降息、印花税调整、注册制改革）
@@ -1298,7 +1304,16 @@ HIGH_SIGNAL_KEYWORDS = [
 # 用 re.escape 转义 "*ST" 等含正则元字符的关键词，
 # 正则引擎一次扫描即可匹配全部关键词，替代逐词 `in` 遍历（O(n×kw_count) → O(n)）
 _ALL_SIGNAL_KEYWORDS = HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS
-_SIGNAL_PATTERN = re.compile("|".join(re.escape(kw) for kw in _ALL_SIGNAL_KEYWORDS))
+
+
+def _signal_kw_pattern(kw: str) -> str:
+    """信号关键词 → 正则片段：英文缩写加词边界（nAMD 不触发 AMD 信号）"""
+    if kw in _TECH_ENGLISH_WORDS:
+        return rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])"
+    return re.escape(kw)
+
+
+_SIGNAL_PATTERN = re.compile("|".join(_signal_kw_pattern(kw) for kw in _ALL_SIGNAL_KEYWORDS))
 
 
 def _has_high_signal(news_list: list) -> bool:
@@ -1737,7 +1752,7 @@ SCORE_ADJUST_PROMPT = """你是资深A股投研总监。以下资讯已经过初
 5. 利好利空均可高分，关键是影响程度；纯噪音应低分
 
 ## 输出格式
-只返回JSON，不要代码块包裹:
+只返回一个JSON对象，不要代码块包裹、不要任何前后缀文字:
 ```json
 {{
   "adjustments": [
@@ -1746,7 +1761,11 @@ SCORE_ADJUST_PROMPT = """你是资深A股投研总监。以下资讯已经过初
 }}
 ```
 
-注意: adjusted_score 范围 0-10，参考 init_score 上下调整。数量与输入一致。
+注意:
+- adjusted_score 范围 0-10，参考 init_score 上下调整。数量与输入一致（共{n}条）。
+- title 必须与输入中的 title 完全一致（一字不差），否则该条调整将无法匹配。
+- 输出必须是一个完整的JSON，严禁截断；若内容过长请优先精简 title 外的所有描述，绝不省略任何一条。
+- 只输出上述 JSON，不输出分析过程、总结或任何其他文字。
 """
 
 
