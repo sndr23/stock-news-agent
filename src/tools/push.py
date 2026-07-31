@@ -19,72 +19,74 @@ WxPusher:
     - 企业微信建群 → 添加群机器人 → 复制 webhook URL
 """
 import logging
+import time
 import requests
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# 事件去重 / 同股公告限额 / 标题去重统一在 calculators 实现，Web UI 与推送共用
+from src.tools.calculators import (
+    dedup_ranked_by_event,
+    _event_signature,
+    _EVENT_KEYWORD_GROUPS,
+    dedup_and_cap_for_display,
+    dedup_ranked_by_title,
+    _extract_title_core,
+    _title_similarity,
+)
+
 PUSHPLUS_API = "https://www.pushplus.plus/send"
 WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
 
-
-def _extract_title_core(title: str) -> str:
-    """提取标题核心内容：去掉【】()等括号内容及标点空格，用于相似度比较"""
-    import re
-    # 防御 None 或非字符串
-    title = str(title) if title else ""
-    # 去掉【...】、(...)、（...）等括号包裹的前缀/后缀
-    t = re.sub(r'[【】\[\]()（）{}<>《》]', '', title)
-    # 去掉所有标点和空白
-    t = re.sub(r'[^\w\u4e00-\u9fff]', '', t)
-    return t
+# 推送重试配置
+_PUSH_MAX_RETRIES = 2
+_PUSH_RETRY_BASE_DELAY = 2  # 指数退避基数: 2s, 4s
 
 
-def _title_similarity(t1: str, t2: str) -> float:
-    """基于字符集合的 Jaccard 相似度（0-1）"""
-    s1, s2 = set(t1), set(t2)
-    if not s1 or not s2:
-        return 0.0
-    return len(s1 & s2) / len(s1 | s2)
-
-
-def dedup_ranked_by_title(ranked_news: list, threshold: float = 0.6) -> list:
-    """排序后标题相似度去重：保留排名靠前的，去掉后续相似标题
+def _post_with_retry(url: str, json_payload: dict, timeout: int = 15,
+                     max_retries: int = _PUSH_MAX_RETRIES,
+                     success_checker=None) -> dict:
+    """带指数退避重试的 POST 请求
 
     Args:
-        ranked_news: 已排序的资讯列表
-        threshold: 标题核心内容 Jaccard 相似度阈值，超过则判定重复
+        url: 请求 URL
+        json_payload: JSON 请求体
+        timeout: 单次请求超时秒数
+        max_retries: 最大重试次数（不含首次）
+        success_checker: 判断响应是否成功的回调，返回 True 表示成功
 
     Returns:
-        去重后的列表（保持原排序）
+        API 返回的 JSON dict
     """
-    if not ranked_news:
-        return ranked_news
-    kept = []
-    kept_cores = []
-    removed = 0
-    for news in ranked_news:
-        title = news.get("title", "")
-        core = _extract_title_core(title)
-        is_dup = False
-        for kc in kept_cores:
-            # 判定重复：Jaccard 相似度高，或短标题核心是长标题核心的子串
-            if _title_similarity(core, kc) >= threshold:
-                is_dup = True
-                break
-            # 子串包含：短标题(>=6字)完全包含在长标题中
-            shorter, longer = (core, kc) if len(core) <= len(kc) else (kc, core)
-            if len(shorter) >= 6 and shorter in longer:
-                is_dup = True
-                break
-        if is_dup:
-            removed += 1
-        else:
-            kept.append(news)
-            kept_cores.append(core)
-    if removed > 0:
-        logger.info(f"推送前标题去重: {len(ranked_news)} -> {len(kept)}条, 去除{removed}条重复")
-    return kept
+    last_result = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(url, json=json_payload, timeout=timeout)
+            try:
+                result = resp.json()
+            except Exception:
+                result = {"code": resp.status_code, "msg": resp.text[:500]}
+            last_result = result
+            if success_checker and success_checker(result):
+                if attempt > 0:
+                    logger.info(f"推送第{attempt+1}次尝试成功")
+                return result
+            # 响应非成功，判断是否值得重试（4xx 客户端错误不重试）
+            status = resp.status_code
+            if 400 <= status < 500 and status != 429:
+                logger.warning(f"推送客户端错误({status})，不重试: {result}")
+                return result
+        except Exception as e:
+            last_result = {"code": 500, "msg": str(e)}
+            logger.warning(f"推送第{attempt+1}次请求异常: {e}")
+
+        if attempt < max_retries:
+            delay = _PUSH_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.info(f"等待{delay}s后重试推送...")
+            time.sleep(delay)
+
+    return last_result or {"code": 500, "msg": "推送失败且无响应"}
 
 
 def format_ranked_news_md(ranked_news: list, top_n: int = 20, title: str = "A股资讯日报", max_chars: int = 0) -> str:
@@ -223,18 +225,14 @@ def push_via_pushplus(token: str, title: str, content: str, template: str = "mar
         "content": content,
         "template": template,
     }
-    try:
-        resp = requests.post(PUSHPLUS_API, json=payload, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("code") == 200:
-            logger.info(f"PushPlus 推送成功: {title}")
-        else:
-            logger.warning(f"PushPlus 推送失败: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"PushPlus 推送异常: {e}")
-        return {"code": 500, "msg": str(e)}
+    result = _post_with_retry(
+        PUSHPLUS_API, payload, timeout=15,
+        success_checker=lambda r: r.get("code") == 200)
+    if result.get("code") == 200:
+        logger.info(f"PushPlus 推送成功: {title}")
+    else:
+        logger.warning(f"PushPlus 推送失败: {result}")
+    return result
 
 
 def push_via_wxpusher(
@@ -280,21 +278,14 @@ def push_via_wxpusher(
         f"WxPusher 请求: appToken={app_token[:6]}***, uid={uid[:6]}***, "
         f"content_len={len(content)}, summary_len={len(summary)}"
     )
-    try:
-        resp = requests.post(WXPUSHER_API, json=payload, timeout=15)
-        # 不使用 raise_for_status，直接解析响应体（即使 400/500 也能看到 WxPusher 的错误信息）
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"code": resp.status_code, "msg": resp.text[:500]}
-        if result.get("code") == 1000:
-            logger.info(f"WxPusher 推送成功: {title}")
-        else:
-            logger.warning(f"WxPusher 推送失败: HTTP {resp.status_code}, response={result}")
-        return result
-    except Exception as e:
-        logger.error(f"WxPusher 推送异常: {e}")
-        return {"code": 500, "msg": str(e)}
+    result = _post_with_retry(
+        WXPUSHER_API, payload, timeout=15,
+        success_checker=lambda r: r.get("code") == 1000)
+    if result.get("code") == 1000:
+        logger.info(f"WxPusher 推送成功: {title}")
+    else:
+        logger.warning(f"WxPusher 推送失败: {result}")
+    return result
 
 
 def push_via_wecom(webhook_url: str, title: str, content: str) -> dict:
@@ -309,27 +300,26 @@ def push_via_wecom(webhook_url: str, title: str, content: str) -> dict:
         企业微信 API 返回的 JSON
     """
     # 企业微信 markdown 消息体限制 4096 字节，超出会返回 errcode=45008
+    # 必须按 UTF-8 字节长度截断，不能按字符数截断（中文一字占3字节）
     full_content = f"## {title}\n\n{content}"
-    if len(full_content.encode('utf-8')) > 4000:
-        full_content = full_content[:3800] + "\n\n...（内容过长已截断）"
+    encoded = full_content.encode('utf-8')
+    if len(encoded) > 4000:
+        # 按字节截断到 3800 字节（留 296 字节给截断提示）
+        # decode errors='ignore' 丢弃截断产生的半个 UTF-8 字符
+        truncated = encoded[:3800].decode('utf-8', errors='ignore')
+        full_content = truncated + "\n\n...（内容过长已截断）"
     payload = {
         "msgtype": "markdown",
         "markdown": {"content": full_content},
     }
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=15)
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"errcode": resp.status_code, "errmsg": resp.text[:500]}
-        if result.get("errcode") == 0:
-            logger.info(f"企业微信推送成功: {title}")
-        else:
-            logger.warning(f"企业微信推送失败: HTTP {resp.status_code}, response={result}")
-        return result
-    except Exception as e:
-        logger.error(f"企业微信推送异常: {e}")
-        return {"errcode": 500, "errmsg": str(e)}
+    result = _post_with_retry(
+        webhook_url, payload, timeout=15,
+        success_checker=lambda r: r.get("errcode") == 0)
+    if result.get("errcode") == 0:
+        logger.info(f"企业微信推送成功: {title}")
+    else:
+        logger.warning(f"企业微信推送失败: {result}")
+    return result
 
 
 def push_news(
@@ -360,8 +350,12 @@ def push_news(
     Returns:
         推送结果 dict
     """
-    # 推送前标题相似度去重（保留排名靠前的）
-    ranked_news = dedup_ranked_by_title(ranked_news)
+    # 防御: top_n 必须为正整数，负值会导致切片从末尾取
+    top_n = max(1, min(int(top_n), 100))
+
+    # 展示层统一去重（标题相似度 + 同事件 + 宏观簇限流 + 同股公告限额）
+    # dedup_and_cap_for_display 内部已包含标题去重，无需重复调用
+    ranked_news = dedup_and_cap_for_display(ranked_news)
 
     # 按推送后端限制动态控制字数：
     # PushPlus 免费版限5000字 → 格式化阶段就限制条数，避免最终粗暴截断
