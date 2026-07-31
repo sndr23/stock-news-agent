@@ -4,10 +4,10 @@ A股资讯监测 Agent 节点实现
 3个节点: fetch_news -> filter_noise -> rank_news
 
 两阶段过滤方案 (解决当日资讯量可能数百上千条的问题):
-  Stage 1 - Python预过滤 (毫秒级, 处理数百条->约40条):
+  Stage 1 - Python预过滤 (毫秒级, 处理数百条->约20条):
     - 关键词去噪 (庆典/年会/八卦等)
     - 标题去重
-    - 重要度初筛 (取top 40)
+    - 重要度初筛 (取top 20)
   Stage 2 - LLM分析 (每批10条约25秒):
     - 剩余噪音识别
     - 利好/利空方向标注
@@ -15,7 +15,6 @@ A股资讯监测 Agent 节点实现
 """
 import json
 import re
-import socket
 import time
 import logging
 from langchain_core.messages import AIMessage
@@ -24,13 +23,13 @@ logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
-from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, _load_watchlist, is_leader_or_high_impact
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display
 from src.tools.data_fetchers import get_hs300_constituents
 from src.agent.state import AgentState, NO_DATA_SENTINEL
-from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
+from src.schemas import ImpactBand, NewsAnalysisItem
 
 
-def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2) -> str:
+def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2, deadline: float = 0) -> str:
     """直接用 requests 调用 LLM API
 
     关键: trust_env=False 禁止 requests 读取系统代理设置(Windows注册表/env vars),
@@ -62,14 +61,18 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 0.3,
+        "temperature": 0.1,  # 与方式A (LangChain) 保持一致，结构化输出场景降低温度
         "max_tokens": 16384
     }
 
     last_error = None
     for attempt in range(max_retries + 1):
+        # 总超时熔断：逼近 deadline 立即放弃重试并返回上层降级，
+        # 根治方式B/C 内部重试叠加（最多 4×120s=480s）突破 llm_filter 的 300s 总超时导致"一直超时"
+        if deadline and time.monotonic() >= deadline:
+            raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt} 次）")
         session = requests.Session()
-        # OpenRouter 官方需科学上网，保留系统代理；国内中转平台禁用代理避免 ConnectionRefused
+        # 官方端点(OpenRouter)需科学上网保留代理；Agnes 等中转端点禁用代理避免 ConnectionRefused
         session.trust_env = IS_OPENROUTER_OFFICIAL
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=timeout)
@@ -88,9 +91,12 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
             session.close()
 
         if attempt < max_retries:
+            # 重试前再次确认未超 deadline（避免退避等待期间已超时仍继续重试）
+            if deadline and time.monotonic() >= deadline:
+                raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt + 1} 次）")
             # 指数退避: 2s, 4s
             wait_time = 2 ** (attempt + 1)
-            logger.info(f"等待 {wait_time}s 后重试...")
+            logger.info(f"等待 {wait_time}s 后重试（Agnes 端点）...")
             time.sleep(wait_time)
 
     raise Exception(f"LLM API 调用失败，已重试 {max_retries} 次: {last_error}")
@@ -157,19 +163,10 @@ def fetch_news_node(state: AgentState) -> dict:
 # Stage 1: Python预过滤 (毫秒级)
 # ============================================================
 
-def _calc_similarity(text1: str, text2: str) -> float:
-    # 简单的2-gram字符级别Jaccard相似度
-    set1 = set([text1[i:i+2] for i in range(len(text1)-1)])
-    set2 = set([text2[i:i+2] for i in range(len(text2)-1)])
-    if not set1 or not set2:
-        return 0.0
-    return len(set1 & set2) / len(set1 | set2)
-
-
-_PREFILTER_TOTAL_LIMIT = 60
+_PREFILTER_TOTAL_LIMIT = 20
 # 各类最小保底配额：确保冷门类别不被自适应比例饿死
-# macro 提升到8：外围资讯（地缘/大宗商品/外围股市）对A股传导效应显著，需保证配额
-_PREFILTER_MIN_QUOTA = {"sector": 10, "macro": 8}
+# macro 保底4：核心外围传导资讯（美联储/制裁/地缘）需保证配额
+_PREFILTER_MIN_QUOTA = {"sector": 6, "macro": 4}
 
 
 def _adaptive_quota(buckets: dict, total_limit: int = _PREFILTER_TOTAL_LIMIT) -> dict:
@@ -181,6 +178,7 @@ def _adaptive_quota(buckets: dict, total_limit: int = _PREFILTER_TOTAL_LIMIT) ->
       2. 剩余配额 = total_limit - direct_quota（不低于 min_quota_sum）
       3. sector/macro 按实际命中数比例瓜分剩余配额
       4. sector 保底提升后重新计算 macro，防止保底提升导致总和超过 remaining
+      5. 回补：sector/macro 实际数量不足配额时，剩余槽位还给 direct（避免浪费）
 
     Returns:
         {"direct": int|None, "sector": int, "macro": int}  # None 表示不截断
@@ -201,17 +199,25 @@ def _adaptive_quota(buckets: dict, total_limit: int = _PREFILTER_TOTAL_LIMIT) ->
     total_avail = sector_avail + macro_avail
 
     if total_avail == 0:
-        return {"direct": direct_quota, "sector": 0, "macro": 0}
+        sector_quota = 0
+        macro_quota = 0
+    elif total_avail <= remaining:
+        # sector/macro 总量不超过剩余配额 → 全留
+        sector_quota = sector_avail
+        macro_quota = macro_avail
+    else:
+        # 按比例分配
+        sector_quota = round(remaining * sector_avail / total_avail)
+        # 保底提升后重新计算 macro，防止保底提升导致总和超过 remaining
+        sector_quota = max(min(sector_quota, sector_avail), min(_PREFILTER_MIN_QUOTA["sector"], sector_avail))
+        macro_quota = remaining - sector_quota
+        macro_quota = max(min(macro_quota, macro_avail), min(_PREFILTER_MIN_QUOTA["macro"], macro_avail))
 
-    if total_avail <= remaining:
-        return {"direct": direct_quota, "sector": sector_avail, "macro": macro_avail}
-
-    # 按比例分配
-    sector_quota = round(remaining * sector_avail / total_avail)
-    # 保底提升后重新计算 macro，防止保底提升导致总和超过 remaining
-    sector_quota = max(min(sector_quota, sector_avail), min(_PREFILTER_MIN_QUOTA["sector"], sector_avail))
-    macro_quota = remaining - sector_quota
-    macro_quota = max(min(macro_quota, macro_avail), min(_PREFILTER_MIN_QUOTA["macro"], macro_avail))
+    # 回补：sector/macro 用不完的槽位还给 direct，避免预筛总数 < top_n
+    if direct_quota is not None:
+        used = direct_quota + sector_quota + macro_quota
+        if used < total_limit:
+            direct_quota = direct_quota + (total_limit - used)
 
     return {"direct": direct_quota, "sector": sector_quota, "macro": macro_quota}
 
@@ -272,14 +278,63 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
         news["_prefilter_score"] = score
         news["_prefilter_category"] = category
 
-    # 权重表初筛：丢弃"零关联度且 sector 类"的纯噪音条目
-    # （macro 类即使被权重表罚分至 0 也保留，因其类别本身即宏观信号）
-    scored = [n for n in deduped if n["_prefilter_score"] > 0 or n["_prefilter_category"] != "sector"]
+    # 权重表初筛：丢弃零关联度的纯噪音条目（所有类别一视同仁，macro 零分也丢弃）
+    scored = [n for n in deduped if n["_prefilter_score"] > 0]
+
+    # 科技/A股相关性过滤：本系统是科技板块资讯监测，
+    # 既无科技关键词、又无A股板块词、又无核心外围传导词的纯外围/纯非科技资讯直接剔除
+    # （避免阿迪达斯收入预期、澳大利亚央行、纯白酒/银行板块等与A股科技无关的资讯占用配额）
+    _CORE_MACRO_TRANSMISSION = {
+        # 科技管制（直接传导A股科技）
+        "制裁", "出口管制", "禁运", "实体清单", "关税", "贸易战",
+        # 全球系统性风险
+        "美联储", "加息", "降息", "缩表", "QE", "鲍威尔", "非农", "CPI", "PPI",
+        "熔断", "崩盘", "债务危机", "银行危机", "金融风险", "系统性风险",
+        # 地缘冲突
+        "战争", "军事冲突", "冲突", "地缘", "俄乌", "中东", "台海",
+        # A股直接政策
+        "降准", "印花税", "注册制", "北向资金",
+        # A股大盘
+        "A股", "沪指", "深证", "创业板", "沪深300", "大盘",
+        # 外围科技指数（直接传导A股科技情绪）
+        "纳指", "纳斯达克", "美股", "恒生科技", "费城半导体",
+    }
+    # 科技板块专属词：SECTOR_KEYWORDS 去除纯非科技词（白酒/银行/房地产/煤炭/钢铁/有色/医药），
+    # 补充 TECH_HARDWARE_KEYWORDS 未覆盖的科技延伸词
+    _TECH_SECTOR_TERMS = {
+        "新能源", "光伏", "储能", "人工智能", "AI", "大模型",
+        "算力", "数据要素", "消费电子", "汽车电子", "锂电", "氢能", "机器人",
+        "电子", "通信", "软件", "计算机", "信息技术", "数字经济",
+        "智能制造", "自动化", "量子", "元宇宙",
+    }
+    macro_filtered = 0
+    relevant = []
+    for news in scored:
+        text = f"{news.get('title', '')} {news.get('content', '')}"
+        has_tech = any(kw in text for kw in TECH_HARDWARE_KEYWORDS)
+        has_tech_sector = any(kw in text for kw in _TECH_SECTOR_TERMS)
+        has_macro_transmission = any(kw in text for kw in _CORE_MACRO_TRANSMISSION)
+        if not has_tech and not has_tech_sector and not has_macro_transmission:
+            macro_filtered += 1
+            continue
+        relevant.append(news)
+    if macro_filtered > 0:
+        logger.info(f"[prefilter] 科技/A股相关性过滤: 剔除{macro_filtered}条无关外围资讯")
+    scored = relevant
 
     buckets = {"direct": [], "sector": [], "macro": []}
+    self_only_removed = 0
     for news in scored:
         cat = news["_prefilter_category"]
+        # 预筛剔除：提及具体非龙头个股、且无板块/宏观联动的资讯（仅影响个股自身），
+        # 不具备市场/板块带动价值，在预筛阶段直接剔除（用户需求：最终只保留能带动市场情绪的价值资讯）。
+        # 公告类已在上方 is_leader_or_high_impact 中处理；此处 _is_self_only_individual_stock 对公告返回 False。
+        if _is_self_only_individual_stock(news, hs300):
+            self_only_removed += 1
+            continue
         buckets[cat].append(news)
+    if self_only_removed > 0:
+        logger.info(f"[prefilter] 剔除仅影响个股自身的非龙头资讯: {self_only_removed}条")
 
     for cat in buckets:
         buckets[cat].sort(key=lambda x: x["_prefilter_score"], reverse=True)
@@ -324,7 +379,10 @@ def _python_prefilter(news_list: list, top_n: int = _PREFILTER_TOTAL_LIMIT) -> t
             if key.startswith("_"):
                 news.pop(key, None)
 
-    total_removed = dup_count + (len(deduped) - len(kept))
+    # total_removed 含三层去重 + 非龙头低影响公告过滤 + 科技相关性过滤 + 自影响个股剔除 + 配额初筛
+    # 注意: len(deduped) - len(kept) 已包含 self_only_removed（self-only 剔除发生在 scored→buckets 阶段，
+    # scored 来源于 deduped），不可再加 self_only_removed 否则双重计数
+    total_removed = dup_count + ann_removed + (len(deduped) - len(kept))
     return kept, total_removed
 
 
@@ -344,32 +402,36 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 - 核心事实：提取关键数据和主体
 - 信息完整性：是否有具体金额/比例/时间？
 
-### 第2步：影响范围判断（最关键步骤）
-按以下顺序逐层判断，取最高层级作为 influence_scope：
+### 第2步：影响范围判断（最关键步骤，决定最终排序层级）
+按以下顺序逐层判断，取最高层级作为 influence_scope。该字段是最终排序的首要维度：
 
-1. 市场级(market)：影响整个A股市场/大盘
-   - 央行/财政部/证监会/国务院的全面性政策（降息降准、注册制改革、印花税调整）
-   - 重大地缘政治事件（影响全市场情绪）
-   - 跨3个以上板块的系统性事件
+1. 市场级(market)：能影响全球或全A股市场的宏观事件（优先级最高，必须排最前）
+   - 美联储政策（加息/降息/缩表/点阵图）、鲍威尔/非农/CPI 等全球货币政策信号
+   - 重大地缘政治事件影响全球风险偏好（战争/冲突/制裁/能源危机）
+   - 央行/财政部/国务院的全面性政策（降准降息、印花税调整、注册制改革）
+   - 全球系统性金融风险（债务危机/银行危机/熔断）
+   * 判定要点：该事件是否"牵动全球或全市场资金与情绪"，而非仅某一板块
 
-2. 板块级(sector)：影响整个行业/板块
-   - 行业政策（如半导体补贴、新能源规划）→ 整个板块
+2. 板块级(sector)：影响整个行业/板块（次级优先）
+   - 行业政策（半导体补贴、新能源规划、AI 产业扶持）→ 整个板块
    - 龙头股重大事件 → 带动板块情绪和估值
      * 龙头判断标准：市值前列、板块风向标、机构持仓集中
      * 典型龙头：中际旭创/新易盛(CPO) | 宁德时代(新能源) | 贵州茅台(白酒) | 招商银行(银行) | 中芯国际(半导体) | 工业富联(算力)
    - 供应链传导（如上游涨价→下游成本上升→整个链条）
    - 板块性技术趋势（如CPO技术路线确立）
 
-3. 个股级(stock)：仅影响个股本身
+3. 个股级(stock)：仅影响个股本身（排最后）
    - 非龙头股的普通公告（业绩波动、常规经营）
    - 无板块联动效应的个股事件
    - 注意：即使是利好，如果只是个股层面且非龙头，不应判为 sector
 
-### 第3步：方向判断
-- 对受影响对象是利好还是利空？
-- 科技板块资讯以"对科技板块的影响"判定方向
+### 第3步：方向判断（以科技板块为本位）
+- 本系统是科技板块资讯监测，方向判定一律以"对科技板块的影响"为准
+- 科技板块涨/利好 → bullish；科技板块跌/利空 → bearish
+- 收盘播报/盘面汇总等混合资讯：即使白酒/消费/银行等非科技板块上涨，只要科技板块（半导体/电子/通信/算力/PCB/CPO/机器人等）下跌，即判 bearish
+- 非科技板块（白酒/消费/医药/银行/汽车等）的利好不改变整体方向判定
 - 含明确多空信号的严禁判 neutral/mixed
-- 同时含利好利空判 mixed
+- 仅当科技板块自身多空交织（如半导体涨但通信跌）才判 mixed
 
 ### 第4步：强度评估（0-10分）
 - 0-2: 几乎无影响（常规播报、无关资讯）
@@ -390,15 +452,19 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 - "某小盘股获补贴200万→仅个股影响→弱利好→低置信"
 
 ## 输出契约（每条只输出以下字段，不要重复content/source等原始字段）
+0. idx: 输入中的数字编号（必须原样回显，用于匹配，不要修改也不要省略）
 1. title: 原标题（用于匹配，必须与输入一致）
 2. market_impact_score: 0-10（0无影响/10极重大）
-3. impact_band: 6档之一（与score区间一致）
-   - bullish(强利好, 6.5-10): 业绩预增/大额中标/政策扶持/增持回购/技术突破
-   - mildly_bullish(弱利好, 5.5-6.4): 普通经营利好
-   - neutral(中性, 4.5-5.5): 无明显多空的常规播报
-   - mixed(多空交织, 4.5-5.5): 同时含利好利空
-   - mildly_bearish(弱利空, 3.5-4.4): 普通经营利空
-   - bearish(强利空, 0-3.4): 立案/退市/爆雷/违约/重大处罚
+3. impact_band: 6档多空方向（与 score 独立，禁止按 score 区间反推 band）
+   - bullish(强利好): 业绩预增/大额中标/政策扶持/增持回购/技术突破
+   - mildly_bullish(弱利好): 普通经营利好
+   - neutral(中性): 无明显多空的常规播报
+   - mixed(多空交织): 同时含利好利空
+   - mildly_bearish(弱利空): 普通经营利空
+   - bearish(强利空): 立案/退市/爆雷/违约/重大处罚/板块暴跌/制裁升级
+   * 关键：score 衡量"影响强度/重要性"(0-10)，band 衡量"多空方向"，两者相互独立。
+     重大利空事件（如半导体板块跌超10%、美对华芯片制裁升级、龙头爆雷）影响极大，
+     必须给高分(7-9)且 band=bearish，绝不能因"利空"就打低分——重要资讯无论利空利好都应排前。
 4. confidence: high/medium/low
 5. affected_sectors: 必填，涉及板块（半导体/CPO/PCB/算力/新能源/医药/银行/...）
 6. affected_stocks: 明确提及的个股
@@ -407,9 +473,17 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 9. analysis_chain: 5步推理链（箭头连接，简明记录思考过程）
 
 ## 规则
-- band 与 score 必须一致（见上区间），冲突时以 score 为准调整 band
+- band（多空方向）与 score（影响强度）相互独立，禁止用 score 区间反推 band
 - 含明确多空信号的严禁判 neutral/mixed
-- 科技板块资讯以"对科技板块的影响"判定方向
+- 方向判定以科技板块为本位：科技板块跌即 bearish，非科技板块（白酒/消费等）上涨不改变方向
+- **impact_reason 必须基于资讯实际内容**：先识别事件主体（哪个国家/公司/板块），再分析影响。
+  严禁看到关键词就套用常见模板（如看到"301条款/关税"就写"中美贸易摩擦"，看到"制裁"就写"半导体制裁"）。
+  若事件主体不是中国/中美，不得在 impact_reason 中出现"中美"字样。
+- **affected_sectors 必须与资讯内容直接相关**：仅提取资讯正文中明确提及或直接涉及的板块，
+  不得因关键词联想而添加未提及的板块（如资讯讲巴西关税就不应添加"半导体"除非正文明确涉及）。
+- **influence_scope 必须严格按第2步判定**：仅影响个股自身且无板块联动的非龙头股资讯，influence_scope 必须判为 stock（这类资讯不具备市场/板块带动价值，将被沉底或预筛剔除）；不要因某条资讯带"利好"就擅自升为 sector/market
+- 市场级(market)只给真正牵动全球或全市场资金情绪的宏观事件，普通外围个股波动、单一海外公司消息不得判为 market
+- **每条必须回显 idx 字段**，值与输入对应条目的 idx 编号完全一致；切勿省略、切勿自造编号
 - 噪音不输出到 filtered_news，计入 removed_count。噪音定义：
   - 庆典/八卦/软文/公关稿
   - 与A股无直接关联的纯国际资讯（如海外天气、韩国外汇案、非涉华国际事件）
@@ -424,6 +498,7 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 {{
   "filtered_news": [
     {{
+      "idx": 0,
       "title": "原标题",
       "market_impact_score": 8,
       "impact_band": "bullish",
@@ -441,7 +516,7 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 ```
 
 注意:
-- filtered_news 中每条只输出title和分析字段，不要输出content/source/published_at/category
+- filtered_news 中每条只输出idx/title和分析字段，不要输出content/source/published_at/category
 - affected_sectors 必须尽力提取，仅当完全不涉及行业板块时才设为空数组
 - analysis_chain 必须填写，记录5步推理过程
 - analysis_chain尽量简短（一行内完成），impact_reason不超过30字
@@ -450,7 +525,6 @@ ANALYSIS_PROMPT = """你是拥有10年A股投研经验的资深资讯分析师�
 
 def _repair_json(text: str) -> str:
     """尝试修复LLM返回的JSON格式问题"""
-    import re
     # 替换中文引号
     text = text.replace('\u201c', '"').replace('\u201d', '"')
     text = text.replace('\u2018', "'").replace('\u2019', "'")
@@ -528,14 +602,7 @@ def _safe_parse_json(content: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    try:
-        repaired = _repair_json(cleaned)
-        return json.loads(repaired)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试提取 filtered_news 数组
-    import re
+    # 尝试提取 filtered_news 数组（re 已在模块顶部导入）
     match = re.search(r'\{[^{}]*"(?:filtered_news|removed_count)"[^{}]*\}', cleaned, re.DOTALL)
     if match:
         try:
@@ -563,10 +630,10 @@ def _safe_parse_json(content: str) -> dict:
     # 策略：逐字符扫描filtered_news数组，提取所有完整的{}对象
     # 长度上限保护：max_tokens=16384 限制了输出长度，超过 200KB 的文本几乎不可能出现，
     # 加上限防御恶意/异常输入导致逐字符扫描 O(n) 性能问题
+    recovered_items = []
     fn_match = re.search(r'"filtered_news"\s*:\s*\[', cleaned)
     if fn_match and len(cleaned) <= 200_000:
         array_start = fn_match.end()  # 指向 [ 后第一个字符
-        recovered_items = []
         i = array_start
         obj_depth = 0
         obj_start = -1
@@ -602,9 +669,101 @@ def _safe_parse_json(content: str) -> dict:
                                 pass
                         obj_start = -1
             i += 1
-        if recovered_items:
-            logger.info(f"截断JSON修复: 恢复了 {len(recovered_items)} 条完整记录")
-            return {"filtered_news": recovered_items, "removed_count": 0}
+    if recovered_items:
+        logger.info(f"截断JSON修复: 恢复了 {len(recovered_items)} 条完整记录")
+        return {"filtered_news": recovered_items, "removed_count": 0}
+
+    # ranking 结构兜底提取（rerank 输出：{"ranking": [...]}）
+    # 与 filtered_news 同理：非完美 JSON（尾部文本/未转义字符）导致首层 json.loads 失败时，
+    # 逐字符扫描 ranking 数组，恢复所有完整 {} 对象（实跑实证：rerank 返回因非完美 JSON 被静默丢弃，
+    # 导致"LLM 智能重排"从未生效）。
+    rk_match = re.search(r'"ranking"\s*:\s*\[', cleaned)
+    if rk_match and len(cleaned) <= 200_000:
+        array_start = rk_match.end()
+        recovered_ranking = []
+        i = array_start
+        obj_depth = 0
+        obj_start = -1
+        in_str = False
+        escape = False
+        while i < len(cleaned):
+            ch = cleaned[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == '\\':
+                escape = True
+                i += 1
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == '{':
+                    if obj_depth == 0:
+                        obj_start = i
+                    obj_depth += 1
+                elif ch == '}':
+                    obj_depth -= 1
+                    if obj_depth == 0 and obj_start >= 0:
+                        obj_text = cleaned[obj_start:i+1]
+                        try:
+                            recovered_ranking.append(json.loads(obj_text))
+                        except json.JSONDecodeError:
+                            try:
+                                recovered_ranking.append(json.loads(_repair_json(obj_text)))
+                            except json.JSONDecodeError:
+                                pass
+                        obj_start = -1
+            i += 1
+        if recovered_ranking:
+            logger.info(f"截断JSON修复(ranking): 恢复了 {len(recovered_ranking)} 条重排记录")
+            return {"ranking": recovered_ranking, "filtered_news": []}
+
+    # adjustments 结构兜底提取（LLM调分输出：{"adjustments": [...]}）
+    # 与 filtered_news/ranking 同理：非完美 JSON 时逐字符扫描恢复完整 {} 对象
+    adj_match = re.search(r'"adjustments"\s*:\s*\[', cleaned)
+    if adj_match and len(cleaned) <= 200_000:
+        array_start = adj_match.end()
+        recovered_adjustments = []
+        i = array_start
+        obj_depth = 0
+        obj_start = -1
+        in_str = False
+        escape = False
+        while i < len(cleaned):
+            ch = cleaned[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == '\\':
+                escape = True
+                i += 1
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == '{':
+                    if obj_depth == 0:
+                        obj_start = i
+                    obj_depth += 1
+                elif ch == '}':
+                    obj_depth -= 1
+                    if obj_depth == 0 and obj_start >= 0:
+                        obj_text = cleaned[obj_start:i+1]
+                        try:
+                            recovered_adjustments.append(json.loads(obj_text))
+                        except json.JSONDecodeError:
+                            try:
+                                recovered_adjustments.append(json.loads(_repair_json(obj_text)))
+                            except json.JSONDecodeError:
+                                pass
+                        obj_start = -1
+            i += 1
+        if recovered_adjustments:
+            logger.info(f"截断JSON修复(adjustments): 恢复了 {len(recovered_adjustments)} 条调分记录")
+            return {"adjustments": recovered_adjustments, "filtered_news": []}
 
     # 最终降级: 返回空结果而不是抛出异常
     logger.warning(f"JSON解析最终失败，降级返回空结果: {cleaned[:100]}...")
@@ -614,28 +773,8 @@ def _safe_parse_json(content: str) -> dict:
 # ============================================================
 # 冲突护栏（借鉴 DSA score_action_conflicts_without_guardrail）
 # ============================================================
-
-BAND_SCORE_RANGE = {
-    ImpactBand.BULLISH: (6.5, 10.0),
-    ImpactBand.MILDLY_BULLISH: (5.5, 6.499),
-    ImpactBand.NEUTRAL: (4.5, 5.499),
-    ImpactBand.MIXED: (4.5, 5.499),
-    ImpactBand.MILDLY_BEARISH: (3.5, 4.499),
-    ImpactBand.BEARISH: (0.0, 3.499),
-}
-
-
-def _band_from_score(score: float) -> ImpactBand:
-    """按 score 强制分档"""
-    if score >= 6.5:
-        return ImpactBand.BULLISH
-    if score >= 5.5:
-        return ImpactBand.MILDLY_BULLISH
-    if score >= 4.5:
-        return ImpactBand.NEUTRAL
-    if score >= 3.5:
-        return ImpactBand.MILDLY_BEARISH
-    return ImpactBand.BEARISH
+# 注：原 BAND_SCORE_RANGE + _band_from_score 已删除——它们按 score 反推 band，
+# 与"score(影响强度) 和 band(多空方向) 相互独立"的解耦设计直接矛盾，且全链路无调用。
 
 
 def _band_to_direction(band: ImpactBand) -> str:
@@ -650,24 +789,70 @@ def _band_to_direction(band: ImpactBand) -> str:
 
 
 # 利空/利好文本信号词（用于检测 LLM band 与分析文本自相矛盾）
+# 扩充: 熔断/跌至/逊于预期/走低 等词缺失曾导致文本方向误判（实证: 韩股熔断/爱马仕跌至低点）
 _BEARISH_TEXT_SIGNALS = {"利空", "暴跌", "下跌", "亏损", "减持", "处罚", "立案", "退市",
                          "爆雷", "违约", "承压", "下滑", "萎缩", "受挫", "受阻", "负面",
-                         "恶化", "巨亏", "重挫", "闪崩", "崩盘", "跌停", "大亏"}
+                         "恶化", "巨亏", "重挫", "闪崩", "崩盘", "跌停", "大亏",
+                         "熔断", "跌至", "走低", "下挫", "恐慌", "抛售", "逊于预期",
+                         "低于预期", "不及预期", "创新低", "回调", "搁浅", "叫停",
+                         "风险警示", "制裁", "管制", "禁运", "关税"}
 _BULLISH_TEXT_SIGNALS = {"利好", "暴涨", "上涨", "盈利", "增持", "回购", "补贴", "扶持",
-                         "突破", "超预期", "预增", "增长", "提振", "刺激", "宽松", "涨停",
-                         "大涨", "走强", "回暖"}
+                        "突破", "超预期", "预增", "增长", "提振", "刺激", "宽松", "涨停",
+                        "大涨", "走强", "回暖",
+                        "走高", "净流入", "流入", "创新高", "涨超", "扭亏", "中标",
+                        "签约", "扩产", "满产", "订单饱满"}
+
+# 低分方向性 band 强制中性阈值：弱信号（sc<该值）不带动市场情绪，
+# LLM 误标的方向性 band（bullish/bearish）一律中性化，避免低分矛盾标注。
+LOW_SCORE_NEUTRAL_THRESHOLD = 4.0
+
+# 地缘风险/冲突负面信号：事件本身代表 global risk-off，不应被 LLM 误标为 bullish。
+# 实证：#9「美军警告驻中东士兵」sc=8.0 标 bullish，实为地缘风险（risk-off）。
+# 注意：仅用复合短语，避免裸"冲突/军事/战事"误伤普通文本（如"测试冲突业绩预增"）。
+_GEOPOLITICAL_RISK_SIGNALS = {
+    "战争", "导弹", "空袭", "军事行动", "军事打击", "军事警告", "制裁升级",
+    "地缘紧张", "地缘风险", "局势紧张", "局势动荡", "战争阴云", "交火", "武装冲突",
+    "边境冲突", "risk-off", "避险情绪", "军事演习", "军事部署", "战云", "紧张局势",
+    "地缘局势", "冲突升级",
+}
+# 受益涨幅信号：若地缘事件同时描述某资产/板块明确受益（原油/黄金/军工订单等），
+# 则 LLM 标 bullish 有依据，不应翻转。用于降低地缘校正的误翻率。
+_BENEFIT_SIGNALS = {
+    "涨", "利好", "订单", "中标", "突破", "创新高", "大涨", "上涨", "净流入",
+    "扩产", "签约", "受益", "提振", "飙升", "走高", "拉升",
+}
 
 
-def _infer_direction_from_text(reason: str, chain: str) -> str:
-    """从 impact_reason + analysis_chain 文本推断多空方向
+def _has_geopolitical_risk(text: str) -> bool:
+    """检测文本是否描述地缘风险/冲突（global risk-off 事件）
+
+    必须命中风险词且无明确受益涨幅词，避免误翻真正的军工/原油/黄金利好
+    （如「原油大涨因地缘冲突」含「涨」，LLM 标 bullish 合理，不翻转）。
+    """
+    t = str(text)
+    has_risk = any(s in t for s in _GEOPOLITICAL_RISK_SIGNALS)
+    has_benefit = any(s in t for s in _BENEFIT_SIGNALS)
+    return has_risk and not has_benefit
+
+
+def _infer_direction_from_text(reason: str, chain: str = "") -> str:
+    """从 impact_reason（自由文本结论）推断多空方向
 
     用于检测 LLM band 标签与分析文本自相矛盾的情况
     （如 band=bullish 但 reason 写"业绩暴雷利空"）
 
+    关键约束：方向推断**仅基于 impact_reason**，不并入 analysis_chain。
+    analysis_chain 是 LLM 的结构化推理标签（如"弱利空""强利好"），会回显 band
+    方向，并入后会污染判断——实证：寒武纪章程修订 reason="常规章程修订,无实质经营影响"
+    本应判 neutral，但其 chain 含"弱利空"(含"利空")，若并入则误判 bearish 导致
+    中性护栏被跳过、常规公告被错标利空。chain 仅在 reason 为空时兜底。
+
     Returns:
         "bullish" / "bearish" / "neutral"（neutral=无法确定，不纠偏）
     """
-    text = f"{reason} {chain}"
+    text = str(reason)
+    if not text.strip():
+        text = str(chain)  # reason 为空才退用 chain
     bearish_hits = sum(1 for kw in _BEARISH_TEXT_SIGNALS if kw in text)
     bullish_hits = sum(1 for kw in _BULLISH_TEXT_SIGNALS if kw in text)
     if bearish_hits > 0 and bullish_hits == 0:
@@ -675,6 +860,22 @@ def _infer_direction_from_text(reason: str, chain: str) -> str:
     if bullish_hits > 0 and bearish_hits == 0:
         return "bullish"
     return "neutral"
+
+
+# 显式中性标记短语：LLM 在 reason/chain 中明确写明"无明确多空信号/无实质影响"等，
+# 即使 band 被标为方向性（如 mildly_bullish，因"回购"关键词触发 bullish 文本检测），
+# 也应强制判为中性（阿特斯"回购进展公告"实证：reason 写"无明确多空信号"却被标 mildly_bullish）。
+_NEUTRAL_MARKER_PHRASES = [
+    "无明确多空信号", "无实质影响", "无重大影响", "无明显影响", "无实际影响",
+    "无明确方向", "无重大变动", "无重大变化", "影响中性", "常规披露", "例行披露",
+    "常规事项", "无具体影响", "中性看待",
+]
+
+
+def _has_explicit_neutral_marker(text: str) -> bool:
+    """检测 LLM 是否明确声明该资讯无明确多空方向（应强制中性，盖过关键词误触发）"""
+    t = str(text)
+    return any(p in t for p in _NEUTRAL_MARKER_PHRASES)
 
 
 def _apply_guardrails(items: list) -> list:
@@ -692,42 +893,58 @@ def _apply_guardrails(items: list) -> list:
                         "mixed": ImpactBand.MILDLY_BULLISH}
 
     for item in items:
-        if isinstance(item, NewsAnalysisItem):
-            lo, hi = BAND_SCORE_RANGE[item.impact_band]
-            if not (lo <= item.market_impact_score <= hi):
-                item.impact_band = _band_from_score(item.market_impact_score)
-            # 文本方向校验：band 与 reason/chain 文本矛盾时，镜像翻转方向保持强度级别
-            text_dir = _infer_direction_from_text(
-                str(getattr(item, "impact_reason", "")),
-                str(getattr(item, "analysis_chain", "")))
-            if text_dir == "bearish" and item.impact_band.value in _FLIP_TO_BEARISH:
-                item.impact_band = _FLIP_TO_BEARISH[item.impact_band.value]
-            elif text_dir == "bullish" and item.impact_band.value in _FLIP_TO_BULLISH:
-                item.impact_band = _FLIP_TO_BULLISH[item.impact_band.value]
-            item.sentiment = item.impact_band.value
+        # 兼容 dict 和 NewsAnalysisItem (Pydantic BaseModel) 两种输入：
+        # 生产管线传 dict（_normalize_llm_item 返回），单元测试传 NewsAnalysisItem
+        is_model = isinstance(item, NewsAnalysisItem)
+        if is_model:
+            d = item.model_dump()
         elif isinstance(item, dict):
-            band_str = item.get("impact_band", "neutral")
-            try:
-                band = ImpactBand(band_str)
-            except ValueError:
-                band = ImpactBand.NEUTRAL
-            lo, hi = BAND_SCORE_RANGE[band]
-            try:
-                score = float(item.get("market_impact_score", 3.0))
-            except (ValueError, TypeError):
-                score = 3.0
-            if not (lo <= score <= hi):
-                band = _band_from_score(score)
-            # 文本方向校验：band 与 reason/chain 文本矛盾时，镜像翻转方向保持强度级别
-            text_dir = _infer_direction_from_text(
-                str(item.get("impact_reason", "")), str(item.get("analysis_chain", "")))
-            if text_dir == "bearish" and band.value in _FLIP_TO_BEARISH:
-                band = _FLIP_TO_BEARISH[band.value]
-            elif text_dir == "bullish" and band.value in _FLIP_TO_BULLISH:
-                band = _FLIP_TO_BULLISH[band.value]
-            item["impact_band"] = band.value
-            item["sentiment"] = band.value
-            item["impact_direction"] = _band_to_direction(band)
+            d = item
+        else:
+            continue
+        band_str = d.get("impact_band", "neutral")
+        try:
+            band = ImpactBand(band_str)
+        except ValueError:
+            band = ImpactBand.NEUTRAL
+        # 显式中性标记强制中性（阿特斯"回购进展公告"实证：LLM 标 mildly_bullish 但 reason 写"无明确多空信号"）
+        _marker_text = str(d.get("impact_reason", "")) + " " + str(d.get("analysis_chain", ""))
+        if _has_explicit_neutral_marker(_marker_text):
+            band = ImpactBand.NEUTRAL
+            d["impact_band"] = "neutral"
+            d["impact_direction"] = "neutral"
+            d["sentiment"] = "neutral"
+            if is_model:
+                item.impact_band = ImpactBand.NEUTRAL
+                item.sentiment = "neutral"
+            continue  # 跳过下方 score-band 校正，避免 5.5 分被翻回 mildly_bullish
+        try:
+            score = float(d.get("market_impact_score", 3.0))
+        except (ValueError, TypeError):
+            score = 3.0
+        # 文本方向校验：band 与 reason/chain 文本矛盾时，镜像翻转方向保持强度级别
+        text_dir = _infer_direction_from_text(
+            str(d.get("impact_reason", "")), str(d.get("analysis_chain", "")))
+        if text_dir == "bearish" and band.value in _FLIP_TO_BEARISH:
+            band = _FLIP_TO_BEARISH[band.value]
+        elif text_dir == "bullish" and band.value in _FLIP_TO_BULLISH:
+            band = _FLIP_TO_BULLISH[band.value]
+        # 地缘风险校正：含明确地缘风险/冲突信号且 LLM 误标 bullish（无受益涨幅词）→ 翻 bearish
+        _dict_risk_text = str(d.get("title", "")) + " " + str(d.get("impact_reason", ""))
+        if _has_geopolitical_risk(_dict_risk_text) and band.value in _FLIP_TO_BEARISH:
+            band = _FLIP_TO_BEARISH[band.value]
+        # 低分方向性 band 强制中性：弱信号（sc<4）不带动市场情绪，无论 LLM 标 bullish/bearish 一律中性化
+        _has_text = str(d.get("impact_reason", "")) or str(d.get("analysis_chain", ""))
+        if score < LOW_SCORE_NEUTRAL_THRESHOLD \
+                and band not in (ImpactBand.NEUTRAL, ImpactBand.MIXED) \
+                and _has_text:
+            band = ImpactBand.NEUTRAL
+        d["impact_band"] = band.value
+        d["sentiment"] = band.value
+        d["impact_direction"] = _band_to_direction(band)
+        if is_model:
+            item.impact_band = band
+            item.sentiment = band.value
     return items
 
 
@@ -743,7 +960,7 @@ def _build_llm():
     reasoning_models = ("agnes", "o1", "o3", "deepseek-r1", "deepseek-reasoner")
     extra_body = {}
     if any(m in OPENROUTER_MODEL_NAME.lower() for m in reasoning_models):
-        extra_body["reasoning_effort"] = "low"  # 限流接口需快速返回，避免524超时
+        extra_body["reasoning_effort"] = "low"  # 降低推理开销，缩短 Agnes 响应耗时（实测单次 30~65s）
     # OpenRouter 官方要求 HTTP-Referer 和 X-Title 请求头
     default_headers = {}
     if IS_OPENROUTER_OFFICIAL:
@@ -759,7 +976,8 @@ def _build_llm():
         max_tokens=16384,
         extra_body=extra_body,
         default_headers=default_headers,
-        timeout=120,  # 推理模型偶发慢响应，90s不够（日志证实7/26 22:11超时）
+        timeout=90,  # 与方式B一致；方式A不重试(max_retries=0)，超时后快速降级到方式B
+        max_retries=0,  # 禁用 LangChain 内部重试——其 2 次重试 × 120s = 360s 会直接突破 llm_filter 的 300s 总 deadline
     )
 
 
@@ -775,7 +993,7 @@ def _build_analysis_prompt(news_batch: list) -> str:
 
     return ANALYSIS_PROMPT.format(
         n=len(truncated_batch),
-        news_list=json.dumps(truncated_batch, ensure_ascii=False, indent=2)
+        news_list=json.dumps(truncated_batch, ensure_ascii=False, separators=(",", ":"))
     )
 
 
@@ -803,25 +1021,41 @@ def _build_simple_prompt(news_batch: list) -> str:
 {{
   "filtered_news": [
     {{
+      "idx": 0,
       "title": "原标题",
       "market_impact_score": 7,
       "impact_band": "bullish",
       "affected_sectors": ["半导体"],
       "affected_stocks": ["中芯国际"],
-      "impact_reason": "一句话影响逻辑"
+      "impact_reason": "一句话影响逻辑",
+      "influence_scope": "sector"
     }}
   ],
   "removed_count": 0
 }}
 ```
 
-band取值: bullish(强利好,6.5-10) / mildly_bullish(弱利好,5.5-6.4) / neutral(中性,4.5-5.5) / mixed(多空交织,4.5-5.5) / mildly_bearish(弱利空,3.5-4.4) / bearish(强利空,0-3.4)
+band取值（多空方向，与 score 独立，禁止按 score 区间反推）: bullish(强利好) / mildly_bullish(弱利好) / neutral(中性) / mixed(多空交织) / mildly_bearish(弱利空) / bearish(强利空)
+* score=影响强度/重要性(0-10)，band=多空方向，两者独立。重大利空（板块暴跌/制裁升级/爆雷）影响极大应给高分(7-9)且 band=bearish，不可因利空打低分。
+influence_scope取值: market(影响全球/全市场宏观事件) / sector(影响整个板块) / stock(仅影响个股自身)
 
+**每条必须回显 idx 字段**，值与输入编号完全一致。
 只返回JSON，不要代码块包裹。"""
     return simple_prompt.format(
         n=len(truncated_batch),
-        news_list=json.dumps(truncated_batch, ensure_ascii=False, indent=2)
+        news_list=json.dumps(truncated_batch, ensure_ascii=False, separators=(",", ":"))
     )
+
+
+def _clean_analysis_chain(chain: str) -> str:
+    """统一 analysis_chain 格式：去除 LLM 偶发返回的步骤前缀标签
+
+    推送实证：部分批次 LLM 返回 "事件识别:xxx→影响范围:板块级→方向:强利好→..."
+    而非 prompt 要求的简洁箭头链。统一去除前缀让推送格式一致。
+    """
+    if not chain:
+        return chain
+    return re.sub(r'(事件识别|影响范围|方向|强度|置信度|置信|第\d步)[：:]\s*', '', chain).strip()
 
 
 def _normalize_llm_item(raw: dict) -> dict | None:
@@ -838,6 +1072,7 @@ def _normalize_llm_item(raw: dict) -> dict | None:
     # 字段别名映射（LLM 可能输出不同的字段名）
     _field_aliases = {
         "title": ["title", "标题", "news_title"],
+        "idx": ["idx", "编号", "index", "序号", "_idx"],
         "market_impact_score": ["market_impact_score", "score", "impact_score", "评分", "影响力评分"],
         "impact_band": ["impact_band", "band", "档位", "方向", "sentiment_band"],
         "confidence": ["confidence", "置信度", "confidence_level"],
@@ -872,17 +1107,17 @@ def _normalize_llm_item(raw: dict) -> dict | None:
         score = 5.0
     normalized["market_impact_score"] = score
 
-    # impact_band 缺失 → 从 score 推断
+    # impact_band 缺失/非法 → 默认 neutral（score 只表影响强度，推不出多空方向）
     if not normalized.get("impact_band"):
-        normalized["impact_band"] = _band_from_score(score).value
+        normalized["impact_band"] = ImpactBand.NEUTRAL.value
     else:
         # 规范化 band 值
         band_str = str(normalized["impact_band"]).lower().strip()
         try:
             normalized["impact_band"] = ImpactBand(band_str).value
         except ValueError:
-            # 无法识别的 band → 从 score 推断
-            normalized["impact_band"] = _band_from_score(score).value
+            # 无法识别的 band → 中性（不再用 score 反推方向）
+            normalized["impact_band"] = ImpactBand.NEUTRAL.value
 
     # confidence 缺失 → 默认 medium
     if not normalized.get("confidence"):
@@ -909,9 +1144,20 @@ def _normalize_llm_item(raw: dict) -> dict | None:
         if str_field not in normalized or normalized[str_field] is None:
             normalized[str_field] = ""
 
+    # analysis_chain 格式统一：去除 LLM 偶发返回的步骤前缀（推送实证格式不一致）
+    if normalized.get("analysis_chain"):
+        normalized["analysis_chain"] = _clean_analysis_chain(normalized["analysis_chain"])
+
     # sentiment 与 band 对齐
     if not normalized["sentiment"]:
         normalized["sentiment"] = normalized["impact_band"]
+
+    # idx 归整为 int（LLM 可能以字符串形式回显编号）
+    if "idx" in normalized:
+        try:
+            normalized["idx"] = int(normalized["idx"])
+        except (ValueError, TypeError):
+            normalized.pop("idx", None)
 
     return normalized
 
@@ -932,20 +1178,25 @@ def _parse_llm_items(content: str) -> list:
     return items
 
 
-def _llm_analyze_batch_structured(batch: list) -> list:
+def _llm_analyze_batch_structured(batch: list, deadline: float = 0) -> list:
     """结构化输出 + 自由文本降级 + 简化prompt重试
 
     三级调用策略：
       方式A: LangChain ChatOpenAI（timeout=120s）
-      方式B: requests 直调 _call_llm_api（timeout=120s, max_retries=3）
+      方式B: requests 直调 _call_llm_api（timeout=90s, max_retries=2）
       方式C: 简化prompt重试（去掉 analysis_chain 等复杂字段，降低输出复杂度）
 
+    deadline: 总超时熔断时间戳(time.monotonic)，0=不限。
+              每级调用前检查，且 _call_llm_api 内部重试也受 deadline 约束，
+              超时立即抛出，避免单批 A→B→C 最坏 >480s 突破 llm_filter_node 的 300s 总超时。
     全部失败时抛异常（不静默返回原始数据），让 llm_filter_node 的重试机制生效。
     """
     prompt = _build_analysis_prompt(batch)
     system_msg = "你是资深A股资讯分析师。请直接返回纯JSON，不要使用```json代码块包裹，不要在JSON字符串中使用换行符。"
 
     # 方式A：LangChain 直接调用 + _safe_parse_json
+    if deadline and time.monotonic() >= deadline:
+        raise Exception("LLM 总超时熔断，跳过方式A")
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
         llm = _build_llm()
@@ -958,9 +1209,11 @@ def _llm_analyze_batch_structured(batch: list) -> list:
     except Exception as e:
         logger.warning(f"方式A(LLM直接调用)失败: {e}")
 
-    # 方式B：requests 直调 + _safe_parse_json（3次重试，应对瞬时网络/限流问题）
+    # 方式B：requests 直调 + _safe_parse_json（1次重试，应对瞬时网络/限流问题）
+    if deadline and time.monotonic() >= deadline:
+        raise Exception("LLM 总超时熔断，跳过方式B")
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=3)
+        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=1, deadline=deadline)
         items = _parse_llm_items(content)
         if items:
             return _apply_guardrails(items)
@@ -969,10 +1222,12 @@ def _llm_analyze_batch_structured(batch: list) -> list:
         logger.warning(f"方式B(requests直调)失败: {e}")
 
     # 方式C：简化prompt重试（降低输出复杂度，提高JSON合规率）
+    if deadline and time.monotonic() >= deadline:
+        raise Exception("LLM 总超时熔断，跳过方式C")
     try:
         simple_prompt = _build_simple_prompt(batch)
         simple_sys = "你是资深A股资讯分析师。直接返回简洁JSON，不要代码块包裹。"
-        content = _call_llm_api(simple_sys, simple_prompt, timeout=120, max_retries=2)
+        content = _call_llm_api(simple_sys, simple_prompt, timeout=90, max_retries=1, deadline=deadline)
         items = _parse_llm_items(content)
         if items:
             logger.info(f"方式C(简化prompt)成功恢复{len(items)}条")
@@ -990,13 +1245,10 @@ def _llm_analyze_batch_structured(batch: list) -> list:
 # ============================================================
 
 def prefilter_node(state: AgentState) -> dict:
-    """Stage 1 (Python) 预过滤: 关键词去噪 + 去重 + 重要度初筛 -> top 30
+    """Stage 1 (Python) 预过滤: 关键词去噪 + 去重 + 重要度初筛 -> top 20
     
     结果写入 prefiltered_news
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
     raw_news = state.get("raw_news", [])
     prefiltered, py_removed = _python_prefilter(raw_news, top_n=_PREFILTER_TOTAL_LIMIT)
 
@@ -1103,11 +1355,8 @@ def route_after_prefilter(state: AgentState) -> str:
 
 def llm_filter_node(state: AgentState) -> dict:
     """Stage 2 (LLM): 调用 LLM 进行深度去噪和标签化。"""
-    import logging
-    import socket
-    logger = logging.getLogger(__name__)
-
-    prefiltered = state.get("prefiltered_news", [])
+    # 创建浅拷贝，避免直接修改 state 中的 prefiltered_news 字典（LangGraph 节点应返回 partial update）
+    prefiltered = [dict(n) for n in state.get("prefiltered_news", [])]
     if not prefiltered:
         return {
             "filtered_news": [],
@@ -1118,25 +1367,28 @@ def llm_filter_node(state: AgentState) -> dict:
 
     # 并发批量调用 LLM
     all_llm_results = []
-    total_llm_removed = 0
+    total_llm_fallback = 0  # LLM 未分析(截断/判噪)而走规则降级保留的条数
     batch_errors = 0
     error_details = []
 
-    # 限流平台用小批次(8条/批, 21s间隔), 主流平台用大批次(15条/批, 2s间隔)
-    # 减少批次数=减少LLM调用次数=降低总耗时和限流风险
-    _slow_providers = ("qwqtao",)
-    _is_slow = any(p in OPENROUTER_BASE_URL.lower() for p in _slow_providers)
-    BATCH_SIZE = 8 if _is_slow else 15
+    # 当前统一使用 Agnes 端点(agnes-2.5-flash)：串行调用避免触发限流，
+    # 10条/批、批次间隔 2s。早期"中转平台(qwqtao)"模型已过期废弃，不再保留慢速分支。
+    BATCH_SIZE = 10
     batches = [prefiltered[i:i + BATCH_SIZE] for i in range(0, len(prefiltered), BATCH_SIZE)]
 
-    old_socket_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(None)
+    # 给每条预筛条目分配稳定 idx（注入 news 对象，随 prompt 序列化传给 LLM）。
+    # LLM 回显 idx 后按 idx 精确 merge，避免标题被改写/截断/合并导致分析被整体丢弃
+    # （实跑实证：60 输入→LLM 解析 55 条→仅 26 条标题精确匹配，34 条走规则兜底）。
+    for idx, news in enumerate(prefiltered):
+        news["idx"] = idx
+
+    # 注: 不再使用 socket.setdefaulttimeout(None)——LLM 调用均通过 requests/httpx
+    # 显式 timeout 参数控制,全局 setdefaulttimeout 会污染 FastAPI 线程池其他请求。
 
     try:
-        # 串行调用（避免并发触发限流）
-        # _slow_providers / _is_slow 已在 BATCH_SIZE 处定义
-        rate_limit_interval = 21 if _is_slow else 2
-        # 总超时熔断：60条/4批 × (120s+重试) 主流平台理论最坏 480s+，
+        # 串行调用（避免并发触发 Agnes 端点限流）
+        rate_limit_interval = 2
+        # 总超时熔断：40条/4批 × (90s+重试) Agnes 端点理论最坏 360s+，
         # 设 deadline=300s 超时后剩余批次降级为规则分析，避免云端 cron 超杀
         _LLM_TOTAL_DEADLINE = 300
         deadline = time.monotonic() + _LLM_TOTAL_DEADLINE
@@ -1148,7 +1400,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 error_details.append(f"批次{idx}~{len(batches)-1}(总超时降级)")
                 break
             try:
-                results_map[idx] = _llm_analyze_batch_structured(batch)
+                results_map[idx] = _llm_analyze_batch_structured(batch, deadline=deadline)
                 logger.info(f"LLM 批次 {idx} 分析完成")
             except Exception as e:
                 # 首次失败后重试一次（超时/限流等瞬时错误常可通过重试解决）
@@ -1162,7 +1414,7 @@ def llm_filter_node(state: AgentState) -> dict:
                 logger.warning(f"LLM 批次 {idx} 首次失败: {e}, 5s后重试...")
                 time.sleep(5)
                 try:
-                    results_map[idx] = _llm_analyze_batch_structured(batch)
+                    results_map[idx] = _llm_analyze_batch_structured(batch, deadline=deadline)
                     logger.info(f"LLM 批次 {idx} 重试成功")
                 except Exception as e2:
                     results_map[idx] = None
@@ -1171,7 +1423,7 @@ def llm_filter_node(state: AgentState) -> dict:
                     logger.warning(f"LLM 批次 {idx} 重试仍失败: {e2}")
             # 批次间限流间隔（最后一批不需要等）
             if idx < len(batches) - 1 and rate_limit_interval > 0:
-                logger.info(f"限流等待 {rate_limit_interval}s（中转平台: 1分钟最多3次请求）...")
+                logger.info(f"限流等待 {rate_limit_interval}s（Agnes 端点批次间保护间隔，避免长时间空跑被网关掐断）...")
                 time.sleep(rate_limit_interval)
 
         # 合并 LLM 结果（兼容 NewsAnalysisItem 对象与 dict）
@@ -1208,7 +1460,7 @@ def llm_filter_node(state: AgentState) -> dict:
                     else:
                         n["impact_band"] = "neutral"
                     n["confidence"] = "low"
-                    n["influence_scope"] = "stock"
+                    n["influence_scope"] = ""  # 空值让 rank_news 的 _infer_influence_scope 推断，避免误沉底
                     n["analysis_chain"] = ""
                     all_llm_results.append(n)
 
@@ -1216,8 +1468,6 @@ def llm_filter_node(state: AgentState) -> dict:
         logger.error(f"[llm_filter] LLM 并发流异常: {e}", exc_info=True)
         # 全部降级
         all_llm_results = prefiltered
-    finally:
-        socket.setdefaulttimeout(old_socket_timeout)
 
     # 3. 结果合并: 使用 LLM 结果中的 impact 字段更新原始 news 对象, 保留原始所有的属性(解决丢失问题)
     final_filtered = []
@@ -1228,12 +1478,30 @@ def llm_filter_node(state: AgentState) -> dict:
         llm_results_by_key[key] = n
     # 同时保留 title-only 索引作为兜底（LLM 可能截断 published_at）
     llm_results_by_title = {n.get("title", "").strip(): n for n in all_llm_results}
+    # 按 idx 精确索引（LLM 回显的编号）——merge 主匹配键，彻底解决标题改写导致的不匹配
+    llm_results_by_idx = {}
+    for n in all_llm_results:
+        _iv = n.get("idx")
+        if _iv is not None:
+            try:
+                llm_results_by_idx[int(_iv)] = n
+            except (ValueError, TypeError):
+                pass
 
     for news in prefiltered:
         title = news.get("title", "").strip()
         pub = str(news.get("published_at", ""))
-        # 优先复合 key 匹配，其次 title 匹配
-        llm_res = llm_results_by_key.get((title, pub)) or llm_results_by_title.get(title)
+        # 匹配优先级：idx（LLM 回显编号）> 复合 key > title 兜底
+        # 只要 LLM 按要求回显 idx，即可 100% 命中，57% 分析被丢弃的问题不再发生
+        llm_res = None
+        _my_idx = news.get("idx")
+        if _my_idx is not None:
+            try:
+                llm_res = llm_results_by_idx.get(int(_my_idx))
+            except (ValueError, TypeError):
+                llm_res = None
+        if llm_res is None:
+            llm_res = llm_results_by_key.get((title, pub)) or llm_results_by_title.get(title)
         if llm_res:
             # LLM 没有认为是噪音，合并字段
 
@@ -1288,17 +1556,16 @@ def llm_filter_node(state: AgentState) -> dict:
                 else:
                     news["impact_band"] = "neutral"
                 news["confidence"] = "low"
-                news["influence_scope"] = "stock"
+                news["influence_scope"] = ""  # 空值让 rank_news 推断，避免宏观资讯误沉底
                 news["analysis_chain"] = ""
             else:
                 # 2. 正常 LLM 输出: 尊重 LLM 方向, 但对中性结论做精细纠偏
-                #    仅当 LLM=neutral 且规则发现明确强正向/强负向组合时才纠偏
-                #    (使用改进后的规则: 强正向组合优先, 不会利空优先误判)
+                #    LLM 推理链为标题方向的最终权威，规则仅加分不改方向
                 if direction == "neutral":
                     rule_dir = predict_direction_by_rules(news.get("title", ""), news.get("content", ""))
                     if rule_dir != "neutral":
-                        direction = rule_dir
-                        # 适度提升分数(+1), 不再无脑抬到5.0
+                        # 规则检测到信号：仅提升排名分数，不覆写 LLM 判定的方向
+                        # 标题标签(利好/利空)以 LLM 推理链为准，最终一致性校验统一对齐
                         orig_score = llm_res.get("market_impact_score", 3.0)
                         try:
                             orig_score = float(orig_score)
@@ -1306,7 +1573,7 @@ def llm_filter_node(state: AgentState) -> dict:
                             orig_score = 3.0
                         news["market_impact_score"] = min(orig_score + 1.0, 10.0)
                         llm_reason = llm_res.get("impact_reason", "")
-                        news["impact_reason"] = (llm_reason + " | 规则纠偏: 检测到明确多空信号").strip(" |")
+                        news["impact_reason"] = (llm_reason + " | 规则补充: 检测到多空信号词").strip(" |")
                     else:
                         news["market_impact_score"] = llm_res.get("market_impact_score", 3.0)
                         news["impact_reason"] = llm_res.get("impact_reason", "")
@@ -1328,28 +1595,122 @@ def llm_filter_node(state: AgentState) -> dict:
                 band_val = llm_res.get("impact_band", "neutral")
                 conf_val = llm_res.get("confidence", "medium")
                 news["impact_band"] = band_val.value if hasattr(band_val, "value") else str(band_val)
-                # 规则纠偏后 band 与 direction 同步：direction 被 rules 改为 bullish/bearish 时，
-                # band 也必须同步，否则推送标题显示"强利好"但方向箭头朝下
-                if direction == "bullish" and "bullish" not in str(news["impact_band"]):
-                    news["impact_band"] = "mildly_bullish"
-                elif direction == "bearish" and "bearish" not in str(news["impact_band"]):
-                    news["impact_band"] = "mildly_bearish"
+                # band-direction 同步交由最终一致性校验统一处理，此处不再二次纠偏
+                # （原中间纠偏与 guardrails + final check 三重执行，阈值不同导致 flip-flop）
                 news["confidence"] = conf_val.value if hasattr(conf_val, "value") else str(conf_val)
-                news["influence_scope"] = llm_res.get("influence_scope", "stock")
+                news["influence_scope"] = llm_res.get("influence_scope", "")  # 空值让 rank_news 推断
                 news["analysis_chain"] = llm_res.get("analysis_chain", "")
 
             final_filtered.append(news)
         else:
-            # LLM 在分析中判定为噪音并排除了该条目
-            total_llm_removed += 1
+            # 该条目在 LLM 结果中找不到匹配——可能是 LLM 判定为噪音排除，
+            # 也可能是输出被 max_tokens 截断导致丢失（日志证实常态发生）。
+            # 统一按"未分析"走规则降级保留，避免截断丢失被误计为噪音静默丢弃。
+            direction = predict_direction_by_rules(news.get("title", ""), news.get("content", ""))
+            news["market_impact_score"] = 5.0 if direction != "neutral" else 3.0
+            news["impact_direction"] = direction
+            news["affected_sectors"] = infer_sectors_by_rules(
+                news.get("title", ""), news.get("content", ""), news.get("name", ""))
+            news["affected_stocks"] = news.get("affected_stocks", [])
+            news["impact_reason"] = "LLM未返回分析结果，基于规则系统自动分析"
+            news["sentiment"] = direction
+            if direction == "bullish":
+                news["impact_band"] = "mildly_bullish"
+            elif direction == "bearish":
+                news["impact_band"] = "mildly_bearish"
+            else:
+                news["impact_band"] = "neutral"
+            news["confidence"] = "low"
+            news["influence_scope"] = ""  # 空值让 rank_news 推断，避免宏观资讯误沉底
+            news["analysis_chain"] = ""
+            final_filtered.append(news)
+            total_llm_fallback += 1  # LLM 未分析，已按规则降级保留
 
-    # 4. 生成返回状态
+    # 4. 最终一致性校验：band 方向 vs reason/chain 文本方向
+    #    合并过程中多次修改 band/direction/reason，可能产生最终不一致
+    #    （如 band=bullish 但 reason 写"利空"），此处做最后一道校正
+    _FLIP_TO_BEARISH_FINAL = {"bullish": "bearish", "mildly_bullish": "mildly_bearish", "mixed": "mildly_bearish"}
+    _FLIP_TO_BULLISH_FINAL = {"bearish": "bullish", "mildly_bearish": "mildly_bullish", "mixed": "mildly_bullish"}
+    consistency_fixes = 0
+    for news in final_filtered:
+        # 信号情报方向由交易所官方数据锁定，不做文本方向翻转
+        if news.get("category") == "signal":
+            continue
+        band = str(news.get("impact_band", "neutral"))
+        reason = str(news.get("impact_reason", ""))
+        chain = str(news.get("analysis_chain", ""))
+        # 显式中性标记强制中性（最终安全网）：LLM 写明"无明确多空信号/无实质影响"等，
+        # 即使 band 标了方向性也必须判中性，盖过"回购"等关键词误触发的 bullish 检测
+        if _has_explicit_neutral_marker(reason + " " + chain):
+            if band != "neutral":
+                news["impact_band"] = "neutral"
+                news["impact_direction"] = "neutral"
+                news["sentiment"] = "neutral"
+                consistency_fixes += 1
+            continue
+        text_dir = _infer_direction_from_text(reason, chain)
+        if text_dir == "bearish" and band in _FLIP_TO_BEARISH_FINAL:
+            news["impact_band"] = _FLIP_TO_BEARISH_FINAL[band]
+            news["impact_direction"] = "bearish"
+            news["sentiment"] = news["impact_band"]
+            consistency_fixes += 1
+        elif text_dir == "bullish" and band in _FLIP_TO_BULLISH_FINAL:
+            news["impact_band"] = _FLIP_TO_BULLISH_FINAL[band]
+            news["impact_direction"] = "bullish"
+            news["sentiment"] = news["impact_band"]
+            consistency_fixes += 1
+        # 中性文本 + 低分不应标方向性 band（推送实证：常规公告被标"强利空"）
+        try:
+            _score = float(news.get("market_impact_score", 3.0))
+        except (ValueError, TypeError):
+            _score = 3.0
+        # 读取最新 band（经上方 text_dir 翻转后可能已变更）
+        _cur_band = news.get("impact_band", "neutral")
+        # 低分方向性 band 强制中性：弱信号（sc<4）不带动市场情绪，无论 LLM 标 bullish/bearish 一律中性化
+        if _score < LOW_SCORE_NEUTRAL_THRESHOLD \
+                and _cur_band not in ("neutral", "mixed") \
+                and (reason or chain):
+            news["impact_band"] = "neutral"
+            news["impact_direction"] = "neutral"
+            news["sentiment"] = "neutral"
+            consistency_fixes += 1
+            _cur_band = "neutral"
+        # 地缘风险校正：含明确地缘风险/冲突信号且 LLM 误标 bullish（无受益涨幅词）→ 翻 bearish。
+        # 必须在低分中性之后（低分已中性化的弱风险不再翻，高 sc 地缘风险仍纠正）。
+        _final_risk_text = str(news.get("title", "")) + " " + reason
+        if _has_geopolitical_risk(_final_risk_text) and _cur_band in ("bullish", "mildly_bullish"):
+            news["impact_band"] = "bearish" if _cur_band == "bullish" else "mildly_bearish"
+            news["impact_direction"] = "bearish"
+            news["sentiment"] = news["impact_band"]
+            consistency_fixes += 1
+            _cur_band = news["impact_band"]
+        # band-direction 最终同步：确保 impact_direction 与 impact_band 方向一致
+        # （替代已移除的中间纠偏 pass2，统一在此处一次性处理，避免 flip-flop）
+        _final_dir = str(news.get("impact_direction", "neutral"))
+        if _final_dir == "bullish" and "bullish" not in _cur_band and _cur_band not in ("neutral", "mixed"):
+            news["impact_band"] = "mildly_bullish"
+            news["sentiment"] = "mildly_bullish"
+            consistency_fixes += 1
+        elif _final_dir == "bearish" and "bearish" not in _cur_band and _cur_band not in ("neutral", "mixed"):
+            news["impact_band"] = "mildly_bearish"
+            news["sentiment"] = "mildly_bearish"
+            consistency_fixes += 1
+    if consistency_fixes:
+        logger.info(f"[llm_filter] 最终一致性校验: 修正{consistency_fixes}条 band↔文本方向冲突")
+
+    # 5. 生成返回状态
     msg = (
         f"[llm_filter] 完成：深度分析{len(prefiltered)}条，"
-        f"保留{len(final_filtered)}条，过滤噪音{total_llm_removed}条。"
+        f"保留{len(final_filtered)}条"
+        + (f"，其中{total_llm_fallback}条LLM未分析走规则降级" if total_llm_fallback else "")
+        + "。"
     )
     if batch_errors:
         msg += f" | {batch_errors}批降级 | 错误: {'; '.join(error_details[:2])}"
+
+    # 清理临时匹配键 idx，避免泄漏到下游/推送/前端
+    for n in final_filtered:
+        n.pop("idx", None)
 
     return {
         "filtered_news": final_filtered,
@@ -1361,41 +1722,47 @@ def llm_filter_node(state: AgentState) -> dict:
 # 节点3: rank_news - Python评分排名 + LLM智能重排
 # ============================================================
 
-RANK_PROMPT = """你是资深A股投研总监。以下资讯已经过初步筛选和评分，请综合判断后给出最终排序。
+SCORE_ADJUST_PROMPT = """你是资深A股投研总监。以下资讯已经过初步筛选和评分，请对每条资讯的重要性分数进行调整。
 
 ## 资讯列表（共{n}条，按初步评分排序）
 {news_list}
 
-## 重排原则
-1. 市场影响力大的优先（央行政策 > 板块龙头事件 > 个股常规公告）
-2. 时效性强的优先（当日突发 > 前日资讯）
-3. 信息确定性高的优先（官方公告 > 市场传闻）
-4. 利好利空均可排前，关键是影响程度
-5. 噪音类（庆典/外交寒暄/无关国际事件）排到最后
+## 调整原则
+你只需调整每条资讯的 adjusted_score（影响分，0-10），**不要直接排序**。
+最终排序由系统根据调整后的综合分自动计算。调整时请考虑：
+1. 对A股科技板块的实质影响程度：能带动市场/板块情绪的重大资讯应高分
+2. 影响范围：市场级(美联储/地缘/央行全面政策) > 板块级(行业政策/龙头带动) > 个股级
+3. 信号强度与时效性：重大突发(当日)优先于常规资讯(前日)
+4. 信息确定性：官方公告/多源报道 > 市场传闻/单一来源
+5. 利好利空均可高分，关键是影响程度；纯噪音应低分
 
 ## 输出格式
 只返回JSON，不要代码块包裹:
 ```json
 {{
-  "ranking": [
-    {{"title": "原标题", "final_rank": 1, "reason": "一句话排序理由"}}
+  "adjustments": [
+    {{"title": "原标题", "adjusted_score": 8.5}}
   ]
 }}
 ```
 
-注意: final_rank 从1开始，1最重要。只返回 ranking 数组中的条目，数量与输入一致。
+注意: adjusted_score 范围 0-10，参考 init_score 上下调整。数量与输入一致。
 """
 
 
-def _llm_rerank(ranked_news: list, top_n: int = 20) -> list:
-    """用 LLM 对 top N 资讯进行智能重排序
+def _llm_adjust_scores(ranked_news: list, top_n: int = 20, deadline: float = 0) -> list:
+    """LLM 调整 market_impact_score，仅在同 scope 同 band 内重排
+
+    LLM 仅调整影响分权重（market_impact_score），不跨 scope/band 重排。
+    调整后重新计算 total_score，在同一 (scope, band) 组内按 total_score 降序重排，
+    组间保持 Python 原始排序顺序（scope > band 主序不被破坏）。
 
     Args:
         ranked_news: Python 初步排名结果
-        top_n: 取前 N 条让 LLM 重排
+        top_n: 取前 N 条让 LLM 调整评分
 
     Returns:
-        重排后的列表（若 LLM 失败则返回原始排名）
+        调整评分后的重排列表（若 LLM 失败则返回原始排名）
     """
     if len(ranked_news) <= 3:
         return ranked_news
@@ -1403,14 +1770,14 @@ def _llm_rerank(ranked_news: list, top_n: int = 20) -> list:
     candidates = ranked_news[:top_n]
     tail = ranked_news[top_n:]
 
-    # 构建精简资讯列表（只保留排序所需字段）
+    # 构建精简资讯列表（只保留评分调整所需字段）
     slim_list = []
     for i, n in enumerate(candidates, 1):
         slim_list.append({
             "init_rank": i,
             "title": n.get("title", ""),
             "impact_band": n.get("impact_band", ""),
-            "market_impact_score": n.get("market_impact_score", 0),
+            "init_score": n.get("market_impact_score", 0),
             "influence_scope": n.get("influence_scope", ""),
             "impact_direction": n.get("impact_direction", ""),
             "confidence": n.get("confidence", ""),
@@ -1418,39 +1785,71 @@ def _llm_rerank(ranked_news: list, top_n: int = 20) -> list:
             "impact_reason": n.get("impact_reason", ""),
         })
 
-    prompt = RANK_PROMPT.format(
+    prompt = SCORE_ADJUST_PROMPT.format(
         n=len(slim_list),
-        news_list=json.dumps(slim_list, ensure_ascii=False, indent=2)
+        news_list=json.dumps(slim_list, ensure_ascii=False, separators=(",", ":"))
     )
     system_msg = "你是资深A股投研总监。请直接返回纯JSON，不要使用代码块包裹。"
 
     try:
-        content = _call_llm_api(system_msg, prompt, timeout=120, max_retries=1)
+        content = _call_llm_api(system_msg, prompt, timeout=90, max_retries=1, deadline=deadline)
         parsed = _safe_parse_json(content)
-        ranking = parsed.get("ranking", [])
-        if not ranking:
-            logger.warning("[llm_rerank] LLM返回空排序，使用原始排名")
+        adjustments = parsed.get("adjustments", [])
+        if not adjustments:
+            logger.warning("[llm_adjust] LLM返回空调整，使用原始排名")
             return ranked_news
 
-        # 构建 title -> final_rank 映射
-        title_to_rank = {}
-        for item in ranking:
+        # 构建 title -> adjusted_score 映射
+        title_to_score = {}
+        for item in adjustments:
             title = item.get("title", "").strip()
-            rank = item.get("final_rank", 0)
-            if title and rank:
-                title_to_rank[title] = int(rank)
+            score = item.get("adjusted_score", 0)
+            if title and score is not None:
+                try:
+                    title_to_score[title] = max(0.0, min(10.0, float(score)))
+                except (ValueError, TypeError):
+                    pass
 
-        # 按 LLM 给的 final_rank 重排 candidates
-        def get_rank(n):
-            return title_to_rank.get(n.get("title", "").strip(), 999)
+        # 更新 market_impact_score
+        adjusted_count = 0
+        for n in candidates:
+            t = n.get("title", "").strip()
+            if t in title_to_score:
+                n["market_impact_score"] = title_to_score[t]
+                adjusted_count += 1
+        logger.info(f"[llm_adjust] LLM调整{adjusted_count}/{len(candidates)}条评分")
 
-        reranked_candidates = sorted(candidates, key=get_rank)
-        logger.info(f"[llm_rerank] LLM重排完成: {len(title_to_rank)}/{len(candidates)}条匹配")
+        # 重新计算 total_score（复用 _calc_continuous_score + confidence 加权）
+        from src.tools.data_fetchers import get_hs300_constituents
+        from src.tools.calculators import (
+            _calc_continuous_score, CONFIDENCE_WEIGHT, BAND_PRIORITY, SCOPE_SCORE_BOOST,
+        )
+        hs300 = get_hs300_constituents()
 
-        # 合并: 重排的 top + 未参与重排的 tail
+        for n in candidates:
+            total = _calc_continuous_score(n, hs300)
+            conf = n.get("confidence", "medium")
+            total = round(total * CONFIDENCE_WEIGHT.get(conf, 0.85), 4)
+            n["total_score"] = total
+
+        # 按 (band, scope) 分组，组内按 total_score 重排，组间保持 Python 原始顺序
+        # LLM 只能在同 band 同 scope 内微调，不跨档重排
+        from itertools import groupby
+        reranked_candidates = []
+        # groupby 要求序列已按分组键排序——ranked_news 来自 rank_news，已按 band/score 排序
+        for (band, scope), group in groupby(candidates, key=lambda x: (
+                x.get("impact_band", ""),
+                x.get("influence_scope", ""))):
+            group_list = list(group)
+            group_list.sort(
+                key=lambda x: (x.get("total_score", 0), x.get("time_factor", 1.0)),
+                reverse=True
+            )
+            reranked_candidates.extend(group_list)
+
         return reranked_candidates + tail
     except Exception as e:
-        logger.warning(f"[llm_rerank] LLM重排失败，使用原始排名: {e}")
+        logger.warning(f"[llm_adjust] LLM调整失败，使用原始排名: {e}")
         return ranked_news
 
 
@@ -1463,14 +1862,19 @@ def rank_news_node(state: AgentState) -> dict:
     # Stage 1: Python 初步排名
     ranked = rank_news(filtered_news)
 
-    # Stage 2: LLM 智能重排 top 20
+    # Stage 2: LLM 调整影响分权重，再按综合分重排（LLM 不直接排序，仅调整 market_impact_score）
     if ranked:
-        ranked = _llm_rerank(ranked, top_n=20)
+        ranked = _llm_adjust_scores(ranked, top_n=20, deadline=time.monotonic() + 120)
+
+    # Stage 3: 展示层统一去重（同事件去重 + 同股公告限额）
+    # 与微信推送共用 dedup_and_cap_for_display，保证 Web UI 与推送两端一致，
+    # 避免"推送已去重但 UI 仍有重复"（寒武纪单日 9 条公告实证）
+    ranked = dedup_and_cap_for_display(ranked)
 
     top_score = ranked[0]["total_score"] if ranked else 0
 
     # 如果最终结果为空，提供明确的用户反馈
-    msg_parts = [f"[rank_news] 排名完成: 共{len(ranked)}条, 最高分: {top_score:.4f} (Python排名+LLM重排)"]
+    msg_parts = [f"[rank_news] 排名完成: 共{len(ranked)}条, 最高分: {top_score:.4f} (Python排名+LLM调分)"]
     if not ranked:
         raw_count = len(state.get("raw_news", []))
         pre_count = len(state.get("prefiltered_news", []))

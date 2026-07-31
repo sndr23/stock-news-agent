@@ -92,3 +92,237 @@ class TestDedup3Layer:
         ]
         result = dedup_news_3layer(news)
         assert len(result) == 2
+
+
+# ============================================================
+# 推送前"同股+同事件"语义去重 (push.dedup_ranked_by_event)
+# ============================================================
+
+from src.tools.push import dedup_ranked_by_event, _event_signature
+
+
+def _mk(title, stocks=None, content="", name=""):
+    return {"title": title, "content": content,
+            "affected_stocks": stocks or [], "name": name}
+
+
+class TestEventSignature:
+    def test_stock_from_affected_stocks(self):
+        stocks, events, numbers = _event_signature(_mk("寒武纪股权激励", stocks=["寒武纪"]))
+        assert "寒武纪" in stocks
+        assert "激励" in events
+
+    def test_stock_from_name_field(self):
+        stocks, _, _ = _event_signature(_mk("公告标题", name="中际旭创"))
+        assert "中际旭创" in stocks
+
+    def test_no_event_keywords(self):
+        _, events, _ = _event_signature(_mk("某公司召开股东大会"))
+        assert events == set()
+
+    def test_group_matching_variants(self):
+        # "限制性股票" 与 "股权激励" 同组
+        _, e1, _ = _event_signature(_mk("寒武纪股权激励大消息"))
+        _, e2, _ = _event_signature(_mk("寒武纪:2026年限制性股票激励计划(草案)"))
+        assert e1 == e2 == {"激励"}
+
+
+class TestDedupRankedByEvent:
+    def test_same_stock_same_event_dedup(self):
+        """推送实证: 寒武纪股权激励新闻+草案公告+考核办法 3 条 → 保留第 1 条"""
+        news = [
+            _mk("寒武纪股权激励大消息!业绩考核目标2026-2028累计营收不低于1000亿", stocks=["寒武纪"]),
+            _mk("寒武纪:2026年限制性股票激励计划(草案)摘要公告", stocks=["寒武纪"]),
+            _mk("寒武纪:2026年限制性股票激励计划实施考核管理办法", stocks=["寒武纪"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 1
+        assert "大消息" in result[0]["title"]
+
+    def test_same_stock_different_event_kept(self):
+        """同股不同事件(回购 vs 业绩) 不去重"""
+        news = [
+            _mk("中际旭创:董事长提议回购公司股份公告", stocks=["中际旭创"]),
+            _mk("中际旭创业绩预告净利润预增", stocks=["中际旭创"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_no_stock_not_deduped(self):
+        """无个股信息的条目不参与去重"""
+        news = [
+            _mk("半导体板块股权激励潮起"),
+            _mk("半导体公司股权激励密集落地"),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_no_event_not_deduped(self):
+        """同股但无事件关键词(章程/决议) 不去重"""
+        news = [
+            _mk("寒武纪:公司章程", stocks=["寒武纪"]),
+            _mk("寒武纪:董事会决议公告", stocks=["寒武纪"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_different_stocks_same_event_kept(self):
+        """不同个股同一事件类型 不去重"""
+        news = [
+            _mk("寒武纪股权激励计划", stocks=["寒武纪"]),
+            _mk("中际旭创股权激励计划", stocks=["中际旭创"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_empty_and_order_preserved(self):
+        assert dedup_ranked_by_event([]) == []
+        news = [
+            _mk("A公司回购股份", stocks=["A公司"]),
+            _mk("B公司回购股份", stocks=["B公司"]),
+            _mk("A公司回购进展公告", stocks=["A公司"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert [n["title"] for n in result] == ["A公司回购股份", "B公司回购股份"]
+
+
+class TestDedupMarketDrop:
+    """行情下跌类去重：同板块/同个股的"盘前走低"近重复应合并（实证：存储芯片走低5条→1条）"""
+
+    def test_same_stock_market_drop_dedup(self):
+        news = [
+            _mk("美股存储芯片板块盘前走低 SK海力士跌超4%", stocks=["SK海力士", "美光科技"]),
+            _mk("美股存储芯片板块盘前走低", stocks=["SK海力士", "美光科技"]),
+            _mk("财联社电，美股存储芯片板块盘前走低，SK海力士跌4.4%", stocks=["SK海力士", "美光科技"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 1
+
+    def test_different_stock_drop_kept(self):
+        """不同个股的下跌新闻不去重"""
+        news = [
+            _mk("美光科技盘前走低跌3%", stocks=["美光科技"]),
+            _mk("寒武纪盘前走低跌2%", stocks=["寒武纪"]),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+
+class TestDedupCoreNumber:
+    """P1 修复: 同股 + 同核心金额(亿/万量级) → 不同措辞的近重复也应去重
+
+    实证: 行云科技"算力服务补充协议 30.53 亿"以 3 条不同标题并存，旧逻辑因措辞差异未合并。
+    """
+
+    def test_same_stock_same_amount_dedup(self):
+        news = [
+            _mk("行云科技:关于签订算力服务补充协议的公告", stocks=["行云科技"],
+                content="合同金额30.53亿元"),
+            _mk("行云科技签订30.53亿算力服务补充协议", stocks=["行云科技"], content=""),
+            _mk("行云科技:算力服务补充协议(二)", stocks=["行云科技"],
+                content="交易总额30.53亿"),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 1
+
+    def test_different_amount_kept(self):
+        """同股但金额不同 → 视为不同事件，保留"""
+        news = [
+            _mk("某公司中标5亿元大单", stocks=["某公司"], content=""),
+            _mk("某公司再签8亿元订单", stocks=["某公司"], content=""),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_amount_unit_mismatch_not_merged(self):
+        """同数值不同量词(亿 vs 万) 不互相碰撞"""
+        news = [
+            _mk("某公司签30亿大单", stocks=["某公司"], content=""),
+            _mk("某公司回购30万股", stocks=["某公司"], content=""),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+    def test_price_or_percent_not_captured(self):
+        """股价/百分比不含 亿/万 量词 → 不触发金额去重（避免误并）"""
+        news = [
+            _mk("某公司股价涨30%", stocks=["某公司"], content=""),
+            _mk("某公司股价30元创新高", stocks=["某公司"], content=""),
+        ]
+        result = dedup_ranked_by_event(news)
+        assert len(result) == 2
+
+
+# ============================================================
+# 同股公告限额 (calculators.cap_announcements_per_stock)
+# ============================================================
+
+from src.tools.calculators import cap_announcements_per_stock, dedup_and_cap_for_display
+
+
+def _ann(title, stocks=None, name=None, score=0.5):
+    return {"title": title, "category": "announcement",
+            "affected_stocks": stocks or [], "name": name, "total_score": score}
+
+
+class TestCapAnnouncementsPerStock:
+    def test_same_stock_capped(self):
+        """寒武纪 3 条常规公告 → 保留按排序前 2 条"""
+        news = [
+            _ann("寒武纪:股权激励草案", stocks=["寒武纪"], score=0.85),
+            _ann("寒武纪:董事会决议", stocks=["寒武纪"], score=0.30),
+            _ann("寒武纪:公司章程", stocks=["寒武纪"], score=0.17),
+        ]
+        out = cap_announcements_per_stock(news, max_per_stock=2)
+        assert len(out) == 2
+
+    def test_title_prefix_extracts_stock(self):
+        """无 affected_stocks 但标题带 '股票名：' 前缀 → 仍可限额"""
+        news = [
+            _ann("寒武纪:法律意见书", name=None, stocks=[], score=0.17),
+            _ann("寒武纪:股东会通知", name=None, stocks=[], score=0.17),
+            _ann("寒武纪:董事会决议", name=None, stocks=[], score=0.17),
+        ]
+        out = cap_announcements_per_stock(news, max_per_stock=2)
+        assert len(out) == 2
+
+    def test_different_stocks_not_capped_together(self):
+        news = [
+            _ann("A公司:董事会决议", stocks=["A公司"], score=0.3),
+            _ann("A公司:公司章程", stocks=["A公司"], score=0.17),
+            _ann("B公司:董事会决议", stocks=["B公司"], score=0.3),
+            _ann("B公司:公司章程", stocks=["B公司"], score=0.17),
+        ]
+        out = cap_announcements_per_stock(news, max_per_stock=2)
+        assert len(out) == 4  # 各自限额内
+
+    def test_news_category_not_capped(self):
+        news = [_ann("某新闻涨停", stocks=["寒武纪"], score=0.9)]
+        news[0]["category"] = "news"
+        out = cap_announcements_per_stock(news, max_per_stock=2)
+        assert len(out) == 1
+
+    def test_zero_cap_disabled(self):
+        news = [_ann("寒武纪:董事会决议", stocks=["寒武纪"]),
+                _ann("寒武纪:公司章程", stocks=["寒武纪"])]
+        out = cap_announcements_per_stock(news, max_per_stock=0)
+        assert len(out) == 2
+
+
+class TestDedupAndCapForDisplay:
+    def test_hanwujicombined(self):
+        """端到端: 寒武纪 5 股权激励同事件 + 4 常规 → 事件去重(5→1) + 限额(→2)"""
+        news = [
+            _ann("寒武纪:限制性股票激励计划(草案)摘要", stocks=["寒武纪"], score=0.855),
+            _ann("寒武纪:限制性股票激励计划实施考核办法", stocks=["寒武纪"], score=0.601),
+            _ann("寒武纪:限制性股票激励计划激励对象名单", stocks=["寒武纪"], score=0.601),
+            _ann("寒武纪:法律意见书", stocks=[], name=None, score=0.177),
+            _ann("寒武纪:公司章程", stocks=[], name=None, score=0.177),
+            _ann("寒武纪:股东会通知", stocks=[], name=None, score=0.177),
+            _ann("寒武纪:董事会决议", stocks=[], name=None, score=0.177),
+            _ann("寒武纪:核查意见", stocks=[], name=None, score=0.177),
+            _ann("寒武纪:变更注册资本公告", stocks=["寒武纪"], score=0.316),
+        ]
+        out = dedup_and_cap_for_display(news)
+        assert len(out) == 2
+        assert "草案" in out[0]["title"]

@@ -9,8 +9,13 @@ from src.schemas import ImpactBand, Confidence, NewsAnalysisItem
 
 @pytest.fixture(autouse=True)
 def mock_hs300():
-    """mock get_hs300_constituents 避免测试中发起网络请求"""
-    with patch("src.agent.nodes.get_hs300_constituents", return_value={"codes": set(), "names": set()}):
+    """mock get_hs300_constituents 避免测试中发起网络请求
+
+    需同时 mock 两处: _python_prefilter 经 src.agent.nodes 引用,
+    rank_news 在函数内从 src.tools.data_fetchers 延迟导入。
+    """
+    with patch("src.agent.nodes.get_hs300_constituents", return_value={"codes": set(), "names": set()}), \
+         patch("src.tools.data_fetchers.get_hs300_constituents", return_value={"codes": set(), "names": set()}):
         yield
 
 
@@ -60,25 +65,26 @@ def test_e2e_mock_pipeline():
         assert "band_priority" in item
 
 
-def test_e2e_conflict_guardrail_in_pipeline():
-    """端到端：LLM 返回冲突 band/score → 护栏校正 → 排名正确"""
+def test_e2e_high_score_bearish_preserved_in_pipeline():
+    """端到端：重大利空(高分+bearish)保持方向，不再被 score 翻转为 bullish（解耦修复）"""
     # 标题含事件词"业绩预增"，避免被预筛零分过滤（sector 类零分丢弃）
     raw = [{"title": "测试冲突业绩预增", "content": "", "url": "", "source": "", "published_at": "", "category": "news"}]
     kept, _ = _python_prefilter(raw, top_n=40)
     assert len(kept) >= 1, "预筛应保留含事件词的条目"
 
-    conflict_item = NewsAnalysisItem(
+    bearish_item = NewsAnalysisItem(
         title="测试冲突业绩预增", market_impact_score=8.0,
         impact_band=ImpactBand.BEARISH,
         confidence=Confidence.MEDIUM,
+        impact_reason="板块大跌利空",
     )
-    corrected = _apply_guardrails([conflict_item])
-    assert corrected[0].impact_band == ImpactBand.BULLISH
+    corrected = _apply_guardrails([bearish_item])
+    assert corrected[0].impact_band == ImpactBand.BEARISH
 
     merged = {**kept[0], **corrected[0].model_dump()}
-    merged["impact_direction"] = "bullish"
+    merged["impact_direction"] = "bearish"
     ranked = rank_news([merged])
-    assert ranked[0]["impact_band"] == "bullish"
+    assert ranked[0]["impact_band"] == "bearish"
 
 
 def test_e2e_empty_input():
