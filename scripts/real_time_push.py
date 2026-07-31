@@ -98,8 +98,34 @@ GIST_STATE_FILENAME = "real_time_state.json"
 # ============================================================
 # 阈值模式
 # ============================================================
-def _passes_threshold(mode: str, score, direction: str, scope: str) -> bool:
-    """重要度门槛判定（三级模式，默认 strict=财联社风格：只推大消息）
+# 科技板块关键词（外围科技消息增强识别用）
+# ============================================================
+TECH_SECTOR_KEYWORDS = [
+    "半导体", "芯片", "集成电路", "AI", "人工智能", "算力", "英伟达",
+    "纳指", "科技股", "消费电子", "软件", "通信", "光模块", "CPO",
+    "存储", "晶圆", "先进封装", "GPU", "机器人", "智能驾驶",
+]
+
+# 外围资讯源标记（富途全球 + 华尔街见闻）
+OVERSEAS_SOURCE_MARKERS = ["富途", "华尔街"]
+
+
+def _is_overseas_tech(news: dict, sectors: list) -> bool:
+    """外围资讯且涉及科技板块 → 增强推送
+
+    美股半导体/科技股/纳指等外围消息，即使 LLM 判定为弱档或个股级，
+    只要直接影响 A 股科技板块，也视为值得推送。
+    """
+    source = str(news.get("source", "") or "")
+    if not any(m in source for m in OVERSEAS_SOURCE_MARKERS):
+        return False
+    text = f"{news.get('title', '')} {news.get('content', '')} {' '.join(str(s) for s in (sectors or []))}"
+    return any(kw in text for kw in TECH_SECTOR_KEYWORDS)
+
+
+def _passes_threshold(mode: str, score, direction: str, scope: str,
+                      leader_stock: bool = False) -> bool:
+    """重要度门槛判定（三级模式，默认 strict）
 
     Args:
         mode: strict / standard / loose
@@ -107,13 +133,15 @@ def _passes_threshold(mode: str, score, direction: str, scope: str) -> bool:
         direction: 6档方向（bullish/bearish=强档；mildly_bullish/
                    mildly_bearish=弱档；neutral/mixed=中性）
         scope: market/sector/stock
+        leader_stock: 资讯主体是否为行业龙头个股（LLM 判定 或 命中自选龙头名单）
 
     Returns:
         是否值得推送
 
-    关键语义:
-    - 个股级(scope=stock)消息不是"重大资讯"（业绩预告、个股公告等），
-      严格模式一律不推；standard/loose 可按分数放行。
+    关键语义（strict 模式）:
+    - 全市场级影响: 必推
+    - 板块级: 强档方向 或 影响分≥7 → 推
+    - 个股级: 仅行业龙头（龙头股重大消息）且 强档 或 分≥7 → 推；非龙头不推
     """
     try:
         score = float(score or 0)
@@ -126,12 +154,18 @@ def _passes_threshold(mode: str, score, direction: str, scope: str) -> bool:
     if scope == "market":
         return True
 
+    strong = direction in ("bullish", "bearish")
+
     if mode == "strict":
-        # 只推板块级以上：板块级 强档方向 或 影响分≥7；个股级不推
-        return scope == "sector" and (score >= 7 or direction in ("bullish", "bearish"))
+        if scope == "sector":
+            return score >= 7 or strong
+        if scope == "stock":
+            # 龙头个股的重大消息可推；非龙头个股不推
+            return leader_stock and (score >= 7 or strong)
+        return False
     if mode == "standard":
         # 板块/个股：影响分≥6 或 强档方向
-        return score >= 6 or (direction in ("bullish", "bearish") and scope in ("sector", "stock"))
+        return score >= 6 or (strong and scope in ("sector", "stock"))
     # loose
     return score >= 5
 
@@ -352,12 +386,17 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 1. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件）
 2. 市场影响评分 >= 7（10分制：强烈影响某板块或多家公司）
 3. 方向为强利好或强利空（如降准、加息、重大重组、立案调查，而非小幅波动）
+4. 行业龙头个股的重大消息（如寒武纪、宁德时代、贵州茅台、中际旭创、比亚迪等
+   各行业市值/地位第一梯队公司的重大经营事件、巨额订单、业绩剧变、监管动作）
+5. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块则视为重大
 
 对每条输入严格输出一个 JSON 数组元素，字段：
 {"title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
- "scope": "market|sector|stock", "sectors": ["板块名"], "reason": "一句话理由"}
+ "scope": "market|sector|stock", "sectors": ["板块名"], "is_leader_stock": true/false,
+ "reason": "一句话理由"}
 direction 必须区分强度：只有影响显著且方向明确才用 bullish/bearish（强档）；
 小幅波动用 mildly_bullish/mildly_bearish；方向不明用 neutral/mixed。
+is_leader_stock: 仅当该资讯主体是行业龙头个股（市值/地位第一梯队）时为 true，否则 false。
 不要输出任何 JSON 以外的文字。"""
 
 
@@ -461,6 +500,7 @@ def _llm_judge(items: list) -> list:
                     "direction": str(e.get("direction", "neutral") or "neutral").lower(),
                     "scope": str(e.get("scope", "stock") or "stock").lower(),
                     "sectors": e.get("sectors") or [],
+                    "is_leader_stock": bool(e.get("is_leader_stock", False)),
                     "reason": str(e.get("reason", "") or "").strip(),
                 })
             logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成")
@@ -474,9 +514,39 @@ def _llm_judge(items: list) -> list:
                     "direction": "neutral",
                     "scope": "stock",
                     "sectors": [],
+                    "is_leader_stock": False,
                     "reason": f"LLM判定失败: {str(e)[:50]}",
                 })
     return results
+
+
+def _load_leader_watchlist() -> set:
+    """加载自选龙头名单（watchlist.json 的 stocks），与 LLM 判定互为补充"""
+    try:
+        wl = json.loads((PROJECT_ROOT / "watchlist.json").read_text(encoding="utf-8"))
+        stocks = wl.get("stocks", []) or []
+        names = set()
+        for s in stocks:
+            if isinstance(s, str):
+                names.add(s.strip())
+            elif isinstance(s, dict):
+                names.add(str(s.get("name", "") or "").strip())
+        return {n for n in names if n}
+    except Exception:
+        return set()
+
+
+def _hit_watchlist(news: dict, watchlist: set) -> bool:
+    """资讯主体是否命中自选龙头名单（标题/名称/代码匹配）"""
+    if not watchlist:
+        return False
+    title = str(news.get("title", "") or "")
+    name = str(news.get("name", "") or "")
+    content = str(news.get("content", "") or "")
+    for n in watchlist:
+        if n and (n in title or n in name or n in content):
+            return True
+    return False
 
 
 def _fallback_decision(news: dict, pref_score: float, hit_signal: bool) -> dict:
@@ -495,6 +565,7 @@ def _fallback_decision(news: dict, pref_score: float, hit_signal: bool) -> dict:
             "direction": direction,
             "scope": "market",
             "sectors": [],
+            "is_leader_stock": False,
             "reason": "高信号词+高预筛分（LLM降级判定）",
         }
     return {
@@ -504,6 +575,7 @@ def _fallback_decision(news: dict, pref_score: float, hit_signal: bool) -> dict:
         "direction": "neutral",
         "scope": "stock",
         "sectors": [],
+        "is_leader_stock": False,
         "reason": "LLM降级：未达直接推送标准",
     }
 
@@ -656,6 +728,9 @@ def run_once(dry_run: bool = False) -> dict:
         # LLM 完全失败 → 降级规则判定
         judges = [_fallback_decision(n, n["_pref_score"], n["_hit_signal"]) for n in candidates]
 
+    # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
+    leader_watchlist = _load_leader_watchlist()
+
     # 5. 阈值过滤 + 推送
     pushed = 0
     skipped = 0
@@ -665,7 +740,19 @@ def run_once(dry_run: bool = False) -> dict:
             j = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
         # LLM 明确判定不重大（push=false）→ 一票否决，不推送
         # 阈值只对 LLM 认为值得推的条目进一步收紧
-        if j.get("push") and _passes_threshold(mode, j.get("score", 0), j.get("direction", "neutral"), j.get("scope", "stock")):
+        # 龙头判定: LLM 标注 或 命中自选龙头名单
+        is_leader = bool(j.get("is_leader_stock")) or _hit_watchlist(n, leader_watchlist)
+        if j.get("push") and _passes_threshold(
+                mode, j.get("score", 0), j.get("direction", "neutral"),
+                j.get("scope", "stock"), leader_stock=is_leader):
+            pass_round = True
+        elif j.get("push") and _is_overseas_tech(n, j.get("sectors") or []):
+            # 外围消息且涉及科技板块：即使未达常规阈值也推（用户要求外围科技必推）
+            pass_round = True
+        else:
+            pass_round = False
+
+        if pass_round:
             content = format_push_alert(n, j)
             if dry_run:
                 logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
