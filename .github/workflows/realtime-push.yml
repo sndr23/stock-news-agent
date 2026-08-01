@@ -42,7 +42,7 @@ jobs:
       # 状态持久化（跨轮次去重，必配！否则 CI 会报错退出）
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
-      # 阈值: strict=只推全市场级/板块级重大消息,个股级不推（财联社风格）
+      # 阈值: strict=全市场级必推+板块级(强档或≥6)+龙头个股(强档或≥6)+外围科技必推,非龙头个股不推
       RT_PUSH_MODE: "strict"
       # 1=全天7x24推送（含周末/隔夜海外消息）
       RT_ALWAYS_ON: "1"

@@ -25,6 +25,8 @@ from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BAS
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
 from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display, _has_tech_keyword, _TECH_ENGLISH_WORDS
 from src.tools.data_fetchers import get_hs300_constituents
+# 高信号关键词表已收敛至共享模块（与实时推送脚本共用单一事实来源，避免漂移）
+from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, NewsAnalysisItem
 
@@ -1275,30 +1277,7 @@ def prefilter_node(state: AgentState) -> dict:
 # 条件路由决策
 # ============================================================
 
-# 重磅信号关键词 (触发 LLM 深度分析的阈值)
-HIGH_SIGNAL_KEYWORDS = [
-    # 重大事件
-    "退市", "立案调查", "重大违法", "破产", "业绩暴雷", "巨额亏损",
-    "债务违约", "重大重组", "借壳", "并购", "涨停", "跌停",
-    "监管处罚", "业绩超预期", "业绩预增", "业绩预减", "爆雷",
-    "ST", "*ST",
-    # 信号情报关键词
-    "龙虎榜", "机构净买入", "业绩预告",
-    # 政策
-    "降准", "降息", "加息", "印花税", "注册制",
-    "产业政策", "补贴", "减税", "政策利好",
-    # 中等信号
-    "北向资金", "回购", "增持", "减持", "分红", "股权激励",
-    "IPO", "定增", "可转债",
-    # 外围风险事件（对A股有传导效应）
-    "熔断", "暴跌", "崩盘", "债务危机", "银行危机", "金融风险",
-    "战争", "军事冲突", "制裁", "地缘", "俄乌", "中东", "台海",
-    "关税", "贸易战", "出口管制", "禁运",
-    "美联储", "鲍威尔", "非农",
-    "原油暴跌", "原油暴涨", "油价",
-    "韩指", "日经", "美股暴跌", "纳指",
-    "汇率", "人民币贬值", "美元飙升",
-]
+# HIGH_SIGNAL_KEYWORDS 从 src.tools.keyword_tables 导入（共享单一事实来源）
 
 # 预编译信号关键词正则：合并 HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS，
 # 用 re.escape 转义 "*ST" 等含正则元字符的关键词，
