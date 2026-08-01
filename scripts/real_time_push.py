@@ -1000,7 +1000,9 @@ def run_once(dry_run: bool = False) -> dict:
             pushed_events.append({**n["_sig"], "t": now})
             pushed += 1
         else:
-            result = _send_alert_item(push_config, "重要资讯", content)
+            # 推送标题直接用新闻原文标题（避免显示"重要资讯"占位符）
+            push_title = str(n.get("title", "") or "")[:80] or "重大资讯"
+            result = _send_alert_item(push_config, push_title, content)
             if result.get("code") == 200 or result.get("errcode") == 0:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
