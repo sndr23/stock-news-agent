@@ -23,6 +23,10 @@
     云端: GitHub Gist（环境变量 GIST_TOKEN + GIST_ID，必须配置，否则 CI 下报错退出）
     本地: logs/real_time_state.json（已被 .gitignore 排除，不入库）
     指纹为事件级: 同事件多源报道（标题措辞不同）共享同一指纹，48h 内只推一次。
+    推送级事件签名去重: 指纹分裂的同事件报道（不同金额表述/信号词子集）
+    在推送前按(LLM主体+事件组+金额+标题相似)合并，同轮只推最优一条，
+    且 48h 内已推过的同事件不再推（恩智浦收购Ambarella三源三推实证修复）。
+    Gist 写回为读-改-写合并：本地--loop与云端并发时避免互相覆盖 pushed 标记。
 
 环境变量:
     OPENROUTER_API_KEY / OPENROUTER_MODEL_NAME / OPENROUTER_BASE_URL  LLM 判定（复用现有配置）
@@ -64,17 +68,17 @@ from src.tools.calculators import (
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
 from src.agent.nodes import _call_llm_api, _repair_json      # LLM 调用与 JSON 单对象修复
+from src.tools.keyword_tables import (                      # 共享关键词表（单一事实来源）
+    HIGH_SIGNAL_KEYWORDS,
+    OVERSEAS_TECH_KEYWORDS,
+    OVERSEAS_SOURCE_MARKERS,
+)
 
 # ============================================================
 # 常量配置
 # ============================================================
-# 高信号关键词：命中则跳过预筛分数限制，直接进入 LLM 判定
-HIGH_SIGNAL_KEYWORDS = [
-    "降准", "降息", "加息", "国常会", "证监会", "央行", "国务院",
-    "政治局", "中央经济工作会议", "关税", "制裁", "美联储", "欧央行",
-    "印花税", "平准基金", "国家队", "汇金", "注册制", "退市新规",
-    "重大资产重组", "立案调查", "涨跌停", "IPO",
-]
+# 高信号关键词（命中则跳过预筛分数限制，直接进入 LLM 判定）：
+# 从 src.tools.keyword_tables 导入，与批处理管线 nodes.py 共用同一份，避免漂移。
 
 # 规则预筛门槛：重要度评分 >= 该值 或 命中高信号词 → 进入 LLM 判定
 # 多源聚合后候选量远大于单源，门槛从 0.50 提升到 0.55 控住 LLM 成本
@@ -98,16 +102,8 @@ GIST_STATE_FILENAME = "real_time_state.json"
 # ============================================================
 # 阈值模式
 # ============================================================
-# 科技板块关键词（外围科技消息增强识别用）
-# ============================================================
-TECH_SECTOR_KEYWORDS = [
-    "半导体", "芯片", "集成电路", "AI", "人工智能", "算力", "英伟达",
-    "纳指", "科技股", "消费电子", "软件", "通信", "光模块", "CPO",
-    "存储", "晶圆", "先进封装", "GPU", "机器人", "智能驾驶",
-]
-
-# 外围资讯源标记（富途全球 + 华尔街见闻）
-OVERSEAS_SOURCE_MARKERS = ["富途", "华尔街"]
+# 外围科技关键词(OVERSEAS_TECH_KEYWORDS)与外围源标记(OVERSEAS_SOURCE_MARKERS)
+# 均从 src.tools.keyword_tables 导入（2026-08-01 用户调优版词表已迁入共享模块）。
 
 
 def _is_overseas_tech(news: dict, sectors: list) -> bool:
@@ -120,7 +116,7 @@ def _is_overseas_tech(news: dict, sectors: list) -> bool:
     if not any(m in source for m in OVERSEAS_SOURCE_MARKERS):
         return False
     text = f"{news.get('title', '')} {news.get('content', '')} {' '.join(str(s) for s in (sectors or []))}"
-    return any(kw in text for kw in TECH_SECTOR_KEYWORDS)
+    return any(kw in text for kw in OVERSEAS_TECH_KEYWORDS)
 
 
 def _passes_threshold(mode: str, score, direction: str, scope: str,
@@ -140,8 +136,8 @@ def _passes_threshold(mode: str, score, direction: str, scope: str,
 
     关键语义（strict 模式）:
     - 全市场级影响: 必推
-    - 板块级: 强档方向 或 影响分≥7 → 推
-    - 个股级: 仅行业龙头（龙头股重大消息）且 强档 或 分≥7 → 推；非龙头不推
+    - 板块级: 强档方向 或 影响分≥6 → 推（2026-08-01 由≥7放宽：用户反馈大量有用板块资讯被卡）
+    - 个股级: 仅行业龙头（龙头股重大消息）且 强档 或 分≥6 → 推；非龙头不推
     """
     try:
         score = float(score or 0)
@@ -158,10 +154,10 @@ def _passes_threshold(mode: str, score, direction: str, scope: str,
 
     if mode == "strict":
         if scope == "sector":
-            return score >= 7 or strong
+            return score >= 6 or strong
         if scope == "stock":
-            # 龙头个股的重大消息可推；非龙头个股不推
-            return leader_stock and (score >= 7 or strong)
+            # 龙头个股的重要消息可推；非龙头个股不推
+            return leader_stock and (score >= 6 or strong)
         return False
     if mode == "standard":
         # 板块/个股：影响分≥6 或 强档方向
@@ -232,12 +228,107 @@ def _news_fingerprint(news: dict) -> str:
 
 
 # ============================================================
+# 推送级事件去重（跨源同事件只推一次）
+# ============================================================
+def _to_float(v, default: float = 0.0) -> float:
+    """宽容转 float（LLM 返回的 score 可能是字符串/None）"""
+    try:
+        return float(v or 0)
+    except (ValueError, TypeError):
+        return default
+
+
+def _push_event_sig(news: dict, judge: dict) -> dict:
+    """生成推送级事件签名：规则抽取(个股/事件组/金额) + LLM主体(entities) + 归一化标题
+
+    指纹 _news_fingerprint 解决"完全同一条"的跨轮去重；本签名解决"同一事件的
+    不同报道"（标题措辞/金额表述/信号词子集不同导致指纹分裂，
+    恩智浦收购Ambarella三源三推实证）。
+    """
+    stocks, events, numbers = _event_signature_light(news)
+    entities = {str(e).strip() for e in (judge.get("entities") or []) if str(e).strip()}
+    return {
+        "stocks": sorted(stocks),
+        "entities": sorted(entities),
+        "events": sorted(events),
+        "numbers": sorted(numbers),
+        "title_norm": _normalize_title(news.get("title", "")),
+    }
+
+
+def _merge_event_sig(sig_a: dict, sig_b: dict) -> dict:
+    """并集合并两个事件签名（分组内传递合并用），标题保留较长者"""
+    return {
+        "stocks": sorted(set(sig_a.get("stocks") or []) | set(sig_b.get("stocks") or [])),
+        "entities": sorted(set(sig_a.get("entities") or []) | set(sig_b.get("entities") or [])),
+        "events": sorted(set(sig_a.get("events") or []) | set(sig_b.get("events") or [])),
+        "numbers": sorted(set(sig_a.get("numbers") or []) | set(sig_b.get("numbers") or [])),
+        "title_norm": sig_a.get("title_norm", "") if len(sig_a.get("title_norm", "")) >= len(sig_b.get("title_norm", "")) else sig_b.get("title_norm", ""),
+    }
+
+
+def _lcs_len(a: str, b: str) -> int:
+    """最长公共子串长度（归一化标题≤40字，DP O(n·m) 开销可忽略）"""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ai = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
+    """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
+
+    1. 主体(个股/LLM实体)交集非空 且 事件组交集非空 → 同主体同事件
+       （"寒武纪股权激励大消息" vs "寒武纪:2026年限制性股票激励计划(草案)"）
+    2. 核心金额交集非空 且 事件组交集非空 → 同事件不同措辞同金额
+       （"30.53亿补充协议" vs "30.53亿元协议"）
+    3. 主体交集为空 但事件组交集非空 且 归一化标题最长公共子串≥5 →
+       多源同事件报道（"恩智浦洽谈收购Ambarella" vs "安霸股价因传恩智浦洽谈收购而飙升"）
+    4. 双方均无事件组（普通流水）且标题字符集 Jaccard≥0.6 → 同一条目的改写
+    """
+    ent_a = set(sig_a.get("stocks") or []) | set(sig_a.get("entities") or [])
+    ent_b = set(sig_b.get("stocks") or []) | set(sig_b.get("entities") or [])
+    ev_a = set(sig_a.get("events") or [])
+    ev_b = set(sig_b.get("events") or [])
+    num_a = set(sig_a.get("numbers") or [])
+    num_b = set(sig_b.get("numbers") or [])
+    shared_ev = ev_a & ev_b
+
+    if shared_ev and (ent_a & ent_b):
+        return True
+    if shared_ev and (num_a & num_b):
+        return True
+    if shared_ev and not (ent_a & ent_b):
+        if _lcs_len(sig_a.get("title_norm", ""), sig_b.get("title_norm", "")) >= 5:
+            return True
+    if not ev_a and not ev_b:
+        ta = set(sig_a.get("title_norm", ""))
+        tb = set(sig_b.get("title_norm", ""))
+        if ta and tb and len(ta & tb) / len(ta | tb) >= 0.6:
+            return True
+    return False
+
+
+# ============================================================
 # 状态持久化（Gist 云端 / 本地文件）
 # ============================================================
 def _empty_state() -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "seen": {},  # {fingerprint: {"t": "YYYY-MM-DD HH:MM:SS", "pushed": bool, "title": str}}
+        # 已推送事件签名（推送级同事件去重，48h 窗口）：
+        # [{"t": str, "stocks": [], "entities": [], "events": [], "numbers": [], "title_norm": str}]
+        "pushed_events": [],
     }
 
 
@@ -316,7 +407,9 @@ def load_state() -> dict:
     if gist_token and gist_id:
         try:
             state = _gist_load(gist_token, gist_id)
-            logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹")
+            state.setdefault("pushed_events", [])
+            logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹, "
+                        f"{len(state.get('pushed_events', []))} 个已推事件")
             return state
         except Exception as e:
             logger.warning(f"Gist 读取失败: {e}")
@@ -331,6 +424,7 @@ def load_state() -> dict:
             state = json.loads(state_path.read_text(encoding="utf-8"))
             if not isinstance(state, dict) or "seen" not in state:
                 state = _empty_state()
+            state.setdefault("pushed_events", [])
             logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹")
             return state
         except Exception as e:
@@ -338,8 +432,52 @@ def load_state() -> dict:
     return _empty_state()
 
 
+def _event_sig_key(e: dict) -> str:
+    """事件签名内容键（状态合并去重用）"""
+    return ("|".join(sorted(e.get("entities") or [])) + "#"
+            + "|".join(sorted(e.get("events") or [])) + "#"
+            + "|".join(sorted(e.get("numbers") or [])) + "#"
+            + (e.get("title_norm") or ""))
+
+
+def _merge_state(local: dict, remote: dict) -> dict:
+    """合并两份状态（Gist 读-改-写防并发覆盖）：取并集，pushed=True 优先
+
+    本地 --loop 与云端 GitHub Actions 共享同一 Gist 时，两方各自读-改-写，
+    直接覆盖写入会丢掉另一方新增的 pushed 标记 → 同一条被重复推送（2026-08-01 实证：
+    云端已推送记录被本地轮询覆盖后，Gist 中 pushed=true 记录消失）。
+    合并后冲突窗口从"整轮执行"缩小到"单次写入"。
+    """
+    merged_seen = dict(remote.get("seen", {}) or {})
+    for fp, rec in (local.get("seen", {}) or {}).items():
+        old = merged_seen.get(fp)
+        if old is None or (rec.get("pushed") and not old.get("pushed")):
+            merged_seen[fp] = rec
+    local["seen"] = merged_seen
+
+    merged_events = {_event_sig_key(e): e for e in (remote.get("pushed_events") or [])}
+    for e in (local.get("pushed_events") or []):
+        merged_events.setdefault(_event_sig_key(e), e)
+    local["pushed_events"] = list(merged_events.values())
+    return local
+
+
 def save_state(state: dict) -> None:
-    """保存状态：云端写 Gist，本地写文件"""
+    """保存状态：云端写 Gist（读-改-写合并防并发覆盖），本地写文件"""
+    gist_token = os.getenv("GIST_TOKEN", "").strip()
+    gist_id = os.getenv("GIST_ID", "").strip()
+
+    if gist_token and gist_id:
+        # 写入前先合并最新远端状态，避免并发实例互相覆盖
+        try:
+            latest = _gist_load(gist_token, gist_id)
+            state = _merge_state(state, latest)
+        except Exception as e:
+            logger.warning(f"Gist 保存前合并失败（将直接覆盖写入）: {e}")
+    elif _is_ci():
+        # CI 下没有 Gist 配置 → 状态无处可存 → 下轮会重复推送，必须报错
+        raise RuntimeError("CI 环境缺少 GIST_TOKEN/GIST_ID，状态无法持久化，禁止无状态运行")
+
     # 滚动清理过期指纹（48h 窗口）
     cutoff = (datetime.now(BJT) - timedelta(hours=STATE_WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     seen = state.get("seen", {})
@@ -350,16 +488,16 @@ def save_state(state: dict) -> None:
         logger.info(f"清理过期指纹 {len(expired)} 条，剩余 {len(seen)} 条")
     state["seen"] = seen
 
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    # 滚动清理过期已推事件签名（48h 窗口）+ 上限 300 条防爆胀
+    pe = [e for e in (state.get("pushed_events") or []) if e.get("t", "") >= cutoff]
+    if len(pe) > 300:
+        pe = sorted(pe, key=lambda e: e.get("t", ""))[-300:]
+    state["pushed_events"] = pe
+
     if gist_token and gist_id:
         _gist_save(gist_token, gist_id, state)
-        logger.info(f"状态已保存到 Gist（{len(seen)} 个指纹）")
+        logger.info(f"状态已保存到 Gist（{len(seen)} 个指纹, {len(pe)} 个已推事件）")
         return
-
-    if _is_ci():
-        # CI 下没有 Gist 配置 → 状态无处可存 → 下轮会重复推送，必须报错
-        raise RuntimeError("CI 环境缺少 GIST_TOKEN/GIST_ID，状态无法持久化，禁止无状态运行")
 
     state_path = _state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,12 +529,14 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 5. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块则视为重大
 
 对每条输入严格输出一个 JSON 数组元素，字段：
-{"title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
- "scope": "market|sector|stock", "sectors": ["板块名"], "is_leader_stock": true/false,
+{"idx": 输入的idx原样回显, "title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
+ "scope": "market|sector|stock", "sectors": ["板块名"], "entities": ["事件主体公司/机构规范简称，1-3个，无则空数组"], "is_leader_stock": true/false,
  "reason": "一句话理由"}
 direction 必须区分强度：只有影响显著且方向明确才用 bullish/bearish（强档）；
 小幅波动用 mildly_bullish/mildly_bearish；方向不明用 neutral/mixed。
 is_leader_stock: 仅当该资讯主体是行业龙头个股（市值/地位第一梯队）时为 true，否则 false。
+entities: 事件的当事公司/机构/人物规范简称（如"恩智浦""安霸""美联储"），用于跨源同事件去重，必须与标题所述主体一致。
+注意: 输出必须是合法 JSON，字符串内的双引号必须转义为 \"（或改用「」）；idx 必须原样回显。
 不要输出任何 JSON 以外的文字。"""
 
 
@@ -404,11 +544,45 @@ def _build_llm_user_prompt(items: list) -> str:
     lines = []
     for n in items:
         lines.append(json.dumps({
+            "idx": n.get("_judge_idx"),
             "title": str(n.get("title", ""))[:80],
             "content": str(n.get("content", "") or "")[:200],
             "published_at": str(n.get("published_at", "")),
         }, ensure_ascii=False))
-    return "请逐条审核以下资讯（不要遗漏任何一条）:\n[\n" + ",\n".join(lines) + "\n]"
+    return "请逐条审核以下资讯（不要遗漏任何一条，idx 原样回显）:\n[\n" + ",\n".join(lines) + "\n]"
+
+
+def _rescue_judge_object(obj_text: str) -> dict | None:
+    """从损坏的 JSON 对象文本中抢救判定字段（应对中文引号未转义等）
+
+    例: {"title": "美联储巴尔金：利率是否已足够高是个"悬而未决"的问题", "push": false, ...}
+    json.loads 与 _repair_json 均失败时，用正则直接抽取关键字段，
+    避免整条判定被丢弃（漏推根因之一，2026-08-01 日志实证）。
+    """
+    m_push = re.search(r'"push"\s*:\s*(true|false)', obj_text, re.I)
+    m_score = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', obj_text)
+    if not m_push or not m_score:
+        return None
+
+    def _str_field(name: str, default: str = "") -> str:
+        m = re.search(rf'"{name}"\s*:\s*"([^"]*)"', obj_text)
+        return m.group(1) if m else default
+
+    out = {
+        "push": m_push.group(1).lower() == "true",
+        "score": float(m_score.group(1)),
+        "direction": _str_field("direction", "neutral"),
+        "scope": _str_field("scope", "stock"),
+        "reason": _str_field("reason", ""),
+    }
+    m_idx = re.search(r'"idx"\s*:\s*(\d+)', obj_text)
+    if m_idx:
+        out["idx"] = int(m_idx.group(1))
+    # title 允许内含未转义引号：非贪婪匹配到第一个", "为止
+    m_title = re.search(r'"title"\s*:\s*"(.+?)"\s*,', obj_text)
+    if m_title:
+        out["title"] = m_title.group(1)
+    return out
 
 
 def _parse_llm_array(content: str) -> list:
@@ -416,7 +590,8 @@ def _parse_llm_array(content: str) -> list:
 
     注意: 不复用 nodes._safe_parse_json —— 它的容错逻辑只为 filtered_news/
     ranking 等 dict 结构设计，裸数组场景会全部 fallback 失败。
-    本函数: 提取代码块 → 逐字符扫描平衡括号 → 逐对象解析（含 _repair_json 兜底）。
+    本函数: 提取代码块 → 逐字符扫描平衡括号 → 逐对象解析
+    （先 _repair_json 兜底，再 _rescue_judge_object 正则抢救）。
     """
     if not content or not content.strip():
         return []
@@ -463,7 +638,11 @@ def _parse_llm_array(content: str) -> list:
                         try:
                             items.append(json.loads(_repair_json(obj_text)))
                         except json.JSONDecodeError:
-                            logger.warning(f"LLM 返回单对象解析失败，跳过: {obj_text[:60]}")
+                            rescued = _rescue_judge_object(obj_text)
+                            if rescued is not None:
+                                items.append(rescued)
+                            else:
+                                logger.warning(f"LLM 返回单对象解析失败，跳过: {obj_text[:60]}")
                     obj_start = -1
         i += 1
     return items
@@ -472,51 +651,65 @@ def _parse_llm_array(content: str) -> list:
 def _llm_judge(items: list) -> list:
     """批量 LLM 判定，返回与 items 一一对应的判定 dict 列表
 
-    返回的每项: {"title", "push", "score", "direction", "scope", "sectors", "reason"}
-    LLM 输出非法时该项判定为不推（保守）。
+    对齐策略: 给每条注入 _judge_idx 并要求 LLM 回显 idx，按 idx 精确合并
+    （标题匹配仅作兜底）。标题精确匹配不可靠——LLM 会改写/截断标题，
+    批处理管线实证 60 条仅 26 条标题精确命中，未对齐条目会被误判不推，
+    是漏推的主要根因。
+
+    批次异常: 逐条降级为规则判定 _fallback_decision（高信号词+高预筛分仍可推），
+    不再整批保守不推——重大消息宁可多推也不漏推。
     """
     if not items:
         return []
-    results = []
+    results = [None] * len(items)
     for start in range(0, len(items), LLM_BATCH_SIZE):
         batch = items[start:start + LLM_BATCH_SIZE]
+        for offset, n in enumerate(batch):
+            n["_judge_idx"] = start + offset
         try:
             raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=90, max_retries=1)
             entries = _parse_llm_array(raw)
-            # 按标题对齐到输入（LLM 可能增减条目/乱序）
+            # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
+            by_idx = {}
             by_title = {}
             for e in entries:
-                if isinstance(e, dict):
-                    t = str(e.get("title", "") or "").strip()
-                    if t:
-                        by_title[t] = e
-            for n in batch:
+                if not isinstance(e, dict):
+                    continue
+                try:
+                    i = int(e.get("idx", -1))
+                    if 0 <= i < len(items):
+                        by_idx[i] = e
+                except (ValueError, TypeError):
+                    pass
+                t = str(e.get("title", "") or "").strip()
+                if t:
+                    by_title[t] = e
+            for offset, n in enumerate(batch):
+                i = start + offset
                 t = str(n.get("title", "") or "").strip()
-                e = by_title.get(t) or {}
-                results.append({
+                e = by_idx.get(i) or by_title.get(t) or {}
+                results[i] = {
                     "title": t,
                     "push": bool(e.get("push", False)),
                     "score": e.get("score", 0),
                     "direction": str(e.get("direction", "neutral") or "neutral").lower(),
                     "scope": str(e.get("scope", "stock") or "stock").lower(),
                     "sectors": e.get("sectors") or [],
+                    "entities": [str(x).strip() for x in (e.get("entities") or []) if str(x).strip()],
                     "is_leader_stock": bool(e.get("is_leader_stock", False)),
                     "reason": str(e.get("reason", "") or "").strip(),
-                })
-            logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成")
+                }
+            logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成（回显{len(entries)}条）")
         except Exception as e:
-            logger.warning(f"LLM 判定批次失败（{len(batch)} 条），该批次按不推处理: {e}")
-            for n in batch:
-                results.append({
-                    "title": str(n.get("title", "")),
-                    "push": False,
-                    "score": 0,
-                    "direction": "neutral",
-                    "scope": "stock",
-                    "sectors": [],
-                    "is_leader_stock": False,
-                    "reason": f"LLM判定失败: {str(e)[:50]}",
-                })
+            logger.warning(f"LLM 判定批次失败（{len(batch)} 条），逐条降级为规则判定: {e}")
+            for offset, n in enumerate(batch):
+                results[start + offset] = _fallback_decision(
+                    n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+    # 防御：任何未填充位置走规则降级
+    for i, r in enumerate(results):
+        if r is None:
+            n = items[i]
+            results[i] = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
     return results
 
 
@@ -731,13 +924,47 @@ def run_once(dry_run: bool = False) -> dict:
     # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
     leader_watchlist = _load_leader_watchlist()
 
-    # 5. 阈值过滤 + 推送
+    # 5. 同事件合并（跨源同事件只推最优一条）→ 跨轮已推事件拦截 → 阈值过滤 → 推送
     pushed = 0
     skipped = 0
     now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 5a. 生成推送级事件签名并按同事件分组：指纹解决"同一条"，签名解决"同一事件的不同报道"
+    groups = []
     for n, j in zip(candidates, judges):
         if not isinstance(j, dict):
             j = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+        sig = _push_event_sig(n, j)
+        n["_sig"] = sig
+        for g in groups:
+            if _is_same_event(sig, g["sig"]):
+                g["items"].append((n, j))
+                g["sig"] = _merge_event_sig(g["sig"], sig)  # 传递合并，链式同事件也能汇聚
+                break
+        else:
+            groups.append({"sig": sig, "items": [(n, j)]})
+    if len(groups) < len(candidates):
+        logger.info(f"同事件合并: {len(candidates)}条候选 -> {len(groups)}个事件 "
+                    f"(合并{len(candidates) - len(groups)}条多源重复)")
+
+    # 5b. 每组选最优代表（LLM判定可推者优先，其次影响分/预筛分高者），落选者记录指纹不再处理
+    reps = []
+    for g in groups:
+        best = max(g["items"], key=lambda x: (
+            bool(x[1].get("push")),
+            _to_float(x[1].get("score", 0)),
+            x[0].get("_pref_score", 0),
+        ))
+        reps.append(best)
+        for n, _j in g["items"]:
+            if n is not best[0]:
+                seen[n["_fp"]] = {"t": now, "pushed": False,
+                                  "title": str(n.get("title", ""))[:52] + "[同事件合并]"}
+                skipped += 1
+
+    # 5c. 逐代表：阈值过滤 → 跨轮同事件拦截 → 推送
+    pushed_events = state.setdefault("pushed_events", [])
+    for n, j in reps:
         # LLM 明确判定不重大（push=false）→ 一票否决，不推送
         # 阈值只对 LLM 认为值得推的条目进一步收紧
         # 龙头判定: LLM 标注 或 命中自选龙头名单
@@ -752,26 +979,37 @@ def run_once(dry_run: bool = False) -> dict:
         else:
             pass_round = False
 
-        if pass_round:
-            content = format_push_alert(n, j)
-            if dry_run:
-                logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
-                print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
-                seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-                pushed += 1
-            else:
-                result = _send_alert_item(push_config, "重要资讯", content)
-                if result.get("code") == 200 or result.get("errcode") == 0:
-                    logger.info(f"推送成功: {n.get('title', '')[:50]}")
-                    seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-                    pushed += 1
-                else:
-                    # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
-                    logger.error(f"推送失败（下轮重试）: {n.get('title', '')[:50]} | {result}")
-                    skipped += 1
-        else:
+        if not pass_round:
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
+            continue
+
+        # 跨轮同事件拦截：48h 内已推过同事件则不再推（防多源报道时间差导致重复推送）
+        if any(_is_same_event(n["_sig"], pe) for pe in pushed_events):
+            logger.info(f"同事件48h内已推送，跳过: {n.get('title', '')[:50]}")
+            seen[n["_fp"]] = {"t": now, "pushed": False,
+                              "title": str(n.get("title", ""))[:52] + "[同事件已推]"}
+            skipped += 1
+            continue
+
+        content = format_push_alert(n, j)
+        if dry_run:
+            logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
+            print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
+            seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+            pushed_events.append({**n["_sig"], "t": now})
+            pushed += 1
+        else:
+            result = _send_alert_item(push_config, "重要资讯", content)
+            if result.get("code") == 200 or result.get("errcode") == 0:
+                logger.info(f"推送成功: {n.get('title', '')[:50]}")
+                seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+                pushed_events.append({**n["_sig"], "t": now})
+                pushed += 1
+            else:
+                # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
+                logger.error(f"推送失败（下轮重试）: {n.get('title', '')[:50]} | {result}")
+                skipped += 1
 
     # 其余未进入候选的条目也记录指纹
     cand_fps = {n["_fp"] for n in candidates}
@@ -822,6 +1060,10 @@ def main():
     if args.loop:
         poll_seconds = int(os.getenv("RT_POLL_SECONDS", "120"))
         logger.info(f"实时推送守护进程启动，轮询间隔 {poll_seconds}s（Ctrl+C 退出）")
+        if os.getenv("GIST_TOKEN") and os.getenv("GIST_ID"):
+            logger.warning("本地轮询与云端 GitHub Actions 共享同一 Gist 状态。"
+                           "若云端定时任务也在运行，建议只保留一个运行端"
+                           "（状态已做读-改-写合并，但双端同跑仍浪费 LLM 额度且偶发重复）")
         while True:
             try:
                 run_once(dry_run=args.dry_run)
