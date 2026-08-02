@@ -239,6 +239,89 @@ class TestLlmJudge:
         assert len(judges) == 1
         assert judges[0]["push"] is False
 
+    def test_missing_entry_falls_back_to_rules_not_silently_skipped(self, monkeypatch):
+        """LLM 成功返回但漏回显某条（截断/遗漏）时，该条走规则降级而非静默不推。
+
+        修复前：e = by_idx.get(i) or by_title.get(t) or {} → push=False，重大消息漏推。
+        修复后：未回显条目按 _fallback_decision 判定（高信号+高预筛分仍可推）。
+        """
+        items = [
+            {"title": "央行宣布降准0.5个百分点", "content": "释放长期流动性",
+             "_pref_score": 0.80, "_hit_signal": True},
+            {"title": "某公司签订重大合同", "content": "",
+             "_pref_score": 0.72, "_hit_signal": True},
+            {"title": "普通流水新闻", "content": "",
+             "_pref_score": 0.30, "_hit_signal": False},
+        ]
+
+        def fake_llm(system_prompt, user_prompt, timeout=90, max_retries=1, deadline=0):
+            # 只回显 idx=0（漏掉 idx=1, 2）
+            return json.dumps([
+                {"idx": 0, "title": "央行宣布降准", "push": False, "score": 2,
+                 "direction": "neutral", "scope": "stock", "reason": "降准幅度小"},
+            ], ensure_ascii=False)
+
+        monkeypatch.setattr(rtp, "_call_llm_api", fake_llm)
+        judges = rtp._llm_judge(items)
+        assert len(judges) == 3
+        # idx=0: LLM 明确判定不推 → 尊重 LLM
+        assert judges[0]["push"] is False
+        # idx=1: 未回显 + 高信号高分 → 规则降级应可推（不再静默漏推）
+        assert judges[1]["push"] is True
+        assert judges[1]["direction"] == "bullish"
+        # idx=2: 未回显 + 低分无信号 → 规则降级不推
+        assert judges[2]["push"] is False
+
+    def test_garbage_output_high_signal_not_lost(self, monkeypatch):
+        """LLM 返回完全无法解析的内容时，高信号+高预筛分条目经规则降级仍可推（不丢）"""
+        monkeypatch.setattr(rtp, "_call_llm_api", lambda *a, **k: "{{{ 乱码 }}}")
+        items = [
+            {"title": "国常会部署稳经济政策", "content": "",
+             "_pref_score": 0.85, "_hit_signal": True},
+            {"title": "普通流水新闻", "content": "",
+             "_pref_score": 0.20, "_hit_signal": False},
+        ]
+        judges = rtp._llm_judge(items)
+        assert judges[0]["push"] is True
+        assert judges[1]["push"] is False
+
+
+class TestFallbackDecision:
+    """LLM 降级判定：方向三态 + scope 按文本语义（不硬编码 market）"""
+
+    def test_bearish_text_maps_bearish(self):
+        j = rtp._fallback_decision(
+            {"title": "某公司被立案调查", "content": ""}, 0.8, True)
+        assert j["push"] is True
+        assert j["direction"] == "bearish"
+
+    def test_neutral_text_not_forced_bearish(self):
+        """无多空信号的中性流水：修复前被判 bearish+market 直推，修复后 neutral+stock"""
+        j = rtp._fallback_decision(
+            {"title": "某公司召开年度总结会议", "content": "会议圆满结束"}, 0.8, True)
+        assert j["push"] is True  # 高信号高分仍推（宁可多推）
+        assert j["direction"] == "neutral"
+        assert j["scope"] == "stock"
+
+    def test_macro_text_maps_market(self):
+        j = rtp._fallback_decision(
+            {"title": "央行宣布降准0.5个百分点", "content": ""}, 0.8, True)
+        assert j["scope"] == "market"
+        assert j["direction"] == "bullish"
+
+    def test_sector_text_maps_sector(self):
+        j = rtp._fallback_decision(
+            {"title": "半导体板块多家公司业绩预增", "content": ""}, 0.8, True)
+        assert j["scope"] == "sector"
+        assert j["direction"] == "bullish"
+
+    def test_low_score_not_pushed(self):
+        j = rtp._fallback_decision(
+            {"title": "普通流水新闻", "content": ""}, 0.3, False)
+        assert j["push"] is False
+        assert j["direction"] == "neutral"
+        assert j["scope"] == "stock"
+
 
 # ============================================================
 # strict 阈值放宽（板块/龙头 ≥6）
@@ -263,3 +346,72 @@ class TestThresholdRelaxed:
 
     def test_score_tolerates_string(self):
         assert rtp._passes_threshold("strict", "6", "neutral", "sector") is True
+
+
+# ============================================================
+# Gist 状态读写：网络错误重试（修复前 raise_for_status 无 try，重试形同虚设）
+# ============================================================
+
+class TestGistLoadRetry:
+    def test_network_error_then_success(self, monkeypatch):
+        import requests
+        calls = {"n": 0}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"files": {rtp.GIST_STATE_FILENAME: {
+                    "content": '{"seen": {"fp1": {"t": "2026-08-01 00:00:00", "pushed": true}}}'
+                }}}
+
+        def fake_get(url, timeout=20):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise requests.exceptions.ConnectionError("boom")
+            return FakeResp()
+
+        monkeypatch.setattr("requests.get", fake_get)
+        state = rtp._gist_load("token", "gist_id")
+        assert calls["n"] == 3  # 前2次失败重试，第3次成功
+        assert state["seen"]["fp1"]["pushed"] is True
+
+    def test_all_fail_returns_empty_state(self, monkeypatch):
+        import requests
+
+        def fake_get(url, timeout=20):
+            raise requests.exceptions.Timeout("timeout")
+
+        monkeypatch.setattr("requests.get", fake_get)
+        state = rtp._gist_load("token", "gist_id")
+        assert state == {}
+
+
+# ============================================================
+# 规则预筛：信号词检查剥离公司名（防 "*ST XX" 公司名触发 ST 直通）
+# ============================================================
+
+class TestPrefilterNameStrip:
+    def test_st_company_name_not_trigger_signal(self):
+        score, hit = rtp._prefilter({
+            "title": "*ST天夏签订日常经营合同",
+            "content": "合同金额较小",
+            "name": "*ST天夏",
+        })
+        assert hit is False
+
+    def test_same_text_without_name_still_hits_signal(self):
+        score, hit = rtp._prefilter({
+            "title": "*ST天夏签订日常经营合同",
+            "content": "合同金额较小",
+        })
+        assert hit is True
+
+    def test_normal_signal_still_hits(self):
+        score, hit = rtp._prefilter({
+            "title": "央行宣布降准0.5个百分点",
+            "content": "",
+            "name": "",
+        })
+        assert hit is True

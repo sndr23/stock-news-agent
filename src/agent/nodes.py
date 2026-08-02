@@ -1832,13 +1832,16 @@ def _llm_adjust_scores(ranked_news: list, top_n: int = 20, deadline: float = 0) 
 
         # 按 (band, scope) 分组，组内按 total_score 重排，组间保持 Python 原始顺序
         # LLM 只能在同 band 同 scope 内微调，不跨档重排
-        from itertools import groupby
+        # 注: 原实现用 itertools.groupby——它要求序列已按键连续排序，而 candidates
+        # 的排序键是 (band_priority, total_score+scope加成)，同 (band, scope) 并不保证
+        # 相邻，groupby 会把同一分组拆成多段，组间顺序失真。改用 dict 分组。
+        groups = {}
+        for c in candidates:
+            groups.setdefault(
+                (c.get("impact_band", ""), c.get("influence_scope", "")), []
+            ).append(c)
         reranked_candidates = []
-        # groupby 要求序列已按分组键排序——ranked_news 来自 rank_news，已按 band/score 排序
-        for (band, scope), group in groupby(candidates, key=lambda x: (
-                x.get("impact_band", ""),
-                x.get("influence_scope", ""))):
-            group_list = list(group)
+        for group_list in groups.values():
             group_list.sort(
                 key=lambda x: (x.get("total_score", 0), x.get("time_factor", 1.0)),
                 reverse=True
