@@ -2,6 +2,12 @@
 """
 A股资讯监测 Agent 图组装
 基于 LangGraph 1.0 的 StateGraph 构建
+
+DEPRECATED（2026-08-02）: 批处理管线已无生产入口。
+当前唯一运行时入口为 scripts/real_time_push.py（实时重大资讯推送），
+其仅复用 src.agent.nodes 的 _call_llm_api / _repair_json。
+本文件 build_agent/run_agent 及其经过的深度分析/排名节点不再被任何
+脚本、API、定时任务调用，仅作为历史批处理能力保留供复用/参考。
 """
 from langgraph.graph import StateGraph, START, END
 
@@ -17,6 +23,8 @@ from src.agent.nodes import (
 
 def build_agent():
     """构建A股资讯监测Agent
+
+    DEPRECATED: 无生产调用方。仅供测试/历史批处理复用。
 
     工作流:
     1. fetch_news: 抓取当日全部新闻+公告
@@ -61,6 +69,9 @@ def run_agent(
     thread_id: str = "default"
 ):
     """运行Agent生成排名结果
+
+    DEPRECATED: 无生产调用方（无任何脚本/API/定时任务引用本函数）。
+    可考虑后续移除，当前仅标记提示，保留测试与历史复用。
 
     thread_id: 保留参数以兼容 API/脚本调用签名,当前无实际作用
                (无 checkpointer,每次运行均为独立全新状态)。
