@@ -366,9 +366,251 @@ class TestTechOverride:
 
     def test_small_cap_earnings_not_override(self):
         """只影响小票自身的业绩预告：不触发科技兜底，仍被 LLM 否决"""
-        n = {"title": "业绩预告: 富瀚微(300613) 预增 幅度1902.7%", "content": ""}
+        n = {"title": "业绩预告: 富翰微(300613) 预增 幅度1902.7%", "content": ""}
         j = self._judge(scope="stock")
         assert rtp._is_domestic_tech(n, j["sectors"]) is False
+
+
+# ============================================================
+# 推送格式化 format_push_alert
+# ============================================================
+
+class TestFormatPushAlert:
+    def test_direction_emoji_and_label(self):
+        """方向 -> emoji/label 映射（A 股红涨绿跌）。方向文案不冲突"""
+        mapping = [
+            ("bullish", "🔴", "强利好"),
+            ("bearish", "🟢", "强利空"),
+            ("mildly_bullish", "🟠", "弱利好"),
+            ("mildly_bearish", "🟡", "弱利空"),
+            ("neutral", "⚪", "中性"),
+            ("mixed", "🔷", "多空交织"),
+        ]
+        for direction, emoji, label in mapping:
+            out = rtp.format_push_alert(
+                {"title": "测试标题", "content": "", "source": "S"},
+                {"direction": direction})
+            assert emoji in out and label in out
+
+    def test_content_truncation_300(self):
+        """正文超过 300 字符时截断并附省略号"""
+        long_content = "很" * 500
+        out = rtp.format_push_alert(
+            {"title": "T", "content": long_content, "source": "S"},
+            {"direction": "neutral"})
+        assert "很" * 300 in out
+        assert "..." in out
+        assert "很" * 301 not in out
+
+    def test_short_content_not_truncated(self):
+        out = rtp.format_push_alert(
+            {"title": "T", "content": "短内容", "source": "S"},
+            {"direction": "neutral"})
+        assert "短内容" in out
+        assert "..." not in out
+
+    def test_reason_and_sectors_included(self):
+        out = rtp.format_push_alert(
+            {"title": "存储芯片涨价", "content": "内容", "source": "S"},
+            {"direction": "bullish", "score": 8, "scope": "sector",
+             "sectors": ["半导体", "AI"], "reason": "板块景气上行"})
+        assert "半导体" in out and "AI" in out
+        assert "板块景气上行" in out
+
+    def test_scope_label(self):
+        out = rtp.format_push_alert(
+            {"title": "央行降准", "content": "", "source": "S"},
+            {"direction": "neutral", "scope": "market", "score": 7})
+        assert "全市场" in out
+
+    def test_missing_scope_defaults_stock(self):
+        out = rtp.format_push_alert(
+            {"title": "T", "content": "", "source": "S"},
+            {"direction": "neutral"})
+        assert "个股" in out
+
+
+# ============================================================
+# 事件指纹 _news_fingerprint
+# ============================================================
+
+class TestNewsFingerprint:
+    def test_same_title_diff_pub_same_fp(self):
+        """同标题不同时间 → 同指纹（同事件去重）"""
+        a = rtp._news_fingerprint(
+            {"title": "央行降准", "content": "", "published_at": "2026-08-01 09:00:00"})
+        b = rtp._news_fingerprint(
+            {"title": "央行降准", "content": "", "published_at": "2026-08-01 10:00:00"})
+        assert a == b
+
+    def test_different_title_diff_fp(self):
+        a = rtp._news_fingerprint({"title": "A公司宣布收购", "content": ""})
+        b = rtp._news_fingerprint({"title": "央行宣布降准", "content": ""})
+        assert a != b
+
+    def test_same_title_diff_content_same_fp(self):
+        """标题相同内容不同（多源转载）→ 同指纹"""
+        a = rtp._news_fingerprint({"title": "央行降准", "content": "版本一"})
+        b = rtp._news_fingerprint({"title": "央行降准", "content": "版本二"})
+        assert a == b
+
+    def test_high_signal_same_fp_numeric_insensitive(self):
+        """高信号词命中：同信号+同事件组+同个股 → 同指纹（数字不掺入）"""
+        a = rtp._news_fingerprint(
+            {"title": "央行宣布降准0.5个百分点", "content": "",
+             "published_at": "2026-07-01 10:00:00"})
+        b = rtp._news_fingerprint(
+            {"title": "央行宣布降准0.5个百分点 释放长期流动性", "content": "",
+             "published_at": "2026-07-01 12:00:00"})
+        assert a == b
+
+    def test_different_amount_company_events_diff_fp(self):
+        """非高信号的公司公告：金额不同 → 指纹不同（避免合并错误）"""
+        a = rtp._news_fingerprint(
+            {"title": "甲乙科技签订供货协议", "content": "", "published_at": "2026-08-01 09:00:00"})
+        b = rtp._news_fingerprint(
+            {"title": "甲乙科技签订供货协议 金额800万", "content": "",
+             "published_at": "2026-08-01 09:01:00"})
+        assert a != b
+
+    def test_high_signal_amount_insensitive_same_fp(self):
+        """高信号词命中时金额刻意不掺入指纹（多源数字表述不稳定）"""
+        a = rtp._news_fingerprint(
+            {"title": "寒武纪回购5亿元", "content": "", "name": "寒武纪",
+             "published_at": "2026-08-01 09:00:00"})
+        b = rtp._news_fingerprint(
+            {"title": "寒武纪回购5.5亿元", "content": "", "name": "寒武纪",
+             "published_at": "2026-08-01 09:00:00"})
+        assert a == b
+
+    def test_fp_is_16_hex_and_deterministic(self):
+        a = rtp._news_fingerprint({"title": "普通流水", "content": ""})
+        b = rtp._news_fingerprint({"title": "普通流水", "content": ""})
+        assert isinstance(a, str) and len(a) == 16
+        assert a == b
+
+
+# ============================================================
+# 状态滚动清理 save_state（48h 窗口 + 300 条上限）
+# ============================================================
+# 生产 save_state 会写本地文件/ Gist，测试通过 monkeypatch 强制本地
+# tmp 路径 + 清空 Gist/CI 环境，验证清理逻辑对真实写盘结果的影响。
+
+class TestStateCleanup:
+    def _to_local(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        stale = tmp_path / "real_time_state.json"
+        monkeypatch.setattr(rtp, "_state_path", lambda: stale)
+
+        def _write(state):
+            rtp.save_state(state)
+            return json.loads(stale.read_text(encoding="utf-8"))
+        return _write
+
+    def test_expired_seen_fingerprints_removed(self, monkeypatch, tmp_path):
+        save = self._to_local(monkeypatch, tmp_path)
+        import datetime
+        old = (datetime.datetime.now(rtp.BJT)
+               - datetime.timedelta(hours=50)).strftime("%Y-%m-%d %H:%M:%S")
+        new = datetime.datetime.now(rtp.BJT).strftime("%Y-%m-%d %H:%M:%S")
+        state = {"seen": {
+            "fp_old": {"t": old, "pushed": True, "title": "旧"},
+            "fp_new": {"t": new, "pushed": False, "title": "新"},
+        }, "pushed_events": []}
+        saved = save(state)
+        assert "fp_old" not in saved["seen"]
+        assert "fp_new" in saved["seen"]
+
+    def test_pushed_events_300_cap(self, monkeypatch, tmp_path):
+        """已推事件超 300 条时保留最新 300 条"""
+        save = self._to_local(monkeypatch, tmp_path)
+        import datetime
+        base = datetime.datetime.now(rtp.BJT) - datetime.timedelta(hours=1)
+        events = [
+            {"entities": [str(i)], "events": [], "numbers": [],
+             "title_norm": f"e{i}", "t": (base - datetime.timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S")}
+            for i in range(320)
+        ]
+        state = {"seen": {}, "pushed_events": events}
+        saved = save(state)
+        assert len(saved["pushed_events"]) <= 300
+        earliest = min(e["t"] for e in saved["pushed_events"])
+        assert earliest >= (base - datetime.timedelta(hours=50)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_old_pushed_events_cleaned(self, monkeypatch, tmp_path):
+        save = self._to_local(monkeypatch, tmp_path)
+        import datetime
+        old = (datetime.datetime.now(rtp.BJT)
+               - datetime.timedelta(hours=49)).strftime("%Y-%m-%d %H:%M:%S")
+        new = datetime.datetime.now(rtp.BJT).strftime("%Y-%m-%d %H:%M:%S")
+        state = {"seen": {}, "pushed_events": [
+            {"t": old, "title_norm": "e_old"},
+            {"t": new, "title_norm": "e_new"},
+        ]}
+        saved = save(state)
+        assert all(e["title_norm"] != "e_old" for e in saved["pushed_events"])
+        assert any(e["title_norm"] == "e_new" for e in saved["pushed_events"])
+
+
+# ============================================================
+# run_once 集成测试（mock LLM + 推送后端）
+# ============================================================
+
+class TestRunOnce:
+    _SENT = []
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path, send_result):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        TestRunOnce._SENT.clear()
+
+        def fake_send(cfg, title, content):
+            TestRunOnce._SENT.append(title)
+            return dict(send_result)
+        monkeypatch.setattr(rtp, "_send_alert_item", fake_send)
+
+        def fake_judge(items):
+            return [{"push": True, "score": 9, "direction": "bullish", "scope": "market",
+                     "sectors": [], "entities": ["央行"], "is_leader_stock": False,
+                     "reason": "宏观必推"} for _ in items]
+        monkeypatch.setattr(rtp, "_llm_judge", fake_judge)
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+
+        news = type("T", (), {"func": staticmethod(lambda: [{
+            "title": "央行宣布降准0.5个百分点 释放万亿流动性",
+            "content": "国常会部署，支持实体", "source": "财联社",
+            "published_at": "2026-08-01 10:00:00",
+        }])})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+    def test_push_success_records_fingerprint(self, monkeypatch, tmp_path):
+        """推送成功：记录指纹 pushed=True + 已推事件，下轮不再推"""
+        self._setup(monkeypatch, tmp_path, {"code": 200, "msg": "ok"})
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 1
+        assert TestRunOnce._SENT, "不应发送推送失败"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        pushed_recs = [r for r in saved["seen"].values() if r.get("pushed")]
+        assert pushed_recs, "推送成功必须记录 seen.pushed=True"
+        assert saved["pushed_events"], "推送成功必须记录已推事件"
+
+    def test_push_fail_does_not_record_fingerprint(self, monkeypatch, tmp_path):
+        """推送失败：不记录指纹，下轮重试（重大消息不丢失）"""
+        self._setup(monkeypatch, tmp_path, {"code": 500, "msg": "fail"})
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 0
+        assert TestRunOnce._SENT, "应尝试发送（失败也应有调用）"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert all(not r.get("pushed") for r in saved["seen"].values()), \
+            "推送失败不得标记 pushed=True（需下轮重试）"
+        assert saved["pushed_events"] == saved["pushed_events"]  # 不新增已推事件
 
 
 # ============================================================
