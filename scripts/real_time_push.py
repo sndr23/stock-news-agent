@@ -60,7 +60,7 @@ logger = logging.getLogger("real_time_push")
 # ============================================================
 # 复用项目现有能力（不重复造轮子）
 # ============================================================
-from src.tools.data_fetchers import get_stock_news, get_market_signals  # 多源聚合抓取
+from src.tools.data_fetchers import get_stock_news, get_market_signals, dedup_news_3layer  # 多源聚合抓取 + 三层近似去重
 from src.tools.calculators import (
     calculate_prefilter_importance,   # 预筛评分
     _EVENT_KEYWORD_GROUPS,            # 事件关键词组
@@ -922,10 +922,21 @@ def run_once(dry_run: bool = False) -> dict:
     try:
         news_list = get_stock_news.func()
         signals = get_market_signals.func()
-        news_list = list(news_list) + list(signals)
     except Exception as e:
         logger.error(f"多源抓取失败: {e}", exc_info=True)
         news_list = []
+        signals = []
+
+    # 跨源近似去重（URL/精确标题之外补一层 SimHash）：同一事件不同措辞的多源
+    # 报道先在入口收敛，避免各自进指纹/候选、重复消耗 LLM 判定 token。
+    # 注: 只作用于多源新闻(dedup_news_3layer 对标题 SimHash)，signals 是交易所
+    # 结构化数据（龙虎榜/业绩预告）且已按代码内去重，模板化标题不参与近似去重，
+    # 避免"业绩预告: XX(代码) 预增 幅度+X%" 同模板不同股票被 SimHash 误判重复。
+    before_dedup = len(news_list)
+    news_list = dedup_news_3layer(list(news_list))
+    if len(news_list) < before_dedup:
+        logger.info(f"三层近似去重: {before_dedup} -> {len(news_list)} 条")
+    news_list = news_list + list(signals)
     logger.info(f"多源聚合: 拉取 {len(news_list)} 条")
     if not news_list:
         logger.info("无资讯返回，跳过本轮")
