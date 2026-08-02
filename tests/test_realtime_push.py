@@ -349,6 +349,29 @@ class TestThresholdRelaxed:
 
 
 # ============================================================
+# 科技板块/科技龙头规则兜底（防 LLM 漏推科技资讯）
+# ============================================================
+
+class TestTechOverride:
+    def _judge(self, scope="sector", score=5, direction="mildly_bullish",
+               leader=False, sectors=None):
+        return {"push": False, "score": score, "direction": direction,
+                "scope": scope, "is_leader_stock": leader, "sectors": sectors or []}
+
+    def test_sector_tech_override(self):
+        """板块级科技资讯：LLM 判不推也放行（score≥5）"""
+        n = {"title": "银河证券：Kimi K3正式开源 重塑大模型商业生态", "content": "建议关注国产超节点"}
+        j = self._judge(sectors=["AI"])
+        assert rtp._is_domestic_tech(n, j["sectors"]) is True
+
+    def test_small_cap_earnings_not_override(self):
+        """只影响小票自身的业绩预告：不触发科技兜底，仍被 LLM 否决"""
+        n = {"title": "业绩预告: 富瀚微(300613) 预增 幅度1902.7%", "content": ""}
+        j = self._judge(scope="stock")
+        assert rtp._is_domestic_tech(n, j["sectors"]) is False
+
+
+# ============================================================
 # Gist 状态读写：网络错误重试（修复前 raise_for_status 无 try，重试形同虚设）
 # ============================================================
 

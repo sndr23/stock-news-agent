@@ -119,6 +119,20 @@ def _is_overseas_tech(news: dict, sectors: list) -> bool:
     return any(kw in text for kw in OVERSEAS_TECH_KEYWORDS)
 
 
+def _is_domestic_tech(news: dict, sectors: list) -> bool:
+    """国内资讯且涉及科技板块 → 增强推送（防 LLM 漏推科技板块资讯）
+
+    用户口径：影响科技板块的资讯不能漏推，但只影响中小市值个股自身的
+    业绩/回购/中标等消息即使再轰动也不推。本函数只管"板块级科技影响"——
+    调用方需结合 scope==sector（板块级）或 is_leader_stock（科技龙头个股）使用。
+    """
+    source = str(news.get("source", "") or "")
+    if any(m in source for m in OVERSEAS_SOURCE_MARKERS):
+        return False
+    text = f"{news.get('title', '')} {news.get('content', '')} {' '.join(str(s) for s in (sectors or []))}"
+    return any(kw in text for kw in OVERSEAS_TECH_KEYWORDS)
+
+
 def _passes_threshold(mode: str, score, direction: str, scope: str,
                       leader_stock: bool = False) -> bool:
     """重要度门槛判定（三级模式，默认 strict）
@@ -542,13 +556,17 @@ def _prefilter(news: dict) -> tuple:
 # LLM 快速重要性判定
 # ============================================================
 _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯是否属于"必须立即推送的重大消息"。
-只推重大消息，日常流水、常规公司经营新闻一律不推。以下任一条件成立才算重大：
+推送优先级由高到低，以下任一条件成立则应判为推送：
 1. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件）
-2. 市场影响评分 >= 7（10分制：强烈影响某板块或多家公司）
-3. 方向为强利好或强利空（如降准、加息、重大重组、立案调查，而非小幅波动）
-4. 行业龙头个股的重大消息（如寒武纪、宁德时代、贵州茅台、中际旭创、比亚迪等
-   各行业市值/地位第一梯队公司的重大经营事件、巨额订单、业绩剧变、监管动作）
-5. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块则视为重大
+2. 影响科技板块/科技产业链的资讯（AI、算力、半导体、芯片、存储、光模块/CPO、PCB、MLCC、
+   机器人、消费电子等）：板块景气变化、龙头动向、技术突破、产业政策——即使标题未点名个股
+3. 科技龙头个股的重大消息（寒武纪、中际旭创、宁德时代、英伟达产业链相关等第一梯队
+   公司的重大经营事件、大额订单、业绩剧变、监管动向）
+4. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块
+明确不推（无论业绩多好、涨跌多剧烈）：
+- 只影响中小市值个股自身股价的消息：业绩预告/业绩变动、小额回购、增持/减持、中标/签约、
+  日常经营、子公司事项、分红送转等——除非该股是行业龙头或直接改变板块逻辑
+- 与上述四条优先级均无关的其他资讯
 
 对每条输入严格输出一个 JSON 数组元素，字段：
 {"idx": 输入的idx原样回显, "title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
@@ -1031,16 +1049,36 @@ def run_once(dry_run: bool = False) -> dict:
     # 5c. 逐代表：阈值过滤 → 跨轮同事件拦截 → 推送
     pushed_events = state.setdefault("pushed_events", [])
     for n, j in reps:
-        # LLM 明确判定不重大（push=false）→ 一票否决，不推送
-        # 阈值只对 LLM 认为值得推的条目进一步收紧
+        # 判定顺序：
+        # 1) LLM 明确判定不重大（push=false）→ 默认一票否决
+        # 2) 例外放行：科技板块级资讯/科技龙头个股（_is_domestic_tech 规则兜底，
+        #    "科技不能不漏"）或外围科技（_is_overseas_tech）——用户口径：影响科技
+        #    板块的资讯必须推，只影响中小市值个股自身的业绩/回购等仍按 LLM 否决
+        # 3) 阈值只对 LLM 认为值得推的条目进一步收紧
         # 龙头判定: LLM 标注 或 命中自选龙头名单
         is_leader = bool(j.get("is_leader_stock")) or _hit_watchlist(n, leader_watchlist)
+        sectors = j.get("sectors") or []
+        scope = str(j.get("scope", "stock") or "stock").lower()
+        tech_override = (
+            # 板块级科技资讯：LLM 即使判不推也放行（score≥5 或 强方向，避免滥推）
+            scope == "sector" and _is_domestic_tech(n, sectors)
+            and (_to_float(j.get("score", 0)) >= 5
+                 or str(j.get("direction", "neutral")) in ("bullish", "bearish"))
+        ) or (
+            # 科技龙头个股的重大消息：LLM 判不推时仍放行
+            scope == "stock" and is_leader and _is_domestic_tech(n, sectors)
+            and (_to_float(j.get("score", 0)) >= 5
+                 or str(j.get("direction", "neutral")) in ("bullish", "bearish"))
+        )
         if j.get("push") and _passes_threshold(
                 mode, j.get("score", 0), j.get("direction", "neutral"),
                 j.get("scope", "stock"), leader_stock=is_leader):
             pass_round = True
-        elif j.get("push") and _is_overseas_tech(n, j.get("sectors") or []):
+        elif j.get("push") and _is_overseas_tech(n, sectors):
             # 外围消息且涉及科技板块：即使未达常规阈值也推（用户要求外围科技必推）
+            pass_round = True
+        elif tech_override:
+            # 科技板块级/科技龙头资讯：LLM 判不推也放行（防漏推科技）
             pass_round = True
         else:
             pass_round = False
