@@ -498,6 +498,33 @@ class TestLLMAdjustSameScopeSameBand:
         news = [self._mk("x", "neutral"), self._mk("y", "neutral"), self._mk("z", "neutral")]
         assert _llm_adjust_scores(news) == news
 
+    @patch("src.tools.data_fetchers.get_hs300_constituents", return_value={"codes": set(), "names": set()})
+    def test_same_group_noncontiguous_not_split(self, _mock_hs300):
+        """同 (band, scope) 组在输入中不连续时，修复前 groupby 会拆组、
+        修复后按 dict 分组聚合并保持组间原始顺序。
+
+        输入顺序: A(bullish,sector) B(neutral,market) C(bullish,sector) D(neutral,market)
+        → 期望: bullish/sector 组(内按分排 C,A) → neutral/market 组(内按分排 D,B)
+        """
+        news = [
+            self._mk("A", "bullish", 6.0, scope="sector"),
+            self._mk("B", "neutral", 3.0, scope="market"),
+            self._mk("C", "bullish", 9.0, scope="sector"),
+            self._mk("D", "neutral", 5.0, scope="market"),
+        ]
+        fake = {
+            "adjustments": [
+                {"title": "A", "adjusted_score": 6.0},
+                {"title": "B", "adjusted_score": 3.0},
+                {"title": "C", "adjusted_score": 9.0},
+                {"title": "D", "adjusted_score": 5.0},
+            ]
+        }
+        with patch("src.agent.nodes._call_llm_api", return_value=__import__("json").dumps(fake)):
+            out = _llm_adjust_scores(news, top_n=20)
+        # 组间保持首次出现顺序：bullish/sector 组在前，neutral/market 组在后
+        assert [n["title"] for n in out] == ["C", "A", "D", "B"]
+
 
 class TestSafeParseJsonAdjustments:
     """adjustments 结构在非完美 JSON 时也必须被解析"""

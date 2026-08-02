@@ -359,13 +359,17 @@ def _gist_load(token: str, gist_id: str) -> dict:
     }
     fobj = None
     for attempt in range(3):
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        files = data.get("files") or {}
-        fobj = files.get(GIST_STATE_FILENAME)
-        if fobj is not None:
-            break
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            files = data.get("files") or {}
+            fobj = files.get(GIST_STATE_FILENAME)
+            if fobj is not None:
+                break
+        except Exception as e:
+            logger.warning(f"Gist 读取第{attempt + 1}次失败: {e}")
+            fobj = None
         if attempt < 2:
             logger.info(f"Gist 状态文件暂未读到（第{attempt + 1}次，可能命中旧快照），1s 后重试")
             time.sleep(1)
@@ -395,8 +399,19 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
             }
         }
     }
-    resp = requests.patch(url, json=payload, headers=headers, timeout=20)
-    resp.raise_for_status()
+    # 瞬时网络错误重试（失败会导致已推送标记未落盘 → 下轮重复推送）
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = requests.patch(url, json=payload, headers=headers, timeout=20)
+            resp.raise_for_status()
+            return
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                logger.warning(f"Gist 写入第{attempt + 1}次失败: {e}, 1s 后重试")
+                time.sleep(1)
+    raise RuntimeError(f"Gist 状态写入失败（已重试2次）: {last_error}")
 
 
 def load_state() -> dict:
@@ -511,7 +526,14 @@ def save_state(state: dict) -> None:
 def _prefilter(news: dict) -> tuple:
     """规则预筛：返回 (预筛评分, 是否命中高信号词)"""
     score = calculate_prefilter_importance(news)
-    text = f"{news.get('title', '')} {news.get('content', '')}"
+    title = str(news.get("title", "") or "")
+    content = str(news.get("content", "") or "")
+    name = str(news.get("name", "") or "")
+    text = f"{title} {content}"
+    # 剥离公司名：避免 "*ST XX" 等公司名命中 "ST" 高信号词直通 LLM 判定
+    # （与 nodes._has_high_signal 的处理保持一致）
+    if name:
+        text = text.replace(name, "")
     hit = any(kw in text for kw in HIGH_SIGNAL_KEYWORDS)
     return float(score), hit
 
@@ -687,7 +709,14 @@ def _llm_judge(items: list) -> list:
             for offset, n in enumerate(batch):
                 i = start + offset
                 t = str(n.get("title", "") or "").strip()
-                e = by_idx.get(i) or by_title.get(t) or {}
+                e = by_idx.get(i) or by_title.get(t)
+                if not e:
+                    # LLM 成功返回但未回显该条目（截断/遗漏/标题改写导致 idx 与标题均未对齐）。
+                    # 不能静默判 push=False——那会把本可推送的重大消息漏掉（漏推主要根因），
+                    # 与批次异常同样逐条走规则降级：高信号词+高预筛分仍可推。
+                    logger.warning(f"LLM 未回显条目 idx={i}，降级规则判定: {t[:40]}")
+                    results[i] = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+                    continue
                 results[i] = {
                     "title": t,
                     "push": bool(e.get("push", False)),
@@ -748,15 +777,31 @@ def _fallback_decision(news: dict, pref_score: float, hit_signal: bool) -> dict:
     原则: 重大消息宁可多推也不漏推；日常流水宁可漏推也不滥推。
     """
     title = str(news.get("title", ""))
+    text = f"{title} {news.get('content', '')}"
     if hit_signal and pref_score >= FALLBACK_PUSH_SCORE_MIN:
-        text = f"{title} {news.get('content', '')}"
-        direction = "bullish" if any(k in text for k in ["利好", "上涨", "支持", "放宽", "增持", "降准", "降息", "减税"]) else "bearish"
+        # 方向三态判断（不再二值化：无多空信号的中性流水不应被标为强利空）
+        if any(k in text for k in ["利好", "上涨", "支持", "放宽", "增持", "降准", "降息", "减税", "预增", "回购", "中标", "涨停", "签约", "订单", "合同"]):
+            direction = "bullish"
+        elif any(k in text for k in ["利空", "下跌", "暴跌", "制裁", "退市", "立案", "爆雷", "违约", "处罚", "跌停", "减持", "预减", "亏损"]):
+            direction = "bearish"
+        else:
+            direction = "neutral"
+        # scope 按文本语义判定，不硬编码 market（普通公司事件不应因降级获得 market 必推特权）
+        if any(k in text for k in ["央行", "国务院", "证监会", "国常会", "政治局", "美联储", "财政部",
+                                   "降准", "降息", "加息", "印花税", "关税", "制裁", "战争", "熔断",
+                                   "大盘", "A股", "纳指", "美股"]):
+            scope = "market"
+        elif any(k in text for k in ["半导体", "芯片", "AI", "算力", "光伏", "新能源", "机器人",
+                                     "光模块", "CPO", "PCB", "消费电子", "医药", "白酒", "板块"]):
+            scope = "sector"
+        else:
+            scope = "stock"
         return {
             "title": title,
             "push": True,
             "score": round(pref_score * 10, 1),
             "direction": direction,
-            "scope": "market",
+            "scope": scope,
             "sectors": [],
             "is_leader_stock": False,
             "reason": "高信号词+高预筛分（LLM降级判定）",
@@ -795,8 +840,11 @@ def format_push_alert(news: dict, judge: dict) -> str:
     注: 企业微信 markdown 不支持 <font color> 内联 HTML，
     统一用 emoji + 文本标签表达方向（A股惯例红涨绿跌），
     PushPlus / 企业微信均能正确渲染。
+
+    正文处理: 资讯原文 content 截断 300 字符附在推送里（避免只推标题+理由
+    让用户看不到资讯内容），企业微信 4096 字节限制内有充足余量。
     """
-    title = str(news.get("title", "") or "")[:80]
+    title = str(news.get("title", "") or "")[:200]
     direction = judge.get("direction", "neutral")
     emoji = _DIR_EMOJI.get(direction, "⚪")
     label = _DIR_LABEL.get(direction, "中性")
@@ -808,11 +856,18 @@ def format_push_alert(news: dict, judge: dict) -> str:
     reason = str(judge.get("reason", "") or "").strip()[:100]
     source = str(news.get("source", "") or "多源资讯")
     pub = str(news.get("published_at", "") or "")
+    content_text = str(news.get("content", "") or "").strip()
 
     lines = [f"{emoji}【{label}】{title}", ""]
     meta = [f"**范围**: {scope_label}", f"**影响分**: {score}", f"**板块**: {sector_str}"]
     lines.append(" | ".join(meta))
     lines.append(f"**来源**: {source} {pub}")
+    if content_text:
+        body = content_text[:300]
+        if len(content_text) > 300:
+            body += "..."
+        lines.append("")
+        lines.append(f"> 📄 {body}")
     if reason:
         lines.append("")
         lines.append(f"> {reason}")
@@ -995,6 +1050,11 @@ def run_once(dry_run: bool = False) -> dict:
         content = format_push_alert(n, j)
         if dry_run:
             logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
+            # Windows 控制台默认 GBK 无法打印 emoji，先切 UTF-8 容错
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
             pushed_events.append({**n["_sig"], "t": now})
