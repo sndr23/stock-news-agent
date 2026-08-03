@@ -217,8 +217,13 @@ class TestLlmJudge:
         assert judges[0]["entities"] == ["央行"]
         assert judges[1]["push"] is False
 
-    def test_batch_failure_fallback_per_item(self, monkeypatch):
-        """批次异常 → 逐条降级规则判定：高信号+高分仍直推，不再整批不推"""
+    def test_batch_failure_hangs_items_for_retry(self, monkeypatch):
+        """批次异常 → 整批挂起（judged=False）：不推、不落指纹，下轮重新送 LLM 判定。
+
+        2026-08-03 用户口径：删除规则降级路径，全部走 LLM 判定。
+        修复前：批次失败逐条规则直推（高信号+高分仍推，且规则方向可能误判）。
+        修复后：一律挂起，绝不规则直推。
+        """
         def boom(*args, **kwargs):
             raise RuntimeError("LLM down")
 
@@ -228,22 +233,24 @@ class TestLlmJudge:
             {"title": "普通流水新闻", "content": "", "_pref_score": 0.3, "_hit_signal": False},
         ]
         judges = rtp._llm_judge(items)
-        assert judges[0]["push"] is True
-        assert judges[0]["scope"] == "market"
-        assert judges[1]["push"] is False
+        for j in judges:
+            assert j["push"] is False
+            assert j["judged"] is False
+            assert j["direction"] == "neutral"
 
-    def test_llm_returns_garbage_defaults_no_push(self, monkeypatch):
+    def test_llm_returns_garbage_defaults_hang(self, monkeypatch):
         monkeypatch.setattr(rtp, "_call_llm_api", lambda *a, **k: "无法解析的内容")
         items = [{"title": "测试", "content": "", "_pref_score": 0.1, "_hit_signal": False}]
         judges = rtp._llm_judge(items)
         assert len(judges) == 1
         assert judges[0]["push"] is False
+        assert judges[0]["judged"] is False
 
-    def test_missing_entry_falls_back_to_rules_not_silently_skipped(self, monkeypatch):
-        """LLM 成功返回但漏回显某条（截断/遗漏）时，该条走规则降级而非静默不推。
+    def test_missing_entry_hangs_for_retry(self, monkeypatch):
+        """LLM 成功返回但漏回显某条（截断/遗漏）时，该条挂起下轮重试，而非规则直推。
 
-        修复前：e = by_idx.get(i) or by_title.get(t) or {} → push=False，重大消息漏推。
-        修复后：未回显条目按 _fallback_decision 判定（高信号+高预筛分仍可推）。
+        2026-08-03 用户口径：删除规则降级路径（修复前未回显条目按 _fallback_decision
+        规则直推，规则方向对全文关键词扫描可能把利空标题误判为利好）。
         """
         items = [
             {"title": "央行宣布降准0.5个百分点", "content": "释放长期流动性",
@@ -266,14 +273,15 @@ class TestLlmJudge:
         assert len(judges) == 3
         # idx=0: LLM 明确判定不推 → 尊重 LLM
         assert judges[0]["push"] is False
-        # idx=1: 未回显 + 高信号高分 → 规则降级应可推（不再静默漏推）
-        assert judges[1]["push"] is True
-        assert judges[1]["direction"] == "bullish"
-        # idx=2: 未回显 + 低分无信号 → 规则降级不推
+        assert judges[0]["judged"] is True
+        # idx=1/2: 未回显 → 挂起（不推、judged=False），下轮重试；绝不规则直推
+        assert judges[1]["push"] is False
+        assert judges[1]["judged"] is False
         assert judges[2]["push"] is False
+        assert judges[2]["judged"] is False
 
-    def test_garbage_output_high_signal_not_lost(self, monkeypatch):
-        """LLM 返回完全无法解析的内容时，高信号+高预筛分条目经规则降级仍可推（不丢）"""
+    def test_garbage_output_all_hang(self, monkeypatch):
+        """LLM 返回完全无法解析的内容时，全部条目挂起（judged=False），不规则直推"""
         monkeypatch.setattr(rtp, "_call_llm_api", lambda *a, **k: "{{{ 乱码 }}}")
         items = [
             {"title": "国常会部署稳经济政策", "content": "",
@@ -282,45 +290,52 @@ class TestLlmJudge:
              "_pref_score": 0.20, "_hit_signal": False},
         ]
         judges = rtp._llm_judge(items)
-        assert judges[0]["push"] is True
-        assert judges[1]["push"] is False
+        assert all(j["push"] is False for j in judges)
+        assert all(j["judged"] is False for j in judges)
 
 
-class TestFallbackDecision:
-    """LLM 降级判定：方向三态 + scope 按文本语义（不硬编码 market）"""
+class TestHangJudge:
+    """LLM 未判定挂起状态（2026-08-03 删除规则降级路径后）"""
 
-    def test_bearish_text_maps_bearish(self):
-        j = rtp._fallback_decision(
-            {"title": "某公司被立案调查", "content": ""}, 0.8, True)
-        assert j["push"] is True
-        assert j["direction"] == "bearish"
-
-    def test_neutral_text_not_forced_bearish(self):
-        """无多空信号的中性流水：修复前被判 bearish+market 直推，修复后 neutral+stock"""
-        j = rtp._fallback_decision(
-            {"title": "某公司召开年度总结会议", "content": "会议圆满结束"}, 0.8, True)
-        assert j["push"] is True  # 高信号高分仍推（宁可多推）
-        assert j["direction"] == "neutral"
-        assert j["scope"] == "stock"
-
-    def test_macro_text_maps_market(self):
-        j = rtp._fallback_decision(
-            {"title": "央行宣布降准0.5个百分点", "content": ""}, 0.8, True)
-        assert j["scope"] == "market"
-        assert j["direction"] == "bullish"
-
-    def test_sector_text_maps_sector(self):
-        j = rtp._fallback_decision(
-            {"title": "半导体板块多家公司业绩预增", "content": ""}, 0.8, True)
-        assert j["scope"] == "sector"
-        assert j["direction"] == "bullish"
-
-    def test_low_score_not_pushed(self):
-        j = rtp._fallback_decision(
-            {"title": "普通流水新闻", "content": ""}, 0.3, False)
+    def test_hang_judge_shape(self):
+        j = rtp._hang_judge({"title": "央行宣布降准"})
         assert j["push"] is False
+        assert j["judged"] is False
         assert j["direction"] == "neutral"
         assert j["scope"] == "stock"
+        assert "挂起" in j["reason"]
+
+    def test_run_once_skips_hung_items_without_fingerprint(self, monkeypatch, tmp_path):
+        """未判定条目：不推送、不落指纹（下轮重新送 LLM 判定）"""
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+
+        sent = []
+        monkeypatch.setattr(rtp, "_send_alert_item",
+                            lambda cfg, title, content: sent.append(title) or {"code": 200})
+        # LLM 判定全部挂起（如 LLM 服务故障）
+        monkeypatch.setattr(rtp, "_llm_judge",
+                            lambda items: [rtp._hang_judge(n) for n in items])
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+
+        news = type("T", (), {"func": staticmethod(lambda: [{
+            "title": "央行宣布降准0.5个百分点 释放万亿流动性",
+            "content": "国常会部署，支持实体", "source": "财联社",
+            "published_at": "2026-08-01 10:00:00",
+        }])})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 0
+        assert sent == [], "未判定条目绝不推送"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert all(not r.get("pushed") for r in saved["seen"].values())
+        # 关键：挂起条目不落指纹 → 下轮仍作为"新增"重新送 LLM
+        assert not saved["seen"], "挂起条目不落指纹，下轮重试"
 
 
 # ============================================================

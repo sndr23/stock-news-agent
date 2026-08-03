@@ -12,6 +12,12 @@
     增量检测（事件级指纹去重）→ 规则预筛 → LLM 严格判定 →
     仅推送重大消息到微信，非重大消息静默丢弃。
 
+判定策略（2026-08-03 用户口径: 全部走 LLM，删除规则降级路径）:
+    - 预筛通过的全部候选必须由 LLM 判定推/不推，Python 规则不得直接通关。
+    - LLM 未回显 / 批次异常 / 无法解析的条目一律标记 judged=False 挂起
+      （不推、不落指纹），留待下一轮重新送 LLM 判定。
+    - 已删除 _fallback_decision 规则直推路径（高信号词+高预筛分不再绕过 LLM）。
+
 运行方式:
     云端: GitHub Actions schedule 每 30/60 分钟触发一次
           （见 .github/workflows/realtime-push.yml）
@@ -65,6 +71,7 @@ from src.tools.calculators import (
     calculate_prefilter_importance,   # 预筛评分
     _EVENT_KEYWORD_GROUPS,            # 事件关键词组
     _extract_core_numbers,            # 核心金额提取
+    predict_direction_by_rules,       # 规则方向兜底（词表全，含扭亏/退市/涨超/走弱等）
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
 from src.agent.nodes import _call_llm_api, _repair_json      # LLM 调用与 JSON 单对象修复
@@ -86,9 +93,6 @@ PREFILTER_SCORE_MIN = 0.55
 
 # 单轮进入 LLM 判定的候选条数上限（防止突发大行情时候选激增拖慢/超时）
 MAX_CANDIDATES_PER_ROUND = 40
-
-# LLM 判定失败时的降级策略：预筛分高 + 命中高信号词 → 直接推（宁可多推不可漏推重大消息）
-FALLBACK_PUSH_SCORE_MIN = 0.70
 
 # 批量 LLM 判定每批条数（控制单次请求 token 与延迟）
 LLM_BATCH_SIZE = 8
@@ -282,7 +286,7 @@ def _merge_event_sig(sig_a: dict, sig_b: dict) -> dict:
 
 
 def _lcs_len(a: str, b: str) -> int:
-    """最长公共子串长度（归一化标题≤40字，DP O(n·m) 开销可忽略）"""
+    """最长公共子串长度（连续，归一化标题≤40字，DP O(n·m) 开销可忽略）"""
     if not a or not b:
         return 0
     prev = [0] * (len(b) + 1)
@@ -299,6 +303,43 @@ def _lcs_len(a: str, b: str) -> int:
     return best
 
 
+def _lcs_subseq_len(a: str, b: str) -> int:
+    """最长公共子序列长度（允许跨越插入，DP O(n·m)）
+
+    与连续子串 _lcs_len 的区别: 允许中间插入/替换字符仍算匹配，
+    可捕获同事件报道中"存储ETF" vs "内存ETF"这类单字差异
+    （连续子串 LCS 会因单字不同被拆断，_is_same_event 兜底失效实证）。
+    """
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return 0
+    prev = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur = [0] * (m + 1)
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+            else:
+                cur[j] = cur[j - 1] if cur[j - 1] >= prev[j] else prev[j]
+        prev = cur
+    return prev[m]
+
+
+# 标题方向线索词（LCS 兜底合并的方向对立守卫）
+_TITLE_BULLISH_HINTS = ["涨", "升", "利好", "增持", "预增", "突破", "涨停", "上涨", "飙升", "反弹", "回升", "创新高"]
+_TITLE_BEARISH_HINTS = ["跌", "降", "利空", "减持", "预减", "跌停", "下跌", "暴跌", "走低", "重挫", "回落", "跳水"]
+
+
+def _title_direction_conflict(ta: str, tb: str) -> bool:
+    """两条归一化标题方向是否对立（防止"集体收涨 vs 集体收跌"被 LCS 误合并漏推）"""
+    bull_a = any(k in ta for k in _TITLE_BULLISH_HINTS)
+    bear_b = any(k in tb for k in _TITLE_BEARISH_HINTS)
+    bear_a = any(k in ta for k in _TITLE_BEARISH_HINTS)
+    bull_b = any(k in tb for k in _TITLE_BULLISH_HINTS)
+    return (bull_a and bear_b) or (bear_a and bull_b)
+
+
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
 
@@ -309,6 +350,10 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     3. 主体交集为空 但事件组交集非空 且 归一化标题最长公共子串≥5 →
        多源同事件报道（"恩智浦洽谈收购Ambarella" vs "安霸股价因传恩智浦洽谈收购而飙升"）
     4. 双方均无事件组（普通流水）且标题字符集 Jaccard≥0.6 → 同一条目的改写
+    5. 双方均无事件组 且 归一化标题 LCS 覆盖较短标题≥55% → 同事件
+       （板块/产业资讯兜底：存储ETF纳入、券商研报等 events/entities/numbers 全空，
+        Jaccard 因长标题被稀释到 0.4 拦不住，实证花旗研报×2、长鑫ETF×2 同轮双推）
+       —— LCS 兜底前先做方向对立守卫，防止涨/跌相反但句式相近的报道被误合并
     """
     ent_a = set(sig_a.get("stocks") or []) | set(sig_a.get("entities") or [])
     ent_b = set(sig_b.get("stocks") or []) | set(sig_b.get("entities") or [])
@@ -326,10 +371,24 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
         if _lcs_len(sig_a.get("title_norm", ""), sig_b.get("title_norm", "")) >= 5:
             return True
     if not ev_a and not ev_b:
-        ta = set(sig_a.get("title_norm", ""))
-        tb = set(sig_b.get("title_norm", ""))
-        if ta and tb and len(ta & tb) / len(ta | tb) >= 0.6:
-            return True
+        ta = str(sig_a.get("title_norm", "") or "")
+        tb = str(sig_b.get("title_norm", "") or "")
+        if ta and tb:
+            if _title_direction_conflict(ta, tb):
+                return False
+            jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
+            if jaccard >= 0.6:
+                return True
+            shorter = min(len(ta), len(tb))
+            if shorter >= 8:
+                # 连续子串兜底（比例足够高 → 同事件）
+                if _lcs_len(ta, tb) / shorter >= 0.55:
+                    return True
+                # 子序列兜底：允许单字替换（"存储ETF" vs "内存ETF"）
+                # 仅在匹配长度绝对充足且占比高时启用，避免日常流水误并
+                sub = _lcs_subseq_len(ta, tb)
+                if sub >= 12 and sub / shorter >= 0.6:
+                    return True
     return False
 
 
@@ -690,16 +749,40 @@ def _parse_llm_array(content: str) -> list:
     return items
 
 
+def _hang_judge(news: dict) -> dict:
+    """LLM 未判定的挂起状态：不推、不落指纹，留待下一轮重新送 LLM 判定。
+
+    2026-08-03 用户口径：删除规则降级路径，预筛通过的全部候选必须由 LLM
+    判定推/不推，Python 规则不得直接通关。judged=False 的条目在 run_once
+    中被跳过且不写入 seen 指纹，因此下轮会重新进入 LLM 判定。
+    """
+    return {
+        "title": str(news.get("title", "") or ""),
+        "push": False,
+        "judged": False,
+        "score": 0,
+        "direction": "neutral",
+        "scope": "stock",
+        "sectors": [],
+        "entities": [],
+        "is_leader_stock": False,
+        "reason": "LLM未判定，挂起下轮重试",
+    }
+
+
 def _llm_judge(items: list) -> list:
     """批量 LLM 判定，返回与 items 一一对应的判定 dict 列表
 
     对齐策略: 给每条注入 _judge_idx 并要求 LLM 回显 idx，按 idx 精确合并
     （标题匹配仅作兜底）。标题精确匹配不可靠——LLM 会改写/截断标题，
-    批处理管线实证 60 条仅 26 条标题精确命中，未对齐条目会被误判不推，
+    批处理管线实证 60 条仅 26 条标题精确命中，未对齐时会被误判不推，
     是漏推的主要根因。
 
-    批次异常: 逐条降级为规则判定 _fallback_decision（高信号词+高预筛分仍可推），
-    不再整批保守不推——重大消息宁可多推也不漏推。
+    规则直通限制（2026-08-03 用户口径）: 预筛通过的全部候选必须由 LLM
+    判定推/不推，Python 规则不得直接通关。因此 LLM 未回显 / 批次异常 /
+    无法解析的条目一律标记 judged=False 挂起（push=False, score=0），
+    由 run_once 跳过、不落指纹，留待下一轮重新送 LLM 判定。
+    已删除 _fallback_decision 规则直推路径。
     """
     if not items:
         return []
@@ -732,16 +815,17 @@ def _llm_judge(items: list) -> list:
                 e = by_idx.get(i) or by_title.get(t)
                 if not e:
                     # LLM 成功返回但未回显该条目（截断/遗漏/标题改写导致 idx 与标题均未对齐）。
-                    # 不能静默判 push=False——那会把本可推送的重大消息漏掉（漏推主要根因），
-                    # 与批次异常同样逐条走规则降级：高信号词+高预筛分仍可推。
-                    logger.warning(f"LLM 未回显条目 idx={i}，降级规则判定: {t[:40]}")
-                    results[i] = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+                    # 不静默判 push=False（避免把可推重大消息漏掉），也不规则直推——
+                    # 挂起留待下轮重新送 LLM 判定。
+                    logger.warning(f"LLM 未回显条目 idx={i}，挂起下轮重试: {t[:40]}")
+                    results[i] = _hang_judge(n)
                     continue
                 results[i] = {
                     "title": t,
                     "push": bool(e.get("push", False)),
+                    "judged": True,
                     "score": e.get("score", 0),
-                    "direction": str(e.get("direction", "neutral") or "neutral").lower(),
+                    "direction": _normalize_direction(e.get("direction", "neutral"), n),
                     "scope": str(e.get("scope", "stock") or "stock").lower(),
                     "sectors": e.get("sectors") or [],
                     "entities": [str(x).strip() for x in (e.get("entities") or []) if str(x).strip()],
@@ -750,15 +834,14 @@ def _llm_judge(items: list) -> list:
                 }
             logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成（回显{len(entries)}条）")
         except Exception as e:
-            logger.warning(f"LLM 判定批次失败（{len(batch)} 条），逐条降级为规则判定: {e}")
+            logger.warning(f"LLM 判定批次失败（{len(batch)} 条），整批挂起下轮重试: {e}")
             for offset, n in enumerate(batch):
-                results[start + offset] = _fallback_decision(
-                    n, n.get("_pref_score", 0), n.get("_hit_signal", False))
-    # 防御：任何未填充位置走规则降级
+                results[start + offset] = _hang_judge(n)
+    # 防御：任何未填充位置挂起（不落指纹，下轮重试）
     for i, r in enumerate(results):
         if r is None:
             n = items[i]
-            results[i] = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+            results[i] = _hang_judge(n)
     return results
 
 
@@ -791,51 +874,59 @@ def _hit_watchlist(news: dict, watchlist: set) -> bool:
     return False
 
 
-def _fallback_decision(news: dict, pref_score: float, hit_signal: bool) -> dict:
-    """LLM 整体失败时的降级判定：预筛分高 + 命中高信号词 → 直接推
+def _normalize_direction(value, news: dict = None) -> str:
+    """归一化 LLM 返回的方向值到 6 档标准值
 
-    原则: 重大消息宁可多推也不漏推；日常流水宁可漏推也不滥推。
+    问题: LLM 输出不稳定，direction 可能返回非标准值（"bullish "带空格、
+    中文"看涨"、"强利好"、乱码等），直接进 _passes_threshold 会丢失
+    bullish/bearish 强档位 → 板块/个股资讯被误降级为"不推"（用户反馈：
+    利好利空被降级、判断不准）。
+    本函数: 标准值直通；常见别名归一；无法识别时用规则方向兜底
+    predict_direction_by_rules（词表更全）而非一律 neutral。
+
+    2026-08-03 修复（用户反馈"利空显示利好"）:
+    - 混合方向检测优先：含"涨"又含"跌/回落"（先涨后跌/涨后回落/冲高回落/
+      利好兑现后回落等）→ 判 mixed，不再因"涨/升"别名先于"跌/降"命中而误判 bullish。
+    - 别名子串匹配改为按 key 长度降序（长别名优先），避免"弱利好"被"利好"抢先。
     """
-    title = str(news.get("title", ""))
-    text = f"{title} {news.get('content', '')}"
-    if hit_signal and pref_score >= FALLBACK_PUSH_SCORE_MIN:
-        # 方向三态判断（不再二值化：无多空信号的中性流水不应被标为强利空）
-        if any(k in text for k in ["利好", "上涨", "支持", "放宽", "增持", "降准", "降息", "减税", "预增", "回购", "中标", "涨停", "签约", "订单", "合同"]):
-            direction = "bullish"
-        elif any(k in text for k in ["利空", "下跌", "暴跌", "制裁", "退市", "立案", "爆雷", "违约", "处罚", "跌停", "减持", "预减", "亏损"]):
-            direction = "bearish"
-        else:
-            direction = "neutral"
-        # scope 按文本语义判定，不硬编码 market（普通公司事件不应因降级获得 market 必推特权）
-        if any(k in text for k in ["央行", "国务院", "证监会", "国常会", "政治局", "美联储", "财政部",
-                                   "降准", "降息", "加息", "印花税", "关税", "制裁", "战争", "熔断",
-                                   "大盘", "A股", "纳指", "美股"]):
-            scope = "market"
-        elif any(k in text for k in ["半导体", "芯片", "AI", "算力", "光伏", "新能源", "机器人",
-                                     "光模块", "CPO", "PCB", "消费电子", "医药", "白酒", "板块"]):
-            scope = "sector"
-        else:
-            scope = "stock"
-        return {
-            "title": title,
-            "push": True,
-            "score": round(pref_score * 10, 1),
-            "direction": direction,
-            "scope": scope,
-            "sectors": [],
-            "is_leader_stock": False,
-            "reason": "高信号词+高预筛分（LLM降级判定）",
-        }
-    return {
-        "title": title,
-        "push": False,
-        "score": round(pref_score * 10, 1),
-        "direction": "neutral",
-        "scope": "stock",
-        "sectors": [],
-        "is_leader_stock": False,
-        "reason": "LLM降级：未达直接推送标准",
+    if value is None:
+        value = ""
+    raw = str(value).strip().lower()
+    if raw in ("bullish", "mildly_bullish", "bearish", "mildly_bearish", "neutral", "mixed"):
+        return raw
+    # 混合方向检测：同一字符串中既有多头又有多空信号 → mixed
+    _BULL_MARKERS = ("涨", "升", "利好", "看多", "看涨", "偏多", "走强", "上行")
+    _BEAR_MARKERS = ("跌", "降", "利空", "看空", "看跌", "偏空", "走弱", "回落", "下行")
+    if any(k in raw for k in _BULL_MARKERS) and any(k in raw for k in _BEAR_MARKERS):
+        return "mixed"
+    alias_map = {
+        "看涨": "bullish", "看多": "bullish", "利多": "bullish", "利好": "bullish",
+        "强利好": "bullish", "偏多": "bullish", "强势": "bullish", "positive": "bullish",
+        "涨": "bullish", "升": "bullish",
+        "看跌": "bearish", "看空": "bearish", "利淡": "bearish", "利空": "bearish",
+        "强利空": "bearish", "偏空": "bearish", "弱势": "bearish", "negative": "bearish",
+        "跌": "bearish", "降": "bearish",
+        "弱利好": "mildly_bullish", "小幅利好": "mildly_bullish",
+        "弱利空": "mildly_bearish", "小幅利空": "mildly_bearish",
+        "多空交织": "mixed", "中性": "neutral", "无影响": "neutral",
+        "中性偏多": "mildly_bullish", "中性偏空": "mildly_bearish",
     }
+    if raw in alias_map:
+        return alias_map[raw]
+    # 别名内嵌（如 "Mildly Bullish"、"偏多中性"）：按关键词子串匹配，
+    # key 按长度降序——长别名（弱利好/中性偏多）优先于单字（利好/涨/跌）
+    for key, mapped in sorted(alias_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if key and key in raw:
+            return mapped
+    if raw.startswith("mildly"):
+        return raw if raw in ("mildly_bullish", "mildly_bearish") else "neutral"
+    # 无法识别：用规则方向兜底（比一律 neutral 更准）
+    if news is not None:
+        rule_dir = predict_direction_by_rules(
+            str(news.get("title", "") or ""), str(news.get("content", "") or ""))
+        if rule_dir in ("bullish", "bearish"):
+            return rule_dir
+    return "neutral"
 
 
 # ============================================================
@@ -1001,11 +1092,11 @@ def run_once(dry_run: bool = False) -> dict:
             save_state(state)
         return {"fetched": len(news_list), "new": len(new_items), "prefiltered": 0, "pushed": 0, "skipped": len(new_items)}
 
-    # 4. LLM 严格判定
+    # 4. LLM 严格判定（全部候选必须经 LLM 判定，无规则降级路径）
     judges = _llm_judge(candidates)
     if not judges:
-        # LLM 完全失败 → 降级规则判定
-        judges = [_fallback_decision(n, n["_pref_score"], n["_hit_signal"]) for n in candidates]
+        # 防御：_llm_judge 异常返回空 → 全部挂起下轮重试（不推、不落指纹）
+        judges = [_hang_judge(n) for n in candidates]
 
     # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
     leader_watchlist = _load_leader_watchlist()
@@ -1019,7 +1110,7 @@ def run_once(dry_run: bool = False) -> dict:
     groups = []
     for n, j in zip(candidates, judges):
         if not isinstance(j, dict):
-            j = _fallback_decision(n, n.get("_pref_score", 0), n.get("_hit_signal", False))
+            j = _hang_judge(n)
         sig = _push_event_sig(n, j)
         n["_sig"] = sig
         for g in groups:
@@ -1048,9 +1139,15 @@ def run_once(dry_run: bool = False) -> dict:
                                   "title": str(n.get("title", ""))[:52] + "[同事件合并]"}
                 skipped += 1
 
-    # 5c. 逐代表：阈值过滤 → 跨轮同事件拦截 → 推送
+    # 5c. 逐代表：LLM未判定挂起 → 阈值过滤 → 跨轮同事件拦截 → 推送
     pushed_events = state.setdefault("pushed_events", [])
     for n, j in reps:
+        if not j.get("judged", True):
+            # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
+            # 未判定条目不推、不落指纹 → 下轮重新送 LLM 判定（避免规则误判方向）。
+            logger.info(f"LLM 未判定，挂起下轮重试: {n.get('title', '')[:40]}")
+            skipped += 1
+            continue
         # 判定顺序：
         # 1) LLM 明确判定不重大（push=false）→ 默认一票否决
         # 2) 例外放行：科技板块级资讯/科技龙头个股（_is_domestic_tech 规则兜底，

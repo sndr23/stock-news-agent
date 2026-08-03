@@ -634,9 +634,73 @@ NATIONAL_POLICY_KEYWORDS = [
 ]
 
 
+# ============================================================
+# 规则方向判定词表（2026-08-03 结构化 + 扩充）
+# 使用约定：标题优先命中即定方向；正文仅在标题无信号时扫描首句。
+# 注意：与 HIGH_SIGNAL_KEYWORDS（路由/预筛语义）不同，本词表仅用于方向兜底，
+#       "回购/增持"裸词不纳入利多（避免中小市值个股自身消息被规则直通）。
+# ============================================================
+STRONG_BULLISH_KEYWORDS = [
+    # 摘帽/扭亏
+    "撤销退市", "撤销*ST", "撤销ST", "撤销风险警示", "申请撤销", "摘帽",
+    "扭亏为盈", "业绩扭亏", "扭亏",
+    # 业绩
+    "业绩预增", "业绩超预期", "大幅预增", "大幅增长", "业绩大增",
+    # 回购/增持
+    "股份回购", "大额回购", "回购股份", "股东增持", "董监高增持", "管理层增持",
+    # 订单
+    "中标", "签约", "大额订单", "重大合同",
+    # 政策
+    "降准", "降息", "减税降费", "减税", "政策利好", "产业扶持", "财政补贴",
+    # 资本运作
+    "并购重组", "重大资产重组", "借壳上市",
+    # 价格上涨类（LLM截断兜底 + 2026-08-03 扩充：涨超/普涨/走高/上行/回升/涨价/上调目标价）
+    "大涨", "暴涨", "飙升", "涨停", "涨幅显著", "涨幅扩大", "涨超", "普涨",
+    "价格大涨", "价格暴涨", "价格飙升", "走高", "上行", "回升", "涨价",
+    "上调目标价", "上调", "逆势上涨", "涨逾",
+]
+
+STRONG_BEARISH_KEYWORDS = [
+    # 监管/违法
+    "立案调查", "重大违法", "破产重整", "破产清算", "被接管",
+    "监管处罚", "行政处罚", "警示函", "监管措施", "监管问责",
+    # 业绩暴雷
+    "业绩暴雷", "巨额亏损", "债务违约", "重大违约", "业绩预减", "业绩盈转亏",
+    "首亏", "亏损扩大", "负增长",
+    # 退市
+    "退市", "终止上市", "实施退市风险", "*ST",
+    # 减持
+    "股东减持", "董监高减持", "大股东减持", "减持",
+    # 价格下跌类（2026-08-03 扩充：跌超/走弱/走低/低开低走/回调/下滑/下跌/重创/监管问责/熔断）
+    "跌停", "大跌", "暴跌", "跳水", "重挫", "重创", "跌超", "走弱", "走低",
+    "低开低走", "回调", "下滑", "下跌", "跌逾", "熔断", "逆势下跌", "下调",
+    "价格大跌", "价格暴跌", "价格跳水", "产品降价", "下调目标价",
+    # 其他利空
+    "跑路", "爆雷", "行业利空",
+    # 外部制裁
+    "出口管制", "制裁", "禁运", "断供", "贸易摩擦",
+]
+
+# 反向修正前缀：前缀后 12 字内出现利空词 → 判利好（放宽出口管制）；
+# 出现利好词 → 判利空（取消增持/终止回购）。
+_REVERSE_PREFIXES = ["放宽", "放松", "解除", "取消", "移除", "结束", "终止", "停止"]
+
+
 def predict_direction_by_rules(title: str, content: str) -> str:
-    """通过规则快速兜底判定多空方向"""
-    text = f"{title} {content}"
+    """通过规则快速兜底判定多空方向（2026-08-03 重写：标题优先 + 事件句对齐）
+
+    修复记录（用户反馈"跳过LLM的资讯利空显示利好"）:
+    1. 标题优先：方向只由标题强关键词决定——标题是事件本身。
+    2. 正文仅在标题无信号时扫描"首句"（主表述），不再全文扫描——
+       避免正文中其他板块/个股的上涨词（"仅XX逆势大涨""XX涨停"）
+       把利空事件整体翻成利好。
+    3. 反向修正：放宽/放松/解除/取消/移除/结束/终止/停止 等前缀 + 12字内
+       利空词 → 判利好（如"马来西亚考虑放宽稀土出口管制"）；前缀 + 利好词 → 判利空。
+    4. 词表扩充：补 跌超/走弱/走低/低开低走/回调/下滑/下跌/重创/监管问责/熔断
+       等常见利空词；涨超/普涨/走高/上行/回升/涨价 等利多词。
+    """
+    title_text = str(title or "")
+    content_text = str(content or "")
 
     # 否定词表（扩展）：覆盖单字否定、双字否定及隐含否定动词
     # 奇数个否定 = 取反；偶数个 = 双重否定表肯定（如"未能否认"=承认）
@@ -647,7 +711,7 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         "失败", "拒绝", "否认", "否定", "驳回", "推翻",
     ]
 
-    def _count_negations_before(kw: str, window: int = 8) -> int:
+    def _count_negations_before(text: str, kw: str, window: int = 8) -> int:
         """统计关键词前 window 字符窗口内的否定词数量
 
         双重否定处理：奇数个否定词 → 取反；偶数个 → 互相抵消（表肯定）。
@@ -658,6 +722,7 @@ def predict_direction_by_rules(title: str, content: str) -> str:
         避免"未"与"未能"、"不"与"不再"等包含关系导致同一否定被重复计数。
 
         Args:
+            text: 待扫描文本（标题 或 正文首句）
             kw: 目标关键词
             window: 关键词向前扫描的字符窗口大小
 
@@ -685,44 +750,46 @@ def predict_direction_by_rules(title: str, content: str) -> str:
             idx = text.find(kw, idx + 1)
         return count
 
-    def _has_negation(kw: str) -> bool:
+    def _has_negation(text: str, kw: str) -> bool:
         """关键词前窗口内否定词数量为奇数则视为否定（双重否定抵消）"""
-        return _count_negations_before(kw) % 2 == 1
+        return _count_negations_before(text, kw) % 2 == 1
 
-    strong_bullish = [
-        "撤销退市", "撤销*ST", "撤销ST", "撤销风险警示", "申请撤销", "摘帽",
-        "扭亏为盈", "业绩扭亏", "扭亏",
-        "业绩预增", "业绩超预期", "大幅预增", "大幅增长", "业绩大增",
-        "股份回购", "大额回购", "回购股份", "股东增持", "董监高增持", "管理层增持",
-        "中标", "签约", "大额订单", "重大合同",
-        "降准", "降息", "减税降费", "减税", "政策利好", "产业扶持", "财政补贴",
-        "并购重组", "重大资产重组", "借壳上市",
-        # 价格上涨类（LLM截断兜底: "存储芯片价格涨幅显著"等需正确判方向）
-        "大涨", "暴涨", "飙升", "涨停", "涨幅显著", "涨幅扩大",
-        "价格大涨", "价格暴涨", "价格飙升",
-    ]
-    for kw in strong_bullish:
-        if kw in text and not _has_negation(kw):
-            return "bullish"
+    def _scan(text: str) -> str:
+        """单段文本方向：强利多词 → 强利空词（均需未否定）"""
+        if not text:
+            return "neutral"
+        for kw in STRONG_BULLISH_KEYWORDS:
+            if kw in text and not _has_negation(text, kw):
+                return "bullish"
+        for kw in STRONG_BEARISH_KEYWORDS:
+            if kw in text and not _has_negation(text, kw):
+                return "bearish"
+        return "neutral"
 
-    strong_bearish = [
-        "立案调查", "重大违法", "破产重整", "破产清算", "被接管",
-        "业绩暴雷", "巨额亏损", "债务违约", "重大违约",
-        "监管处罚", "行政处罚", "警示函", "监管措施",
-        "退市", "终止上市", "实施退市风险", "*ST",
-        "股东减持", "董监高减持", "大股东减持", "减持",
-        "跌停", "跑路", "爆雷", "产品降价", "行业利空",
-        "业绩预减", "业绩盈转亏", "首亏",
-        "出口管制", "制裁", "禁运", "断供", "贸易摩擦",
-        # 价格下跌类（LLM截断兜底: 对称补充）
-        "大跌", "暴跌", "跳水", "重挫",
-        "价格大跌", "价格暴跌", "价格跳水",
-    ]
-    for kw in strong_bearish:
-        if kw in text and not _has_negation(kw):
-            return "bearish"
+    # ① 反向修正（双向）：放宽/解除/取消 + 12字内利空词 → 利好；+ 利好词 → 利空
+    # 反向检测额外纳入裸词 增持/回购/并购/重组/中标/签约（"取消增持""终止回购"是利空）
+    full = f"{title_text} {content_text}"
+    _REV_BULLISH = STRONG_BULLISH_KEYWORDS + ["增持", "回购", "并购", "重组", "中标", "签约"]
+    for prefix in _REVERSE_PREFIXES:
+        idx = full.find(prefix)
+        if idx < 0:
+            continue
+        window = full[idx: idx + len(prefix) + 12]
+        for kw in STRONG_BEARISH_KEYWORDS:
+            if kw in window:
+                return "bullish"
+        for kw in _REV_BULLISH:
+            if kw in window:
+                return "bearish"
 
-    return "neutral"
+    # ② 标题优先（主信号）
+    d = _scan(title_text)
+    if d != "neutral":
+        return d
+
+    # ③ 正文首句兜底（主表述；不扫描全文，避免"仅XX逆势大涨"等非事件句污染方向）
+    first_sentence = re.split(r"[。；;！!？?]", content_text, maxsplit=1)[0]
+    return _scan(first_sentence)
 
 
 SECTOR_NAME_MAP = {
