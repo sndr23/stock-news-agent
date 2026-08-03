@@ -340,6 +340,38 @@ def _title_direction_conflict(ta: str, tb: str) -> bool:
     return (bull_a and bear_b) or (bear_a and bull_b)
 
 
+# 市场开收盘/复盘类快讯识别（2026-08-03 21:32 美股开盘三源三推实证）
+# 该类快讯来自多源（东财/新浪/富途/华尔街）标题措辞差异大、无事件组/实体/金额，
+# Jaccard(0.14~0.41) 与 LCS 兜不住 → 按"同时段组 + 同市场域"合并。
+_SESSION_GROUPS = {
+    "open": ["开盘", "早盘", "盘前"],
+    "noon": ["午评", "午盘"],
+    "close": ["收盘", "尾盘", "盘后"],
+}
+_MARKET_DOMAIN_MARKERS = {
+    "us": ["美股", "道指", "纳指", "标普", "谷歌", "苹果", "特斯拉", "英伟达"],
+    "a": ["A股", "沪指", "深成指", "创业板", "科创50", "沪深"],
+    "kr": ["韩股", "韩国综指", "科斯达克"],
+    "jp": ["日经", "日股"],
+    "hk": ["恒指", "港股"],
+    "eu": ["欧股", "欧洲股市"],
+}
+
+
+def _session_group(ta: str, tb: str) -> str | None:
+    """两条标题是否属于同一市场时段组（开盘组/午评组/收盘组），返回组名或 None"""
+    ga = next((g for g, kws in _SESSION_GROUPS.items() if any(k in ta for k in kws)), None)
+    gb = next((g for g, kws in _SESSION_GROUPS.items() if any(k in tb for k in kws)), None)
+    return ga if (ga is not None and ga == gb) else None
+
+
+def _market_domain_overlap(ta: str, tb: str) -> bool:
+    """两条标题的市场域（美股/A股/韩股/日股/港股/欧股）是否有交集"""
+    da = {d for d, kws in _MARKET_DOMAIN_MARKERS.items() if any(k in ta for k in kws)}
+    db = {d for d, kws in _MARKET_DOMAIN_MARKERS.items() if any(k in tb for k in kws)}
+    return bool(da & db)
+
+
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
 
@@ -354,6 +386,10 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
        （板块/产业资讯兜底：存储ETF纳入、券商研报等 events/entities/numbers 全空，
         Jaccard 因长标题被稀释到 0.4 拦不住，实证花旗研报×2、长鑫ETF×2 同轮双推）
        —— LCS 兜底前先做方向对立守卫，防止涨/跌相反但句式相近的报道被误合并
+    6. 双方均无事件组 且 同市场时段域（美股开盘/午评/收盘类多源快讯）→ 同事件
+       （2026-08-03 21:32 美股开盘三源三推实证：标题措辞差异大，
+        "美股开盘三大股指齐涨" vs "道指开盘涨0.52%" 仅共享'开盘'，
+        Jaccard/LCS 均兜不住；按 同时段组 + 同市场域 + 方向不冲突 合并）
     """
     ent_a = set(sig_a.get("stocks") or []) | set(sig_a.get("entities") or [])
     ent_b = set(sig_b.get("stocks") or []) | set(sig_b.get("entities") or [])
@@ -376,6 +412,9 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
         if ta and tb:
             if _title_direction_conflict(ta, tb):
                 return False
+            # 市场开收盘/复盘类快讯：同时段组 + 同市场域 → 同事件（多源措辞差异大）
+            if _session_group(ta, tb) is not None and _market_domain_overlap(ta, tb):
+                return True
             jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
             if jaccard >= 0.6:
                 return True

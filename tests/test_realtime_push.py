@@ -131,6 +131,50 @@ class TestIsSameEvent:
         assert m["title_norm"] == "更长的标题"
 
 
+class TestSameEventMarketSession:
+    """市场开收盘/复盘类多源快讯同事件合并（2026-08-03 21:32 美股开盘三源三推实证修复）
+
+    该类快讯无事件组/实体/金额，标题措辞差异大（Jaccard 0.14~0.41、LCS 兜不住），
+    按"同时段组 + 同市场域 + 方向不冲突"合并。
+    """
+
+    def _sig(self, title):
+        return rtp._push_event_sig({"title": title, "content": ""}, {})
+
+    def test_us_open_three_sources_merged(self):
+        """实证三对：美股开盘齐涨多源报道 → 两两同事件（不再三推）"""
+        a = self._sig("【美股开盘：三大股指齐涨】道指涨1.08%，标普500指数涨0.7%")
+        b = self._sig("美股开盘：美股三大指数集体高开")
+        c = self._sig("道指开盘涨0.52%，纳指涨0.31%，标普500涨0.2%。明星科技股谷歌-A涨2%")
+        assert rtp._is_same_event(a, b)
+        assert rtp._is_same_event(a, c)
+        assert rtp._is_same_event(b, c)
+
+    def test_cross_market_not_merged(self):
+        """跨市场（A股午评 vs 美股开盘）→ 不同事件"""
+        a = self._sig("A股午评：科创50指数低开低走跌3.73%，算力硬件股集体回调")
+        b = self._sig("美股开盘：美股三大指数集体高开")
+        assert not rtp._is_same_event(a, b)
+
+    def test_cross_session_not_merged(self):
+        """跨时段（A股午评 vs A股收盘）→ 不同事件（防 48h 拦截误杀收盘）"""
+        a = self._sig("A股午评：科创50指数低开低走跌3.73%")
+        b = self._sig("A股收盘：科创50指数跌3.2%，两市成交缩量")
+        assert not rtp._is_same_event(a, b)
+
+    def test_opposite_direction_not_merged(self):
+        """同市场同时段但方向对立（齐涨 vs 齐跌）→ 不同事件（方向守卫）"""
+        a = self._sig("美股开盘：三大股指齐涨，道指涨1%")
+        b = self._sig("美股开盘：三大股指齐跌，道指跌1%")
+        assert not rtp._is_same_event(a, b)
+
+    def test_domestic_open_different_days_not_affected(self):
+        """韩股/日股同域不误并：韩股收盘 vs 韩股开盘 跨时段 → 不同事件"""
+        a = self._sig("韩国综指开盘涨0.5%")
+        b = self._sig("韩国综指收盘跌超5%")
+        assert not rtp._is_same_event(a, b)
+
+
 # ============================================================
 # Gist 状态合并（读-改-写防并发覆盖）
 # ============================================================
