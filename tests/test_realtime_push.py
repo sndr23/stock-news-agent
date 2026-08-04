@@ -175,6 +175,44 @@ class TestSameEventMarketSession:
         assert not rtp._is_same_event(a, b)
 
 
+class TestSameEventIntraday:
+    """盘中行情动态（涨超/现报/涨幅扩大）同事件合并（2026-08-04 00:32 纳指三推实证修复）
+
+    无时段词（开盘/午评/收盘），Jaccard 0.20~0.33、LCS 占比 0.25~0.46 均兜不住，
+    按"同市场域 + 共享市场指数词 + 方向不冲突"合并。
+    """
+
+    def _sig(self, title):
+        return rtp._push_event_sig({"title": title, "content": ""}, {})
+
+    def test_nasdaq_rally_three_sources_merged(self):
+        """实证三对：纳指大涨多源报道 → 两两同事件（不再三推）"""
+        a = self._sig("美股涨幅扩大 纳指涨超2%")
+        b = self._sig("纳指涨200点 现报25882.567点 道指涨101点")
+        c = self._sig("纳指涨超2% Meta涨超6%")
+        assert rtp._is_same_event(a, b)
+        assert rtp._is_same_event(a, c)
+        assert rtp._is_same_event(b, c)
+
+    def test_different_index_not_merged(self):
+        """不同市场指数（沪指 vs 纳指）→ 不同事件（无共享指数词）"""
+        a = self._sig("沪指涨1%，两市成交放量")
+        b = self._sig("纳指涨超2%，科技股领涨")
+        assert not rtp._is_same_event(a, b)
+
+    def test_intraday_opposite_direction_not_merged(self):
+        """盘中同指数方向对立（纳指涨 vs 纳指跌）→ 不同事件（方向守卫）"""
+        a = self._sig("纳指涨超2%，科技股普涨")
+        b = self._sig("纳指跌超2%，科技股重挫")
+        assert not rtp._is_same_event(a, b)
+
+    def test_earnings_forecast_signal_not_merged_with_market_move(self):
+        """业绩预告信号 vs 指数行情 → 不同事件（信号类有事件组，不进入普通新闻分支）"""
+        a = self._sig("纳指涨超2%")
+        b = self._sig("业绩预告: 中微公司(688012) 预增 幅度2966.0%")
+        assert not rtp._is_same_event(a, b)
+
+
 # ============================================================
 # Gist 状态合并（读-改-写防并发覆盖）
 # ============================================================
@@ -670,6 +708,22 @@ class TestRunOnce:
         assert all(not r.get("pushed") for r in saved["seen"].values()), \
             "推送失败不得标记 pushed=True（需下轮重试）"
         assert saved["pushed_events"] == saved["pushed_events"]  # 不新增已推事件
+
+    def test_only_strong_direction_pushed(self, monkeypatch, tmp_path):
+        """2026-08-04 用户口径：仅强利好/强利空推送；弱档/中性/混合不推"""
+        self._setup(monkeypatch, tmp_path, {"code": 200, "msg": "ok"})
+        # 覆盖 LLM 判定为弱档（push=True 但 direction=mildly_bullish）→ 必须不推
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items: [{
+            "push": True, "score": 9, "direction": "mildly_bullish", "scope": "market",
+            "sectors": [], "entities": ["央行"], "is_leader_stock": False,
+            "reason": "弱档"} for _ in items])
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 0, "弱档方向不得推送"
+        assert TestRunOnce._SENT == [], "弱档方向不得发送"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        # 已判定的弱档条目应记录指纹（pushed=False），避免下轮重复送 LLM
+        assert all(not r.get("pushed") for r in saved["seen"].values())
+        assert saved["seen"], "弱档已判定条目应落指纹（pushed=False）"
 
 
 # ============================================================

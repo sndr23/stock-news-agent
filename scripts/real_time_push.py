@@ -356,6 +356,11 @@ _MARKET_DOMAIN_MARKERS = {
     "hk": ["恒指", "港股"],
     "eu": ["欧股", "欧洲股市"],
 }
+# 市场指数/基准词（盘中行情动态同事件判定用，2026-08-04 00:32 纳指三推实证）
+_INDEX_TOKENS = [
+    "纳指", "道指", "标普", "恒指", "日经", "韩指", "韩国综指", "科斯达克",
+    "沪指", "深成指", "创业板指", "科创50", "上证", "沪深300", "富时100",
+]
 
 
 def _session_group(ta: str, tb: str) -> str | None:
@@ -370,6 +375,18 @@ def _market_domain_overlap(ta: str, tb: str) -> bool:
     da = {d for d, kws in _MARKET_DOMAIN_MARKERS.items() if any(k in ta for k in kws)}
     db = {d for d, kws in _MARKET_DOMAIN_MARKERS.items() if any(k in tb for k in kws)}
     return bool(da & db)
+
+
+def _shared_index_token(ta: str, tb: str) -> bool:
+    """两条标题是否共享同一市场指数词（纳指/道指/标普/沪指等）"""
+    return any(k in ta and k in tb for k in _INDEX_TOKENS)
+
+
+def _session_conflict(ta: str, tb: str) -> bool:
+    """两条标题是否属于冲突的市场时段（如 午评 vs 收盘）——有时段词且组不同"""
+    ga = next((g for g, kws in _SESSION_GROUPS.items() if any(k in ta for k in kws)), None)
+    gb = next((g for g, kws in _SESSION_GROUPS.items() if any(k in tb for k in kws)), None)
+    return ga is not None and gb is not None and ga != gb
 
 
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
@@ -390,6 +407,10 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
        （2026-08-03 21:32 美股开盘三源三推实证：标题措辞差异大，
         "美股开盘三大股指齐涨" vs "道指开盘涨0.52%" 仅共享'开盘'，
         Jaccard/LCS 均兜不住；按 同时段组 + 同市场域 + 方向不冲突 合并）
+    7. 双方均无事件组 且 同市场域 + 共享市场指数词（盘中行情动态）→ 同事件
+       （2026-08-04 00:32 纳指三推实证：美股涨幅扩大纳指涨超2 / 纳指涨200现报… /
+        纳指涨超2 Meta涨超6 无时段词，Jaccard 0.20~0.33、LCS 占比 0.25~0.46，
+        但均含"纳指"且方向一致）
     """
     ent_a = set(sig_a.get("stocks") or []) | set(sig_a.get("entities") or [])
     ent_b = set(sig_b.get("stocks") or []) | set(sig_b.get("entities") or [])
@@ -414,6 +435,11 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
                 return False
             # 市场开收盘/复盘类快讯：同时段组 + 同市场域 → 同事件（多源措辞差异大）
             if _session_group(ta, tb) is not None and _market_domain_overlap(ta, tb):
+                return True
+            # 盘中行情动态（涨超/现报/涨幅扩大等）：同市场域 + 共享市场指数词
+            # + 时段不冲突（防 午评 vs 收盘 因共享指数词误并）→ 同事件
+            if (not _session_conflict(ta, tb) and _market_domain_overlap(ta, tb)
+                    and _shared_index_token(ta, tb)):
                 return True
             jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
             if jaccard >= 0.6:
@@ -1178,13 +1204,21 @@ def run_once(dry_run: bool = False) -> dict:
                                   "title": str(n.get("title", ""))[:52] + "[同事件合并]"}
                 skipped += 1
 
-    # 5c. 逐代表：LLM未判定挂起 → 阈值过滤 → 跨轮同事件拦截 → 推送
+    # 5c. 逐代表：LLM未判定挂起 → 强档方向门槛 → 阈值过滤 → 跨轮同事件拦截 → 推送
     pushed_events = state.setdefault("pushed_events", [])
     for n, j in reps:
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
             # 未判定条目不推、不落指纹 → 下轮重新送 LLM 判定（避免规则误判方向）。
             logger.info(f"LLM 未判定，挂起下轮重试: {n.get('title', '')[:40]}")
+            skipped += 1
+            continue
+        # 2026-08-04 用户口径：仅强利好/强利空（bullish/bearish）推送；
+        # 弱档/中性/混合（mildly_bullish/mildly_bearish/neutral/mixed）一律不推，
+        # 覆盖 market/sector/stock、外围科技必推、科技防漏推等全部路径。
+        if j.get("direction") not in ("bullish", "bearish"):
+            logger.info(f"非强档方向({j.get('direction')})，不推: {n.get('title', '')[:40]}")
+            seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
             continue
         # 判定顺序：
