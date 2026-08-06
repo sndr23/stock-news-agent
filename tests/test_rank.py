@@ -553,6 +553,7 @@ class TestSafeParseJsonAdjustments:
 from src.agent.nodes import _safe_parse_json
 
 
+
 class TestSafeParseJsonRanking:
     """rerank 返回的 ranking 结构在非完美 JSON 时也必须被解析（否则智能重排静默失效）"""
 
@@ -586,3 +587,4 @@ class TestSafeParseJsonRanking:
         parsed = _safe_parse_json(content)
         assert len(parsed.get("filtered_news", [])) == 1
 
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

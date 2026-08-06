@@ -1,10 +1,12 @@
 # filepath: tests/test_macro_cluster.py
+import pytest
 """测试宏观/板块级主题簇限流（第八轮残余问题修复）
 
 同一主体（机构/国家/商品/地缘事件）的近重复报道应限流，
 避免霸占头部、稀释 A 股实质利好。仅作用于 market/sector 级。
 """
 from src.tools.calculators import (
+
     dedup_macro_clusters, dedup_and_cap_for_display, _macro_cluster_key,
 )
 
@@ -92,3 +94,5 @@ class TestDedupAndCapIntegration:
         after_cluster = dedup_macro_clusters(after_event, 2)
         assert len(after_cluster) == 3
         assert all("基准推演" not in n["title"] for n in after_cluster)
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

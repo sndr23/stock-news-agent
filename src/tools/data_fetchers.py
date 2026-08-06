@@ -9,6 +9,7 @@ import json
 import socket
 import logging
 import hashlib
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -489,6 +490,158 @@ def _fetch_wallstreetcn_news():
     return []
 
 
+def _fetch_jin10_news():
+    """金十数据全球快讯 (直接API, 免费, 国内可直连)
+
+    金十数据快讯流: 国际宏观/外汇/大宗商品/美股/A股公告, 中文快讯风格
+    (路透社快讯的中文替代), 无分页参数, 固定返回最近20条。
+    channel=-8200 为全部频道; content 含 HTML 需清洗。
+    source 字段通常为空, 用 "金十数据" 兜底标记。
+    """
+    import re as _re
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.jin10.com/",
+        "x-app-id": "bVBF4FyRTn5NJF5n",
+        "x-version": "1.0.0",
+        "x-token": "",
+    }
+    url = "https://flash-api.jin10.com/get_flash_list"
+    _JIN10_TIMEOUT = (3, 5)  # connect 3s + read 5s, 最坏 3+5+2+3+5=18s < per_source_timeout=30s
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params={"channel": "-8200"}, headers=headers, timeout=_JIN10_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            items = payload.get("data", [])
+            # 防御 data 为 {"data": [...]} 的结构变化
+            if isinstance(items, dict):
+                items = items.get("data", []) or []
+            if not items:
+                logger.warning("金十数据: API返回空 items")
+                return []
+
+            news = []
+            for item in items:
+                inner = item.get("data", {}) or {}
+                content = _re.sub(r'<[^>]+>', '', str(inner.get("content", ""))).strip()
+                if not content:
+                    continue
+                # 标题: 优先 title 字段, 没有则取 content 前40字
+                title = str(inner.get("title", "")).strip()
+                if not title:
+                    title = content[:40] + ("..." if len(content) > 40 else "")
+                pub_time = str(item.get("time", "")).strip()
+                if not _in_news_window(pub_time, look_back_days=1):
+                    continue
+                source = str(inner.get("source", "")).strip() or "金十数据"
+                news.append({
+                    "title": title,
+                    "source": source,
+                    "content": content,
+                    "published_at": pub_time,
+                    "category": "news",
+                    "sentiment": "neutral",
+                })
+
+            logger.info(f"金十数据: 原始{len(items)}条, 当日{len(news)}条"
+                        + (f" (第{attempt+1}次尝试成功)" if attempt > 0 else ""))
+            return news
+        except Exception as e:
+            if attempt < max_retries:
+                import time as _time
+                _time.sleep(2)
+                logger.warning(f"金十数据第{attempt+1}次请求失败: {e}, 2s后重试...")
+            else:
+                logger.warning(f"金十数据获取失败(已重试{max_retries}次): {e}")
+    return []
+
+
+# Google News RSS 查询词（国际宏观/大宗商品/权威通讯社覆盖，when:1d 限定当日）
+GOOGLE_NEWS_QUERIES = [
+    "global economy when:1d",
+    "Federal Reserve when:1d",
+    "crude oil when:1d",
+    "gold price when:1d",
+    "china economy when:1d",
+]
+# 单次拉取上限：防止国际快讯淹没 A 股主体资讯
+GOOGLE_NEWS_MAX_ITEMS = 30
+
+
+def _fetch_google_news():
+    """Google News RSS (免费/无需Key, 可按来源识别路透社等国际通讯社)
+
+    搜索 feed 返回每条报道的 <source> 发布源（Reuters/Bloomberg/AP 等），
+    正好覆盖用户所需的"路透社级国际资讯"。链接为 Google 重定向地址，
+    仅用于溯源展示，不做二次解析（保持轻量）。
+
+    已知限制: news.google.com 在大陆网络直连不可达，需代理
+    （HTTP_PROXY/HTTPS_PROXY 环境变量）；不可达/失败时返回空列表，
+    由 _parallel_fetch 失败隔离，不影响其他数据源。
+    """
+    import urllib.parse as _urlparse
+    import xml.etree.ElementTree as _ET
+    from email.utils import parsedate_to_datetime as _parse_rfc822
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    news = []
+    for q in GOOGLE_NEWS_QUERIES:
+        params = _urlparse.urlencode({"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        url = f"https://news.google.com/rss/search?{params}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=(3, 5))
+            resp.raise_for_status()
+            root = _ET.fromstring(resp.content)
+        except Exception as e:
+            logger.warning(f"Google News 查询失败({q}): {e}")
+            continue
+
+        for item in root.iter("item"):
+            def _txt(tag: str) -> str:
+                el = item.find(tag)
+                return el.text.strip() if el is not None and el.text else ""
+
+            title = _txt("title")
+            if not title:
+                continue
+            source_el = item.find("source")
+            source = source_el.text.strip() if source_el is not None and source_el.text else ""
+            # 标题常以 " - Source" 结尾，去除后缀保留纯标题
+            if source and title.endswith(f" - {source}"):
+                title = title[: -(len(source) + 3)]
+            # RFC822 (GMT) -> BJT
+            pub_raw = _txt("pubDate")
+            try:
+                pub_time = _parse_rfc822(pub_raw).astimezone(BJT).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pub_time = ""
+            if not _in_news_window(pub_time, look_back_days=1):
+                continue
+
+            news.append({
+                "title": title,
+                "source": source or "Google News",
+                "content": _txt("description"),
+                "published_at": pub_time,
+                "url": _txt("link"),
+                "category": "news",
+                "sentiment": "neutral",
+            })
+
+    # 按时间倒序 + 上限截断
+    if news:
+        news.sort(key=lambda n: n.get("published_at", ""), reverse=True)
+        news = news[:GOOGLE_NEWS_MAX_ITEMS]
+    logger.info(f"Google News: 查询{len(GOOGLE_NEWS_QUERIES)}组, 当日{len(news)}条")
+    return news
+
+
 def _fetch_announcements():
     """交易所公告 (stock_notice_report)
 
@@ -772,16 +925,61 @@ def _parallel_fetch(tasks: dict, per_source_timeout: int = 30, total_timeout: in
 # ============================================================
 
 _hs300_singleton: dict | None = None
+# 沪深300成分股文件缓存（2026-08-06 新增）：GitHub Actions 每轮新进程，
+# 进程内单例无法跨轮复用，每轮都重拉 akshare(8~12s)。成分股准静态(季度调整)，
+# 落地到 logs/hs300_cache.json 并设 48h TTL，跨轮复用省时 + 降限流风险。
+_HS300_CACHE_PATH = Path(__file__).parent.parent.parent / "logs" / "hs300_cache.json"
+_HS300_CACHE_TTL_HOURS = 48
+
+
+def _hs300_load_cache() -> dict | None:
+    """读取本地缓存（未过期且结构合法才返回）"""
+    try:
+        if not _HS300_CACHE_PATH.exists():
+            return None
+        data = json.loads(_HS300_CACHE_PATH.read_text(encoding="utf-8"))
+        mtime = data.get("_mtime", 0)
+        if (time.time() - mtime) > _HS300_CACHE_TTL_HOURS * 3600:
+            return None
+        if not isinstance(data.get("codes"), list) or not isinstance(data.get("names"), list):
+            return None
+        return {"codes": set(data["codes"]), "names": set(data["names"])}
+    except Exception as e:
+        logger.warning(f"沪深300缓存读取失败: {e}")
+        return None
+
+
+def _hs300_save_cache(codes: set, names: set) -> None:
+    """写本地缓存（含时间戳）"""
+    try:
+        _HS300_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HS300_CACHE_PATH.write_text(
+            json.dumps({"codes": sorted(codes), "names": sorted(names),
+                        "_mtime": time.time()}, ensure_ascii=False),
+            encoding="utf-8")
+        logger.info(f"沪深300成分股已写入缓存: {_HS300_CACHE_PATH.name}")
+    except Exception as e:
+        logger.warning(f"沪深300缓存写入失败: {e}")
 
 
 def get_hs300_constituents() -> dict:
     """获取沪深300成分股（代码集合 + 名称集合）。
 
-    进程内单例：沪深300成分股准静态（季度调整），同进程内只请求一次 akshare，
-    后续调用直接复用。失败时返回空集合，调用方应据此跳过降权（保守不降权）。
+    三级缓存（2026-08-06 增强）：
+      1. 进程内单例（_hs300_singleton）——同进程多节点调用零成本
+      2. 本地文件缓存（logs/hs300_cache.json，48h TTL）——跨 GitHub Actions 轮次复用
+      3. akshare 实时拉取——首次/缓存过期时
+    失败时返回空集合，调用方应据此跳过降权（保守不降权）。
     """
     global _hs300_singleton
     if _hs300_singleton is not None:
+        return _hs300_singleton
+
+    # 2. 本地文件缓存兜底（避免每轮重拉 akshare 8~12s）
+    cached = _hs300_load_cache()
+    if cached is not None:
+        _hs300_singleton = cached
+        logger.info(f"沪深300成分股: 命中本地缓存, {len(cached['codes'])}只")
         return _hs300_singleton
 
     try:
@@ -796,6 +994,7 @@ def get_hs300_constituents() -> dict:
         names_col = "成分券名称" if "成分券名称" in df.columns else None
         names = set(str(n).strip() for n in df[names_col].dropna().tolist() if str(n).strip()) if names_col else set()
         _hs300_singleton = {"codes": codes, "names": names}
+        _hs300_save_cache(codes, names)  # 写缓存供后续轮次复用
         logger.info(f"沪深300成分股: 获取成功, {len(codes)}只")
         return _hs300_singleton
     except Exception as e:
@@ -823,6 +1022,8 @@ def get_stock_news(data_mode: str = "live") -> list:
         _fetch_ths_news: "同花顺快讯",
         _fetch_futu_news: "富途全球快讯",
         _fetch_wallstreetcn_news: "华尔街见闻",
+        _fetch_jin10_news: "金十数据",
+        _fetch_google_news: "Google News",
     })
 
     all_news = []

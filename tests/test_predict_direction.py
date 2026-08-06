@@ -4,6 +4,7 @@ import pytest
 from src.tools.calculators import predict_direction_by_rules
 
 
+
 class TestPredictDirection:
     def test_bullish_keywords(self):
         assert predict_direction_by_rules("业绩预增100%", "") == "bullish"
@@ -91,3 +92,5 @@ class TestDirectionFix20260803:
         title = "晚间公告速览"
         content = "多家公司业绩预增超100%，机构看好后续走势。其中某公司签署重大合同。"
         assert predict_direction_by_rules(title, content) == "bullish"
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

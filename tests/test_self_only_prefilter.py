@@ -13,6 +13,7 @@ from unittest.mock import patch
 from src.tools.calculators import _is_self_only_individual_stock
 from src.agent.nodes import _python_prefilter
 
+
 _EMPTY_HS300 = {"codes": set(), "names": set()}
 
 
@@ -84,3 +85,5 @@ class TestPrefilterSelfOnlyIntegration:
         ]
         kept, removed = _python_prefilter(news, top_n=40)
         assert len(kept) == 0, "10 条全为仅影响自身的非龙头个股，应全部剔除"
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

@@ -12,7 +12,15 @@
   外围科技增强识别使用 OVERSEAS_TECH_KEYWORDS
 - 规则打分 (calculators.py)：继续保留 TECH_HARDWARE_KEYWORDS（硬件词表，打分专用，
   与路由/外围判定语义不同，不合并）
+
+英文缩写词边界（2026-08-06 修复，P2）：
+- HIGH_SIGNAL_KEYWORDS 中的 ST/*ST/IPO 此前在 nodes.py 与 real_time_push.py 均以
+  裸子串匹配，"STorage/STMicroelectronics" 会误命中 ST → 预筛直通误判 + 指纹
+  sig 路径合并导致漏推。
+- 现提供 signal_kw_pattern / has_signal_keyword / find_signal_keywords 共享实现，
+  两管线统一调用，杜绝再次漂移。
 """
+import re
 
 # ============================================================
 # 重磅信号关键词（两条管线共用）
@@ -60,5 +68,58 @@ OVERSEAS_TECH_KEYWORDS = [
     "存储", "晶圆", "先进封装", "GPU", "PCB", "MLCC",
 ]
 
-# 外围资讯源标记（富途全球 + 华尔街见闻）
-OVERSEAS_SOURCE_MARKERS = ["富途", "华尔街"]
+# 外围资讯源标记（富途全球 + 华尔街见闻 + 金十数据）
+OVERSEAS_SOURCE_MARKERS = ["富途", "华尔街", "金十"]
+
+
+# ============================================================
+# 英文缩写词边界匹配（2026-08-06 新增，两管线共享）
+# 背景：HIGH_SIGNAL_KEYWORDS 中的 ST/*ST/IPO 是英文缩写，裸子串匹配会误命中
+# "STorage"/"STMicroelectronics"（实测 'STMicroelectronics 财报' 误命中 ST），
+# 导致预筛直通误判 + _news_fingerprint 的 sig 路径指纹合并 → 漏推。
+# AMD/CPO 等科技缩写已在 calculators._TECH_ENGLISH_WORDS 有词边界，
+# 此处统一为 HIGH_SIGNAL_KEYWORDS 提供相同保护。
+# ============================================================
+
+# 需要词边界的英文缩写信号词（词表内全部英文缩写，自动从 HIGH_SIGNAL_KEYWORDS 提取）
+_HIGH_SIGNAL_ENGLISH = {
+    kw for kw in HIGH_SIGNAL_KEYWORDS
+    if re.fullmatch(r"[A-Za-z*]+", kw or "")
+}
+
+# 预编译：kw → 词边界正则（编译后的 Pattern）
+# 英文缩写加词边界（前后不能紧跟字母/数字），防 STorage/nAMD 误命中；
+# 中文词保持子串匹配。*ST 的 * 是正则元字符，re.escape 处理。
+_SIGNAL_KW_PATTERNS = {
+    kw: re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])" if kw in _HIGH_SIGNAL_ENGLISH else re.escape(kw)
+    )
+    for kw in HIGH_SIGNAL_KEYWORDS
+}
+# 合并成单条预编译正则（一次扫描全部关键词，替代逐词 in 遍历）
+SIGNAL_KEYWORD_PATTERN = re.compile("|".join(p.pattern for p in _SIGNAL_KW_PATTERNS.values()))
+
+
+def signal_kw_pattern(kw: str) -> str:
+    """信号关键词 → 正则片段：英文缩写加词边界（供外部扩展合并用，如 nodes 合并科技硬件词）"""
+    if kw in _HIGH_SIGNAL_ENGLISH:
+        return rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])"
+    return re.escape(kw)
+
+
+def has_signal_keyword(text: str) -> bool:
+    """检测文本是否命中任一高信号关键词（英文缩写词边界感知）"""
+    if not text:
+        return False
+    return bool(SIGNAL_KEYWORD_PATTERN.search(text))
+
+
+def find_signal_keywords(text: str) -> list:
+    """返回文本命中的高信号关键词列表（英文缩写词边界感知）
+
+    与 has_signal_keyword 的区别：返回具体命中的词（用于事件指纹 sig 路径）。
+    用逐词正则 search 替代裸子串 in（ST/IPO 不再误命中 STorage）。
+    """
+    if not text:
+        return []
+    return [kw for kw in HIGH_SIGNAL_KEYWORDS if _SIGNAL_KW_PATTERNS[kw].search(text)]

@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem, NewsAnalysisBatch
 
 
+
 def test_impact_band_values():
     assert ImpactBand.BULLISH.value == "bullish"
     assert ImpactBand.MIXED.value == "mixed"
@@ -61,3 +62,5 @@ def test_news_analysis_batch():
     batch = NewsAnalysisBatch(filtered_news=[item], removed_count=2, analysis_summary="摘要")
     assert len(batch.filtered_news) == 1
     assert batch.removed_count == 2
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

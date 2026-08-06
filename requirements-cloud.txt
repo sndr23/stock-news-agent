@@ -10,3 +10,5 @@ akshare~=1.18.0
 requests~=2.32.0
 pandas~=2.3.0
 chinese_calendar>=1.9.0,<2.0.0
+# 测试门禁依赖（2026-08-06 新增：CI 跑 -m unit 单元测试）
+pytest>=8.0.0

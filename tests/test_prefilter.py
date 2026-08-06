@@ -1,6 +1,8 @@
 # filepath: tests/test_prefilter.py
+import pytest
 """测试预筛权重表 score_news_relevance"""
 from src.tools.calculators import (
+
     score_news_relevance, _is_official_source,
     _COMPANY_EVENT_TERMS, _SECTOR_NEWS_TERMS, _MACRO_NEWS_TERMS,
 )
@@ -68,3 +70,5 @@ class TestIsOfficialSource:
 
     def test_empty(self):
         assert _is_official_source(url="", source="") is False
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

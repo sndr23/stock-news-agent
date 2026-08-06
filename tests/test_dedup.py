@@ -1,4 +1,5 @@
 # filepath: tests/test_dedup.py
+import pytest
 """测试去重工具：URL 规范化、SimHash、日期窗口"""
 from datetime import datetime, timedelta
 from src.tools.data_fetchers import (
@@ -260,6 +261,7 @@ class TestDedupCoreNumber:
 from src.tools.calculators import cap_announcements_per_stock, dedup_and_cap_for_display
 
 
+
 def _ann(title, stocks=None, name=None, score=0.5):
     return {"title": title, "category": "announcement",
             "affected_stocks": stocks or [], "name": name, "total_score": score}
@@ -326,3 +328,5 @@ class TestDedupAndCapForDisplay:
         out = dedup_and_cap_for_display(news)
         assert len(out) == 2
         assert "草案" in out[0]["title"]
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
