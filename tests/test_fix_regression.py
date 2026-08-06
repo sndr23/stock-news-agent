@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import patch
 from src.tools import data_fetchers
 from src.tools.calculators import (
+
     _has_tech_keyword, rank_news, CONFIDENCE_WEIGHT, SCOPE_SCORE_BOOST,
 )
 
@@ -109,3 +110,5 @@ class TestConfidenceAdjustment:
         lower = mk("医药常规获批", 5.0, "high")
         ranked = rank_news([lower, higher])
         assert ranked[0]["title"] == "半导体封装重大订单"
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

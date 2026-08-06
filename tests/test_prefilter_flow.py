@@ -5,6 +5,7 @@ from unittest.mock import patch
 from src.agent.nodes import _python_prefilter
 
 
+
 @pytest.fixture(autouse=True)
 def mock_hs300():
     """mock get_hs300_constituents 避免测试中发起网络请求"""
@@ -47,3 +48,5 @@ def test_cluster_weight_preserved():
     kept, removed = _python_prefilter(news, top_n=40)
     for n in kept:
         assert "cluster_weight" in n
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from src.tools.push import (
+
     format_ranked_news_md,
     push_via_wecom,
     push_news,
@@ -126,3 +127,5 @@ class TestTitleDedup:
         ]
         result = dedup_ranked_by_title(news)
         assert len(result) == 1
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

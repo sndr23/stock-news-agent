@@ -65,7 +65,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-cloud.txt
 
-      # 实时轮询每次运行都跑全量测试会浪费大量免费分钟额度，故省略
+      # 轻量测试门禁（2026-08-06 新增）：单元测试均为 mock 型，本地实测 294 项约 6s。
+      # 相比整个任务 1.5-2 分钟，测试耗时可忽略，但能拦截纯函数回归（依赖 ~= 升级/重构误伤）。
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      # 实时轮询每次运行都跑全量测试会浪费大量免费分钟额度，故仅跑 unit 子集
       - name: 执行实时推送
         run: python scripts/real_time_push.py
 

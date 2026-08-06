@@ -6,7 +6,8 @@
 
 数据源（多源聚合，不限于财联社）:
     - get_stock_news: 东财快讯 + 财联社电报 + 新浪财经 + 同花顺快讯
-                      + 富途全球快讯 + 华尔街见闻（6 源并行抓取 + 跨源去重）
+                      + 富途全球快讯 + 华尔街见闻 + 金十数据
+                      + Google News（8 源并行抓取 + 跨源去重）
     - get_market_signals: 龙虎榜机构动向 + 业绩预告（交易所官方信号）
     每 30 分钟（云端 GitHub Actions）/ 120 秒（本地 --loop）抓取一轮，
     增量检测（事件级指纹去重）→ 规则预筛 → LLM 严格判定 →
@@ -74,11 +75,14 @@ from src.tools.calculators import (
     predict_direction_by_rules,       # 规则方向兜底（词表全，含扭亏/退市/涨超/走弱等）
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
-from src.agent.nodes import _call_llm_api, _repair_json      # LLM 调用与 JSON 单对象修复
+# LLM 调用与 JSON 修复（2026-08-06 起从共享模块导入，不再依赖废弃的批处理管线 nodes.py）
+from src.llm_client import _call_llm_api, _repair_json
 from src.tools.keyword_tables import (                      # 共享关键词表（单一事实来源）
     HIGH_SIGNAL_KEYWORDS,
     OVERSEAS_TECH_KEYWORDS,
     OVERSEAS_SOURCE_MARKERS,
+    has_signal_keyword,        # 2026-08-06: 词边界感知的信号词匹配（ST/IPO 防误命中）
+    find_signal_keywords,      # 返回命中的信号词列表（事件指纹 sig 路径用）
 )
 
 # ============================================================
@@ -99,6 +103,16 @@ LLM_BATCH_SIZE = 8
 
 # 状态窗口：指纹保留时长（小时），滚动清理
 STATE_WINDOW_HOURS = 48
+
+# 候选溢出挂起重试上限（2026-08-06 新增）：同一指纹连续 N 轮溢出后放弃（写 seen），
+# 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
+MAX_PENDING_RETRY = 3
+
+# 心跳告警（2026-08-06 新增）：有新增资讯但连续 N 轮 0 推送时输出告警日志，
+# 帮助区分"确实没大事" vs "系统静默故障"
+HEARTBEAT_ZERO_PUSH_WARN_ROUNDS = 6
+# 进程内计数器（本地 --loop 常驻进程跨轮累计；云端单轮运行无影响）
+_zero_push_streak = [0]
 
 # Gist 内状态文件名
 GIST_STATE_FILENAME = "real_time_state.json"
@@ -230,7 +244,9 @@ def _news_fingerprint(news: dict) -> str:
         date = datetime.now(BJT).strftime("%Y-%m-%d")
     text = f"{news.get('title', '')} {news.get('content', '')}"
     stocks, events, numbers = _event_signature_light(news)
-    hit_signal = [kw for kw in HIGH_SIGNAL_KEYWORDS if kw in text]
+    # 2026-08-06 修复：find_signal_keywords 用词边界匹配英文缩写（ST/IPO），
+    # 防 "STorage" 误命中 ST 导致不同事件指纹合并（漏推）
+    hit_signal = find_signal_keywords(text)
     if hit_signal:
         # 命中高信号词（宏观/监管级）：以信号词+事件组+个股为指纹，不掺入数字——
         # 数字表达不稳定（"1700亿" vs "一千七百亿"），且同信号词下数字分叉
@@ -464,6 +480,11 @@ def _empty_state() -> dict:
     return {
         "version": 2,
         "seen": {},  # {fingerprint: {"t": "YYYY-MM-DD HH:MM:SS", "pushed": bool, "title": str}}
+        # 候选溢出挂起重试（2026-08-06 新增，防漏推）：
+        # 单轮候选超上限被溢出的条目不写 seen（否则 48h 内永久放弃 → 漏推），
+        # 而是记入 pending 并在下轮重新进入 LLM 判定。
+        # {fingerprint: {"t": str, "retry": int, "title": str}}
+        "pending": {},
         # 已推送事件签名（推送级同事件去重，48h 窗口）：
         # [{"t": str, "stocks": [], "entities": [], "events": [], "numbers": [], "title_norm": str}]
         "pushed_events": [],
@@ -561,8 +582,10 @@ def load_state() -> dict:
         try:
             state = _gist_load(gist_token, gist_id)
             state.setdefault("pushed_events", [])
+            state.setdefault("pending", {})
             logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹, "
-                        f"{len(state.get('pushed_events', []))} 个已推事件")
+                        f"{len(state.get('pushed_events', []))} 个已推事件"
+                        f", {len(state.get('pending', {}))} 个挂起重试")
             return state
         except Exception as e:
             logger.warning(f"Gist 读取失败: {e}")
@@ -578,7 +601,9 @@ def load_state() -> dict:
             if not isinstance(state, dict) or "seen" not in state:
                 state = _empty_state()
             state.setdefault("pushed_events", [])
-            logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹")
+            state.setdefault("pending", {})
+            logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹, "
+                        f"{len(state.get('pending', {}))} 个挂起重试")
             return state
         except Exception as e:
             logger.warning(f"本地状态解析失败，重置: {e}")
@@ -607,6 +632,16 @@ def _merge_state(local: dict, remote: dict) -> dict:
         if old is None or (rec.get("pushed") and not old.get("pushed")):
             merged_seen[fp] = rec
     local["seen"] = merged_seen
+
+    # 合并挂起重试（pending）：retry 计数取较大者（防并发覆盖丢计数）
+    merged_pending = dict(remote.get("pending", {}) or {})
+    for fp, rec in (local.get("pending", {}) or {}).items():
+        old = merged_pending.get(fp)
+        if old is None:
+            merged_pending[fp] = rec
+        else:
+            merged_pending[fp] = rec if int(rec.get("retry", 0)) >= int(old.get("retry", 0)) else old
+    local["pending"] = merged_pending
 
     merged_events = {_event_sig_key(e): e for e in (remote.get("pushed_events") or [])}
     for e in (local.get("pushed_events") or []):
@@ -641,6 +676,17 @@ def save_state(state: dict) -> None:
         logger.info(f"清理过期指纹 {len(expired)} 条，剩余 {len(seen)} 条")
     state["seen"] = seen
 
+    # 滚动清理过期挂起重试（48h 窗口）+ 上限 200 条防爆胀
+    pending = state.get("pending", {})
+    pend_expired = [fp for fp, rec in pending.items() if rec.get("t", "") < cutoff]
+    for fp in pend_expired:
+        pending.pop(fp, None)
+    if len(pending) > 200:
+        pending = dict(sorted(pending.items(), key=lambda kv: kv[1].get("t", ""))[-200:])
+    state["pending"] = pending
+    if pend_expired or len(pending) != len(state.get("pending", {})):
+        logger.info(f"清理过期挂起重试 {len(pend_expired)} 条，剩余 {len(pending)} 条")
+
     # 滚动清理过期已推事件签名（48h 窗口）+ 上限 300 条防爆胀
     pe = [e for e in (state.get("pushed_events") or []) if e.get("t", "") >= cutoff]
     if len(pe) > 300:
@@ -672,7 +718,9 @@ def _prefilter(news: dict) -> tuple:
     # （与 nodes._has_high_signal 的处理保持一致）
     if name:
         text = text.replace(name, "")
-    hit = any(kw in text for kw in HIGH_SIGNAL_KEYWORDS)
+    # 2026-08-06 修复：改用共享词边界匹配（has_signal_keyword），
+    # "STorage/STMicroelectronics" 不再误命中 "ST" 信号词
+    hit = has_signal_keyword(text)
     return float(score), hit
 
 
@@ -835,8 +883,16 @@ def _hang_judge(news: dict) -> dict:
     }
 
 
-def _llm_judge(items: list) -> list:
+def _llm_judge(items: list, deadline: float = 0) -> list:
     """批量 LLM 判定，返回与 items 一一对应的判定 dict 列表
+
+    Args:
+        items: 待判定候选
+        deadline: 总超时熔断时间戳(time.monotonic())，0=不限。
+                  2026-08-06 修复：此前调用 _call_llm_api 未传 deadline，
+                  多批(最多5批)×90s×2次重试最坏 900s，突破 GitHub Actions
+                  timeout-minutes:10 导致任务被强杀（已推送未保存状态→重复推送）。
+                  现在批次循环入口检查熔断，逼近 deadline 立即挂起剩余批次。
 
     对齐策略: 给每条注入 _judge_idx 并要求 LLM 回显 idx，按 idx 精确合并
     （标题匹配仅作兜底）。标题精确匹配不可靠——LLM 会改写/截断标题，
@@ -854,10 +910,19 @@ def _llm_judge(items: list) -> list:
     results = [None] * len(items)
     for start in range(0, len(items), LLM_BATCH_SIZE):
         batch = items[start:start + LLM_BATCH_SIZE]
+        # 总超时熔断：逼近 deadline 剩余批次全部挂起下轮重试（避免突破 Actions 10min 上限）
+        if deadline and time.monotonic() >= deadline:
+            logger.warning(f"LLM 判定逼近总超时熔断，批次 {start//LLM_BATCH_SIZE + 1} 起共 "
+                           f"{len(items) - start} 条挂起下轮重试")
+            for offset, n in enumerate(batch):
+                results[start + offset] = _hang_judge(n)
+            for remaining in range(start + LLM_BATCH_SIZE, len(items)):
+                results[remaining] = _hang_judge(items[remaining])
+            break
         for offset, n in enumerate(batch):
             n["_judge_idx"] = start + offset
         try:
-            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=90, max_retries=1)
+            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=90, max_retries=1, deadline=deadline)
             entries = _parse_llm_array(raw)
             # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
             by_idx = {}
@@ -1091,6 +1156,7 @@ def run_once(dry_run: bool = False) -> dict:
 
     state = load_state()
     seen = state.setdefault("seen", {})
+    pending = state.setdefault("pending", {})
 
     # 1. 多源聚合抓取：6 大新闻源 + 龙虎榜/业绩预告信号
     # 注意: get_stock_news/get_market_signals 是 LangChain @tool 包装的
@@ -1119,12 +1185,14 @@ def run_once(dry_run: bool = False) -> dict:
         return {"fetched": 0, "new": 0, "prefiltered": 0, "pushed": 0, "skipped": 0}
 
     # 2. 增量检测：事件级指纹去重，只处理未见过指纹的条目
+    # pending 中的溢出条目允许重新进入（防漏推：候选溢出不再永久 seen）
     new_items = []
     for n in news_list:
         fp = _news_fingerprint(n)
         if fp in seen:
             continue
         n["_fp"] = fp
+        n["_pend_retry"] = int((pending.get(fp) or {}).get("retry", 0))
         new_items.append(n)
     logger.info(f"增量检测: 新增 {len(new_items)} 条（已见 {len(news_list) - len(new_items)} 条）")
     if not new_items:
@@ -1140,25 +1208,48 @@ def run_once(dry_run: bool = False) -> dict:
         n["_hit_signal"] = hit
         if pref_score >= PREFILTER_SCORE_MIN or hit:
             candidates.append(n)
-    # 候选上限保护：突发大行情候选激增时，按预筛分排序取前 N 条，其余按未推记录
+    # 候选上限保护：突发大行情候选激增时，按预筛分排序取前 N 条
+    # 2026-08-06 修复（P1-2）：溢出条目不写 seen（此前被末尾循环永久 seen → 48h 漏推），
+    # 改为记入 pending 挂起，下轮重新进入增量检测与 LLM 判定。
+    # 保护：同一 fp 连续 MAX_PENDING_RETRY 轮仍溢出则放弃（写 seen），防无限重试。
     max_candidates = int(os.getenv("RT_MAX_CANDIDATES", str(MAX_CANDIDATES_PER_ROUND)))
+    overflow = []
     if len(candidates) > max_candidates:
         candidates.sort(key=lambda x: x["_pref_score"], reverse=True)
         overflow = candidates[max_candidates:]
         candidates = candidates[:max_candidates]
-        logger.info(f"候选超过上限({max_candidates})，丢弃低分候选 {len(overflow)} 条")
+        now_for_pend = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
+        for n in overflow:
+            retry = int(n.get("_pend_retry", 0)) + 1
+            if retry >= MAX_PENDING_RETRY:
+                # 连续多轮溢出：放弃该条目，记 seen 防无限重试
+                seen[n["_fp"]] = {"t": now_for_pend, "pushed": False,
+                                  "title": str(n.get("title", ""))[:60] + "[溢出放弃]"}
+                logger.info(f"候选溢出重试{retry}轮仍无法进入判定，放弃: {n.get('title', '')[:40]}")
+            else:
+                pending[n["_fp"]] = {"t": now_for_pend, "retry": retry,
+                                     "title": str(n.get("title", ""))[:60]}
+        logger.info(f"候选超过上限({max_candidates})，溢出 {len(overflow)} 条进入挂起重试")
+        overflow_fps = {n["_fp"] for n in overflow}
+    else:
+        overflow_fps = set()
     logger.info(f"规则预筛: 通过 {len(candidates)}/{len(new_items)} 条")
     if not candidates:
-        # 全部不达标：记录指纹，不推送
+        # 全部不达标：记录指纹，不推送（跳过 pending 溢出条目——它们下轮重试）
         now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
         for n in new_items:
+            if n["_fp"] in pending:
+                continue
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
         if not dry_run:
             save_state(state)
         return {"fetched": len(news_list), "new": len(new_items), "prefiltered": 0, "pushed": 0, "skipped": len(new_items)}
 
     # 4. LLM 严格判定（全部候选必须经 LLM 判定，无规则降级路径）
-    judges = _llm_judge(candidates)
+    # 总超时熔断（2026-08-06）：本轮 LLM 判定最多 300s，超过则剩余批次挂起下轮重试。
+    # 防止多批×重试叠加突破 GitHub Actions timeout-minutes:10（此前最坏 900s）。
+    _llm_deadline = time.monotonic() + 300
+    judges = _llm_judge(candidates, deadline=_llm_deadline)
     if not judges:
         # 防御：_llm_judge 异常返回空 → 全部挂起下轮重试（不推、不落指纹）
         judges = [_hang_judge(n) for n in candidates]
@@ -1294,11 +1385,20 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.error(f"推送失败（下轮重试）: {n.get('title', '')[:50]} | {result}")
                 skipped += 1
 
-    # 其余未进入候选的条目也记录指纹
+    # 其余未进入候选的条目也记录指纹（跳过溢出挂起的 pending 条目——它们下轮重试）
     cand_fps = {n["_fp"] for n in candidates}
     for n in new_items:
-        if n["_fp"] not in cand_fps and n["_fp"] not in seen:
+        if n["_fp"] not in cand_fps and n["_fp"] not in seen and n["_fp"] not in pending:
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
+
+    # pending 条目本轮已重新进入判定并落 seen（推/不推均已定论）→ 从 pending 移除，
+    # 避免陈旧挂起记录残留导致计数混乱（2026-08-06 P1-2）
+    for n in candidates:
+        if n["_fp"] in seen:
+            pending.pop(n["_fp"], None)
+    for fp in list(pending.keys()):
+        if fp in seen:
+            pending.pop(fp, None)
 
     if not dry_run:
         save_state(state)
@@ -1311,6 +1411,19 @@ def run_once(dry_run: bool = False) -> dict:
         "skipped": skipped,
     }
     logger.info(f"本轮完成: 拉取{stats['fetched']} 新增{stats['new']} 预筛{stats['prefiltered']} 推送{stats['pushed']} 未推{stats['skipped']}")
+
+    # 心跳告警（2026-08-06 新增）：有新增资讯但连续多轮 0 推送时，提示可能系统异常
+    # （正常行情下新资讯经 LLM 判定后通常有少量推送；长期 0 推送可能是 LLM 端点故障/
+    # 阈值过严/数据源异常，人工需确认而非静默接受）
+    if stats["new"] > 0 and stats["pushed"] == 0:
+        _zero_push_streak[0] += 1
+        if _zero_push_streak[0] >= HEARTBEAT_ZERO_PUSH_WARN_ROUNDS:
+            logger.warning(
+                f"[heartbeat] 已连续 {_zero_push_streak[0]} 轮有新增资讯但 0 推送！"
+                f"请检查 LLM 端点/推送后端/阈值配置（fetch={stats['fetched']}, "
+                f"new={stats['new']}, prefilter={stats['prefiltered']}）")
+    else:
+        _zero_push_streak[0] = 0  # 有推送或本轮无新增 → 重置计数
     return stats
 
 

@@ -46,3 +46,10 @@ Thumbs.db
 # 临时 / 上传
 .uploads/
 .agnes/work/
+
+# 每日复盘报告（生成物 + neodata 原始响应，不入库）
+daily-review/
+
+# neodata 临时查询产物（根目录调试残留）
+err_neodata_*.txt
+neodata_*.txt

@@ -21,6 +21,10 @@ from langchain_core.messages import AIMessage
 
 logger = logging.getLogger(__name__)
 
+# LLM 调用/JSON 修复已抽取至共享模块 src/llm_client.py（2026-08-06 架构解耦）：
+# 实时推送 production 入口 scripts/real_time_push.py 直接引用 src.llm_client，
+# 本模块保留 re-import 以兼容既有测试 patch 路径（src.agent.nodes._call_llm_api 等）。
+from src.llm_client import _call_llm_api, _repair_json, _safe_parse_json  # noqa: F401
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
 from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display, _has_tech_keyword, _TECH_ENGLISH_WORDS
@@ -29,79 +33,6 @@ from src.tools.data_fetchers import get_hs300_constituents
 from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
 from src.agent.state import AgentState, NO_DATA_SENTINEL
 from src.schemas import ImpactBand, NewsAnalysisItem
-
-
-def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2, deadline: float = 0) -> str:
-    """直接用 requests 调用 LLM API
-
-    关键: trust_env=False 禁止 requests 读取系统代理设置(Windows注册表/env vars),
-    避免代理服务未运行时导致 ProxyError/ConnectionRefused
-
-    Args:
-        system_prompt: 系统提示词
-        user_prompt: 用户提示词
-        timeout: 单次请求超时秒数
-        max_retries: 最大重试次数
-
-    Returns:
-        LLM 返回的文本内容
-    """
-    import requests
-
-    url = f"{OPENROUTER_BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    # OpenRouter 官方要求 HTTP-Referer 和 X-Title 请求头，否则返回 402
-    if IS_OPENROUTER_OFFICIAL:
-        headers["HTTP-Referer"] = "https://github.com/stock-news-agent"
-        headers["X-Title"] = "StockNewsAgent"
-    payload = {
-        "model": OPENROUTER_MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.1,  # 与方式A (LangChain) 保持一致，结构化输出场景降低温度
-        "max_tokens": 16384
-    }
-
-    last_error = None
-    for attempt in range(max_retries + 1):
-        # 总超时熔断：逼近 deadline 立即放弃重试并返回上层降级，
-        # 根治方式B/C 内部重试叠加（最多 4×120s=480s）突破 llm_filter 的 300s 总超时导致"一直超时"
-        if deadline and time.monotonic() >= deadline:
-            raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt} 次）")
-        session = requests.Session()
-        # 官方端点(OpenRouter)需科学上网保留代理；Agnes 等中转端点禁用代理避免 ConnectionRefused
-        session.trust_env = IS_OPENROUTER_OFFICIAL
-        try:
-            resp = session.post(url, json=payload, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            if content:  # 非空内容才返回
-                return content
-            else:
-                last_error = f"第{attempt+1}次返回空内容"
-                logger.warning(last_error)
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"第{attempt+1}次调用失败: {e}")
-        finally:
-            session.close()
-
-        if attempt < max_retries:
-            # 重试前再次确认未超 deadline（避免退避等待期间已超时仍继续重试）
-            if deadline and time.monotonic() >= deadline:
-                raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt + 1} 次）")
-            # 指数退避: 2s, 4s
-            wait_time = 2 ** (attempt + 1)
-            logger.info(f"等待 {wait_time}s 后重试（Agnes 端点）...")
-            time.sleep(wait_time)
-
-    raise Exception(f"LLM API 调用失败，已重试 {max_retries} 次: {last_error}")
 
 
 # ============================================================
@@ -529,253 +460,6 @@ market 级影响面最广，在影响强度相近时优先于 sector/stock 级�
 - analysis_chain 必须填写，记录5步推理过程
 - analysis_chain尽量简短（一行内完成），impact_reason不超过30字
 """
-
-
-def _repair_json(text: str) -> str:
-    """尝试修复LLM返回的JSON格式问题"""
-    # 替换中文引号
-    text = text.replace('\u201c', '"').replace('\u201d', '"')
-    text = text.replace('\u2018', "'").replace('\u2019', "'")
-    # 替换中文冒号
-    text = text.replace('\uff1a', ':')
-    # 替换中文逗号
-    text = text.replace('\uff0c', ',')
-    # 替换中文句号
-    text = text.replace('\u3002', '.')
-    # 替换中文顿号
-    text = text.replace('\u3001', ',')
-    # 替换不可见字符
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-    # 转义JSON字符串值内的换行符（Claude等模型常返回未转义的换行）
-    # 逐字符扫描：在双引号字符串内，把裸 \n \r \t 转义
-    result = []
-    in_string = False
-    escape = False
-    for ch in text:
-        if escape:
-            result.append(ch)
-            escape = False
-            continue
-        if ch == '\\':
-            result.append(ch)
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            result.append(ch)
-            continue
-        if in_string:
-            if ch == '\n':
-                result.append('\\n')
-            elif ch == '\r':
-                result.append('\\r')
-            elif ch == '\t':
-                result.append('\\t')
-            else:
-                result.append(ch)
-        else:
-            result.append(ch)
-    return ''.join(result)
-
-
-def _safe_parse_json(content: str) -> dict:
-    """安全解析LLM返回的JSON, 多重容错"""
-    if not content or not content.strip():
-        return {"filtered_news": [], "removed_count": 0}
-
-    # 预处理: 清理可能的乱码
-    import re
-    cleaned = content
-    cleaned = cleaned.replace('\u0000', '')  # 移除null字符
-    # 先提取代码块（避免代码块标记被破坏），处理 ```json / ``` 等变体
-    cb_match = re.search(r'```(?:json)?\s*\n?(.*?)```', cleaned, re.DOTALL)
-    if cb_match:
-        cleaned = cb_match.group(1)
-    elif "```" in cleaned:
-        parts = cleaned.split("```")
-        if len(parts) >= 3:
-            cleaned = parts[1]
-    # 先修复中文标点（中文引号/冒号/逗号等），再做不可见字符清理
-    cleaned = _repair_json(cleaned)
-    # 清理不可见字符，但保留中文引号/标点（已转换为ASCII）和中文汉字
-    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cleaned)
-
-    cleaned = cleaned.strip()
-
-    if not cleaned:
-        return {"filtered_news": [], "removed_count": 0}
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试提取 filtered_news 数组（re 已在模块顶部导入）
-    match = re.search(r'\{[^{}]*"(?:filtered_news|removed_count)"[^{}]*\}', cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    news_match = re.search(r'"filtered_news"\s*:\s*\[', cleaned)
-    if news_match:
-        start = news_match.end() - 1
-        depth = 0
-        for i in range(start, len(cleaned)):
-            if cleaned[i] == '[':
-                depth += 1
-            elif cleaned[i] == ']':
-                depth -= 1
-                if depth == 0:
-                    try:
-                        news_array = json.loads(cleaned[start:i+1])
-                        return {"filtered_news": news_array, "removed_count": 0}
-                    except json.JSONDecodeError:
-                        break
-
-    # 截断JSON修复：LLM输出被max_tokens截断时，JSON不完整
-    # 策略：逐字符扫描filtered_news数组，提取所有完整的{}对象
-    # 长度上限保护：max_tokens=16384 限制了输出长度，超过 200KB 的文本几乎不可能出现，
-    # 加上限防御恶意/异常输入导致逐字符扫描 O(n) 性能问题
-    recovered_items = []
-    fn_match = re.search(r'"filtered_news"\s*:\s*\[', cleaned)
-    if fn_match and len(cleaned) <= 200_000:
-        array_start = fn_match.end()  # 指向 [ 后第一个字符
-        i = array_start
-        obj_depth = 0
-        obj_start = -1
-        in_str = False
-        escape = False
-        while i < len(cleaned):
-            ch = cleaned[i]
-            if escape:
-                escape = False
-                i += 1
-                continue
-            if ch == '\\':
-                escape = True
-                i += 1
-                continue
-            if ch == '"':
-                in_str = not in_str
-            elif not in_str:
-                if ch == '{':
-                    if obj_depth == 0:
-                        obj_start = i
-                    obj_depth += 1
-                elif ch == '}':
-                    obj_depth -= 1
-                    if obj_depth == 0 and obj_start >= 0:
-                        obj_text = cleaned[obj_start:i+1]
-                        try:
-                            recovered_items.append(json.loads(obj_text))
-                        except json.JSONDecodeError:
-                            try:
-                                recovered_items.append(json.loads(_repair_json(obj_text)))
-                            except json.JSONDecodeError:
-                                pass
-                        obj_start = -1
-            i += 1
-    if recovered_items:
-        logger.info(f"截断JSON修复: 恢复了 {len(recovered_items)} 条完整记录")
-        return {"filtered_news": recovered_items, "removed_count": 0}
-
-    # ranking 结构兜底提取（rerank 输出：{"ranking": [...]}）
-    # 与 filtered_news 同理：非完美 JSON（尾部文本/未转义字符）导致首层 json.loads 失败时，
-    # 逐字符扫描 ranking 数组，恢复所有完整 {} 对象（实跑实证：rerank 返回因非完美 JSON 被静默丢弃，
-    # 导致"LLM 智能重排"从未生效）。
-    rk_match = re.search(r'"ranking"\s*:\s*\[', cleaned)
-    if rk_match and len(cleaned) <= 200_000:
-        array_start = rk_match.end()
-        recovered_ranking = []
-        i = array_start
-        obj_depth = 0
-        obj_start = -1
-        in_str = False
-        escape = False
-        while i < len(cleaned):
-            ch = cleaned[i]
-            if escape:
-                escape = False
-                i += 1
-                continue
-            if ch == '\\':
-                escape = True
-                i += 1
-                continue
-            if ch == '"':
-                in_str = not in_str
-            elif not in_str:
-                if ch == '{':
-                    if obj_depth == 0:
-                        obj_start = i
-                    obj_depth += 1
-                elif ch == '}':
-                    obj_depth -= 1
-                    if obj_depth == 0 and obj_start >= 0:
-                        obj_text = cleaned[obj_start:i+1]
-                        try:
-                            recovered_ranking.append(json.loads(obj_text))
-                        except json.JSONDecodeError:
-                            try:
-                                recovered_ranking.append(json.loads(_repair_json(obj_text)))
-                            except json.JSONDecodeError:
-                                pass
-                        obj_start = -1
-            i += 1
-        if recovered_ranking:
-            logger.info(f"截断JSON修复(ranking): 恢复了 {len(recovered_ranking)} 条重排记录")
-            return {"ranking": recovered_ranking, "filtered_news": []}
-
-    # adjustments 结构兜底提取（LLM调分输出：{"adjustments": [...]}）
-    # 与 filtered_news/ranking 同理：非完美 JSON 时逐字符扫描恢复完整 {} 对象
-    adj_match = re.search(r'"adjustments"\s*:\s*\[', cleaned)
-    if adj_match and len(cleaned) <= 200_000:
-        array_start = adj_match.end()
-        recovered_adjustments = []
-        i = array_start
-        obj_depth = 0
-        obj_start = -1
-        in_str = False
-        escape = False
-        while i < len(cleaned):
-            ch = cleaned[i]
-            if escape:
-                escape = False
-                i += 1
-                continue
-            if ch == '\\':
-                escape = True
-                i += 1
-                continue
-            if ch == '"':
-                in_str = not in_str
-            elif not in_str:
-                if ch == '{':
-                    if obj_depth == 0:
-                        obj_start = i
-                    obj_depth += 1
-                elif ch == '}':
-                    obj_depth -= 1
-                    if obj_depth == 0 and obj_start >= 0:
-                        obj_text = cleaned[obj_start:i+1]
-                        try:
-                            recovered_adjustments.append(json.loads(obj_text))
-                        except json.JSONDecodeError:
-                            try:
-                                recovered_adjustments.append(json.loads(_repair_json(obj_text)))
-                            except json.JSONDecodeError:
-                                pass
-                        obj_start = -1
-            i += 1
-        if recovered_adjustments:
-            logger.info(f"截断JSON修复(adjustments): 恢复了 {len(recovered_adjustments)} 条调分记录")
-            return {"adjustments": recovered_adjustments, "filtered_news": []}
-
-    # 最终降级: 返回空结果而不是抛出异常
-    logger.warning(f"JSON解析最终失败，降级返回空结果: {cleaned[:100]}...")
-    return {"filtered_news": [], "removed_count": 0}
 
 
 # ============================================================
@@ -1282,14 +966,20 @@ def prefilter_node(state: AgentState) -> dict:
 # 预编译信号关键词正则：合并 HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS，
 # 用 re.escape 转义 "*ST" 等含正则元字符的关键词，
 # 正则引擎一次扫描即可匹配全部关键词，替代逐词 `in` 遍历（O(n×kw_count) → O(n)）
+# 英文缩写词边界复用 keyword_tables.signal_kw_pattern（2026-08-06 共享，防 ST/IPO 误命中）
+from src.tools.keyword_tables import signal_kw_pattern as _shared_signal_kw_pattern
 _ALL_SIGNAL_KEYWORDS = HIGH_SIGNAL_KEYWORDS + TECH_HARDWARE_KEYWORDS
 
 
 def _signal_kw_pattern(kw: str) -> str:
-    """信号关键词 → 正则片段：英文缩写加词边界（nAMD 不触发 AMD 信号）"""
+    """信号关键词 → 正则片段：英文缩写加词边界（nAMD 不触发 AMD 信号）
+
+    科技硬件缩写(AMD/CPO 等)用 calculators._TECH_ENGLISH_WORDS 集合判定词边界；
+    高信号英文缩写(ST/IPO 等)复用 keyword_tables.signal_kw_pattern 共享实现。
+    """
     if kw in _TECH_ENGLISH_WORDS:
         return rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])"
-    return re.escape(kw)
+    return _shared_signal_kw_pattern(kw)
 
 
 _SIGNAL_PATTERN = re.compile("|".join(_signal_kw_pattern(kw) for kw in _ALL_SIGNAL_KEYWORDS))

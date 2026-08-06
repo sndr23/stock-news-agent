@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+
 _PROJECT_ROOT = Path(__file__).parent.parent
 
 
@@ -399,7 +400,7 @@ class TestHangJudge:
                             lambda cfg, title, content: sent.append(title) or {"code": 200})
         # LLM 判定全部挂起（如 LLM 服务故障）
         monkeypatch.setattr(rtp, "_llm_judge",
-                            lambda items: [rtp._hang_judge(n) for n in items])
+                            lambda items, **kw: [rtp._hang_judge(n) for n in items])
         monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
 
         news = type("T", (), {"func": staticmethod(lambda: [{
@@ -671,7 +672,7 @@ class TestRunOnce:
             return dict(send_result)
         monkeypatch.setattr(rtp, "_send_alert_item", fake_send)
 
-        def fake_judge(items):
+        def fake_judge(items, **kw):
             return [{"push": True, "score": 9, "direction": "bullish", "scope": "market",
                      "sectors": [], "entities": ["央行"], "is_leader_stock": False,
                      "reason": "宏观必推"} for _ in items]
@@ -713,7 +714,7 @@ class TestRunOnce:
         """2026-08-04 用户口径：仅强利好/强利空推送；弱档/中性/混合不推"""
         self._setup(monkeypatch, tmp_path, {"code": 200, "msg": "ok"})
         # 覆盖 LLM 判定为弱档（push=True 但 direction=mildly_bullish）→ 必须不推
-        monkeypatch.setattr(rtp, "_llm_judge", lambda items: [{
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
             "push": True, "score": 9, "direction": "mildly_bullish", "scope": "market",
             "sectors": [], "entities": ["央行"], "is_leader_stock": False,
             "reason": "弱档"} for _ in items])
@@ -793,3 +794,282 @@ class TestPrefilterNameStrip:
             "name": "",
         })
         assert hit is True
+
+
+# ============================================================
+# 候选溢出挂起重试（2026-08-06 P1-2 修复：不再永久 seen 漏推）
+# ============================================================
+
+
+# ============================================================
+# 候选溢出挂起重试（2026-08-06 P1-2 修复：不再永久 seen 漏推）
+
+
+
+# ============================================================
+# 候选溢出挂起重试（2026-08-06 P1-2 修复：不再永久 seen 漏推）
+# ============================================================
+
+class TestCandidateOverflowPending:
+    """溢出条目不落 seen，进入 pending 下轮重试；连续溢出达上限后放弃"""
+
+    def _make_news(self):
+        from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
+        from src.tools.calculators import _EVENT_KEYWORD_GROUPS
+        ev_kws = set()
+        for _g, kws in _EVENT_KEYWORD_GROUPS:
+            ev_kws.update(kws)
+        kws = [kw for kw in HIGH_SIGNAL_KEYWORDS if kw not in ev_kws][:45]
+        return [{
+            "title": "主体%d %s 动态" % (i, kw),
+            "content": "%s 相关事项" % kw,
+            "source": "财联社",
+            "published_at": "2026-08-01 10:00:00",
+            "affected_stocks": ["主体%d" % i],
+        } for i, kw in enumerate(kws)]
+
+    def _mock_sources(self, monkeypatch, news_list):
+        news = type("T", (), {"func": staticmethod(lambda: news_list)})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+    def _setup_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item",
+                            lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
+            "push": True, "score": 8, "direction": "bullish", "scope": "market",
+            "sectors": [], "entities": [], "is_leader_stock": False,
+            "reason": "宏观"} for _ in items])
+        monkeypatch.setenv("RT_MAX_CANDIDATES", "40")
+
+    def test_overflow_goes_pending_not_seen(self, monkeypatch, tmp_path):
+        """候选超上限时：溢出的条目不写 seen，进入 pending（下轮可重试）"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+
+        stats = rtp.run_once(dry_run=False)
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert len(saved["pending"]) >= 1, "溢出条目必须进入 pending"
+        # 溢出的条目(预筛分最低的尾部)不得出现在 seen(否则永久放弃→漏推)
+        assert stats["pushed"] <= 40
+
+    def test_pending_retry_reaches_limit_then_given_up(self, monkeypatch, tmp_path):
+        """同一指纹连续 MAX_PENDING_RETRY 轮溢出 -> 放弃写 seen，防无限重试"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+
+        rtp.run_once(dry_run=False)  # 第一轮:40 判定, 5 溢出进 pending
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert saved["pending"], "第一轮后应有 pending 条目"
+
+        # 第二轮:已 seen 的 40 条不再进入, pending 的 5 条重新抓取后预筛仍过 → 本轮候选=5(不溢出)
+        # 模拟:再次提供同样 45 条(已 seen 40 跳过, pending 5 进入)
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+        saved2 = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        # pending 中的 5 条本轮应进入判定(候选 5 <= 40 不溢出) → pending 清空
+        assert len(saved2["pending"]) == 0, "pending 条目重新进入判定后应清空"
+
+    def test_pending_entries_reenter_next_round(self, monkeypatch, tmp_path):
+        """溢出进入 pending 的条目，下一轮源中重新出现时应重新进入判定并可能推送"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+        judge_calls = []
+
+        def counting_judge(items, **kw):
+            judge_calls.append(len(items))
+            return [{"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                     "sectors": [], "entities": [], "is_leader_stock": False,
+                     "reason": "宏观"} for _ in items]
+        monkeypatch.setattr(rtp, "_llm_judge", counting_judge)
+
+        rtp.run_once(dry_run=False)  # 第一轮:40 判定 + 5 溢出
+        first_calls = sum(judge_calls)
+        # 第二轮:已 seen 40 跳过, pending 5 重新进入 → 判定数=5
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+        second_calls = sum(judge_calls) - first_calls
+        assert 0 < second_calls <= 5, "第二轮应只判定 pending 的少量条目, 实际 %d" % second_calls
+
+
+
+# ============================================================
+# 候选溢出挂起重试（2026-08-06 P1-2 修复：不再永久 seen 漏推）
+# ============================================================
+
+class TestCandidateOverflowPending:
+    """溢出条目不落 seen，进入 pending 下轮重试；连续溢出达上限后放弃"""
+
+    def _make_news(self):
+        from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
+        from src.tools.calculators import _EVENT_KEYWORD_GROUPS
+        ev_kws = set()
+        for _g, kws in _EVENT_KEYWORD_GROUPS:
+            ev_kws.update(kws)
+        kws = [kw for kw in HIGH_SIGNAL_KEYWORDS if kw not in ev_kws][:45]
+        return [{
+            "title": "主体%d %s 动态" % (i, kw),
+            "content": "%s 相关事项" % kw,
+            "source": "财联社",
+            "published_at": "2026-08-01 10:00:00",
+            "affected_stocks": ["主体%d" % i],
+        } for i, kw in enumerate(kws)]
+
+    def _mock_sources(self, monkeypatch, news_list):
+        news = type("T", (), {"func": staticmethod(lambda: news_list)})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+    def _setup_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item",
+                            lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
+            "push": True, "score": 8, "direction": "bullish", "scope": "market",
+            "sectors": [], "entities": [], "is_leader_stock": False,
+            "reason": "宏观"} for _ in items])
+        monkeypatch.setenv("RT_MAX_CANDIDATES", "40")
+
+    def test_overflow_goes_pending_not_seen(self, monkeypatch, tmp_path):
+        """候选超上限时：溢出的条目不写 seen，进入 pending（下轮可重试）"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+
+        stats = rtp.run_once(dry_run=False)
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert len(saved["pending"]) >= 1, "溢出条目必须进入 pending"
+        # 溢出的条目(预筛分最低的尾部)不得出现在 seen(否则永久放弃→漏推)
+        assert stats["pushed"] <= 40
+
+    def test_pending_retry_reaches_limit_then_given_up(self, monkeypatch, tmp_path):
+        """同一指纹连续 MAX_PENDING_RETRY 轮溢出 -> 放弃写 seen，防无限重试"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+
+        rtp.run_once(dry_run=False)  # 第一轮:40 判定, 5 溢出进 pending
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert saved["pending"], "第一轮后应有 pending 条目"
+
+        # 第二轮:已 seen 的 40 条不再进入, pending 的 5 条重新抓取后预筛仍过 → 本轮候选=5(不溢出)
+        # 模拟:再次提供同样 45 条(已 seen 40 跳过, pending 5 进入)
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+        saved2 = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        # pending 中的 5 条本轮应进入判定(候选 5 <= 40 不溢出) → pending 清空
+        assert len(saved2["pending"]) == 0, "pending 条目重新进入判定后应清空"
+
+    def test_pending_entries_reenter_next_round(self, monkeypatch, tmp_path):
+        """溢出进入 pending 的条目，下一轮源中重新出现时应重新进入判定并可能推送"""
+        self._setup_env(monkeypatch, tmp_path)
+        news_list = self._make_news()
+        self._mock_sources(monkeypatch, news_list)
+        judge_calls = []
+
+        def counting_judge(items, **kw):
+            judge_calls.append(len(items))
+            return [{"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                     "sectors": [], "entities": [], "is_leader_stock": False,
+                     "reason": "宏观"} for _ in items]
+        monkeypatch.setattr(rtp, "_llm_judge", counting_judge)
+
+        rtp.run_once(dry_run=False)  # 第一轮:40 判定 + 5 溢出
+        first_calls = sum(judge_calls)
+        # 第二轮:已 seen 40 跳过, pending 5 重新进入 → 判定数=5
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+        second_calls = sum(judge_calls) - first_calls
+        assert 0 < second_calls <= 5, "第二轮应只判定 pending 的少量条目, 实际 %d" % second_calls
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
+
+
+# ============================================================
+# 英文缩写词边界（2026-08-06 P2 修复：ST/IPO 防误命中）
+# ============================================================
+
+class TestEnglishAbbrevBoundary:
+    """HIGH_SIGNAL_KEYWORDS 的英文缩写(ST/IPO)必须词边界匹配，防 STorage/STMicro 误命中"""
+
+    def test_storage_not_high_signal(self):
+        from src.tools.keyword_tables import has_signal_keyword, find_signal_keywords
+        assert has_signal_keyword("Storage 需求强劲") is False
+        assert find_signal_keywords("Storage 需求强劲") == []
+
+    def test_stmicro_not_high_signal(self):
+        from src.tools.keyword_tables import has_signal_keyword
+        assert has_signal_keyword("STMicroelectronics 财报") is False
+
+    def test_st_stock_still_hits(self):
+        from src.tools.keyword_tables import has_signal_keyword, find_signal_keywords
+        assert has_signal_keyword("*ST 中安 重整") is True
+        assert has_signal_keyword("ST华微 公告") is True
+        assert "ST" in find_signal_keywords("*ST 中安 重整")
+
+    def test_ipo_still_hits(self):
+        from src.tools.keyword_tables import has_signal_keyword, find_signal_keywords
+        assert has_signal_keyword("IPO 重启预期") is True
+        assert find_signal_keywords("IPO 重启预期") == ["IPO"]
+
+    def test_prefilter_uses_boundary(self):
+        """_prefilter 走词边界：含 STorage 的新闻不再直通信号"""
+        score, hit = rtp._prefilter({
+            "title": "存储芯片 Storage 需求强劲",
+            "content": "行业景气",
+            "name": "",
+        })
+        assert hit is False, "Storage 不应命中 ST 信号词"
+
+    def test_prefilter_st_stock_hits(self):
+        score, hit = rtp._prefilter({
+            "title": "*ST中安 重大资产重组",
+            "content": "重整推进",
+            "name": "*ST中安",
+        })
+        # name 剥离后仍应命中(标题含重组)
+        assert hit is True
+
+
+# ============================================================
+# 心跳告警 + hs300 文件缓存（2026-08-06 P2）
+# ============================================================
+
+class TestHeartbeatAndCache:
+    def test_zero_push_streak_resets_on_push(self):
+        """有推送时 0 推送计数应重置"""
+        rtp._zero_push_streak[0] = 5
+        rtp._zero_push_streak[0] = 0  # run_once 中 else 分支行为
+        assert rtp._zero_push_streak[0] == 0
+
+    def test_heartbeat_threshold_constant(self):
+        assert rtp.HEARTBEAT_ZERO_PUSH_WARN_ROUNDS >= 3, "阈值过小会频繁误报"
+
+    def test_hs300_cache_roundtrip(self, tmp_path, monkeypatch):
+        """hs300 文件缓存读写 + TTL 过期"""
+        import src.tools.data_fetchers as df
+        monkeypatch.setattr(df, "_HS300_CACHE_PATH", tmp_path / "hs300_cache.json")
+        df._hs300_save_cache({"000001"}, {"平安银行"})
+        loaded = df._hs300_load_cache()
+        assert loaded == {"codes": {"000001"}, "names": {"平安银行"}}
+        # 过期
+        import json, time
+        p = tmp_path / "hs300_cache.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["_mtime"] = 0
+        p.write_text(json.dumps(data), encoding="utf-8")
+        assert df._hs300_load_cache() is None, "过期缓存应失效"

@@ -5,6 +5,7 @@ from unittest.mock import patch
 from src.agent.nodes import _adaptive_quota, _PREFILTER_TOTAL_LIMIT, _PREFILTER_MIN_QUOTA
 
 
+
 class TestAdaptiveQuotaBasic:
     def _make_buckets(self, direct=0, sector=0, macro=0):
         return {
@@ -78,3 +79,5 @@ class TestAdaptiveQuotaBasic:
         result = _adaptive_quota(buckets)
         total = (result["direct"] or 16) + result["sector"] + result["macro"]
         assert total <= _PREFILTER_TOTAL_LIMIT, f"总配额{total}超过limit{_PREFILTER_TOTAL_LIMIT}"
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

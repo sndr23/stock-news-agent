@@ -3,6 +3,7 @@
 import pytest
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem
 from src.agent.nodes import (
+
     _apply_guardrails, _band_to_direction,
     llm_filter_node, _has_explicit_neutral_marker,
 )
@@ -280,3 +281,5 @@ class TestLowScoreNeutralAndGeopoliticalGuardrails:
         )
         result = _apply_guardrails([item])
         assert result[0].impact_band == ImpactBand.BULLISH
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

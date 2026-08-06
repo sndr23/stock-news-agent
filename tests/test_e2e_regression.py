@@ -7,6 +7,7 @@ from src.tools.calculators import rank_news
 from src.schemas import ImpactBand, Confidence, NewsAnalysisItem
 
 
+
 @pytest.fixture(autouse=True)
 def mock_hs300():
     """mock get_hs300_constituents 避免测试中发起网络请求
@@ -93,3 +94,5 @@ def test_e2e_empty_input():
     assert kept == []
     ranked = rank_news([])
     assert ranked == []
+
+pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
