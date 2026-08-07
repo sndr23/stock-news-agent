@@ -123,3 +123,53 @@ def find_signal_keywords(text: str) -> list:
     if not text:
         return []
     return [kw for kw in HIGH_SIGNAL_KEYWORDS if _SIGNAL_KW_PATTERNS[kw].search(text)]
+
+
+# ============================================================
+# 事件指纹专用信号词（2026-08-07 新增，防宽泛词指纹碰撞）
+# ============================================================
+# 背景: _news_fingerprint 用"命中信号词集合"作为事件级指纹键的一部分。
+# 但 HIGH_SIGNAL_KEYWORDS 中混有宽泛市场/机构/主题词（韩国/纳指/央行/油价等），
+# 它们本身不能标识具体事件：实测"韩国总统宣布新产业计划"与"韩国半导体出口大增"
+# 均仅命中"韩国"→ 同日指纹完全相同 → 后一条被 seen 跳过 → 漏推。
+# 方案: 指纹路径使用 find_signal_fp_keywords（排除宽泛词后的核心事件词）；
+# 预筛直通（has_signal_keyword / find_signal_keywords）保持全部词不变——
+# 宽泛词仍能送 LLM 判定，只是不参与指纹合并。
+# 仅命中宽泛词的新闻自动退回"标题归一化指纹"，跨源同事件由推送级
+# _is_same_event（市场域/指数词/方向守卫）在推送前兜底合并。
+_SIGNAL_FP_BROAD_WORDS = {
+    # 机构/主体类（不能标识事件本身："央行"可出现在降准/加息/利率决议/官员讲话等不同事件）
+    "央行", "国务院", "证监会", "政治局", "汇金", "国家队", "平准基金",
+    "美联储", "鲍威尔", "欧央行", "中央经济工作会议",
+    # 市场/主题类（不同事件共用同一市场语境；龙虎榜/机构净买入无个股字段时
+    # 必须退回事件/标题指纹，避免同日多条龙虎榜因共享词合并）
+    "韩国", "日经", "纳指", "美股", "科技股", "汇率", "油价", "北向资金",
+    "机构净买入", "龙虎榜",
+}
+# 注意：并购/回购/增持/减持/股权激励/分红/IPO/定增/可转债等资本运作词
+# 不列入宽泛排除词——它们依赖个股名（st 键）区分公司，且 sig 路径刻意不掺入
+# 金额以合并"5亿 vs 5.5亿"等同事件多源表述（test_high_signal_amount_insensitive_same_fp
+# 保护此行为）；若误列入，寒武纪两次不同金额回购将被拆成不同指纹。
+# 预编译：宽泛词同样按英文缩写词边界处理（IPO 不误命中 IPOdroid 等）
+_FP_BROAD_PATTERNS = {
+    kw: re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])" if re.fullmatch(r"[A-Za-z*]+", kw or "") else re.escape(kw)
+    )
+    for kw in _SIGNAL_FP_BROAD_WORDS
+}
+
+
+def find_signal_fp_keywords(text: str) -> list:
+    """事件指纹专用信号词：命中列表减去宽泛市场/机构/主题词
+
+    仅用于 _news_fingerprint 的 sig 路径。命中返回核心事件词；
+    仅命中宽泛词（如只含"韩国/纳指/央行"）返回空 → 调用方退回标题指纹，
+    避免不同事件因共享宽泛词被合并成同一指纹（漏推根因之一）。
+    """
+    if not text:
+        return []
+    hits = [kw for kw in HIGH_SIGNAL_KEYWORDS if _SIGNAL_KW_PATTERNS[kw].search(text)]
+    if not hits:
+        return []
+    core = [kw for kw in hits if kw not in _FP_BROAD_PATTERNS]
+    return core
