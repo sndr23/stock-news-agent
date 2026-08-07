@@ -996,6 +996,245 @@ class TestCandidateOverflowPending:
         second_calls = sum(judge_calls) - first_calls
         assert 0 < second_calls <= 5, "第二轮应只判定 pending 的少量条目, 实际 %d" % second_calls
 
+
+# ============================================================
+# 2026-08-07 修复回归：抓取 try 隔离（#1）
+# ============================================================
+
+class TestFetchIsolation:
+    """news 与 signals 分开 try：单类失败不清空另一类成功数据"""
+
+    def _setup(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
+            "push": True, "score": 8, "direction": "bullish", "scope": "market",
+            "sectors": [], "entities": [], "is_leader_stock": False,
+            "reason": "宏观"} for _ in items])
+        monkeypatch.setattr(rtp, "dedup_news_3layer", lambda lst: list(lst))
+
+    def _tool(self, fn):
+        return type("T", (), {"func": staticmethod(fn)})()
+
+    def test_signals_failure_keeps_news(self, monkeypatch, tmp_path):
+        """signals 抛异常 → 已成功的 news 必须保留并正常推送"""
+        self._setup(monkeypatch, tmp_path)
+        news = self._tool(lambda: [{
+            "title": "央行宣布降准0.5个百分点 释放万亿流动性",
+            "content": "国常会部署，支持实体", "source": "财联社",
+            "published_at": "2026-08-01 10:00:00"}])
+
+        def boom():
+            raise RuntimeError("signals down")
+        sig = self._tool(boom)
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+        stats = rtp.run_once(dry_run=False)
+        assert stats["fetched"] >= 1, "signals 失败不得清空已成功的新闻"
+        assert stats["pushed"] >= 1, "新闻应正常走完判定并推送"
+
+    def test_news_failure_keeps_signals(self, monkeypatch, tmp_path):
+        """news 抛异常 → signals（业绩预告）保留并正常推送"""
+        self._setup(monkeypatch, tmp_path)
+
+        def boom():
+            raise RuntimeError("news down")
+        news = self._tool(boom)
+        sig = self._tool(lambda: [{
+            "title": "业绩预告: 中微公司(688012) 预增 幅度2966.0%",
+            "content": "净利润同比大幅增长", "source": "交易所业绩预告",
+            "published_at": "2026-08-01 10:00:00", "category": "signal",
+            "impact_direction": "bullish", "affected_stocks": ["中微公司"]}])
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+        stats = rtp.run_once(dry_run=False)
+        assert stats["fetched"] >= 1, "news 失败不得清空已成功的信号"
+        assert stats["pushed"] >= 1
+
+
+# ============================================================
+# 2026-08-07 修复回归：宽泛信号词指纹碰撞（#2）
+# ============================================================
+
+class TestFingerprintBroadWordFix:
+    """仅命中宽泛市场词（韩国/纳指/央行等）的不同事件不得共享指纹"""
+
+    def _n(self, title, content="", ts="2026-08-07 10:00:00"):
+        return {"title": title, "content": content, "published_at": ts}
+
+    def test_korea_different_events_no_collision(self):
+        """实测复现案例：两条韩国新闻此前指纹相同 → 现在必须不同"""
+        a = self._n("韩国总统宣布新产业计划")
+        b = self._n("韩国半导体出口大增")
+        assert rtp._news_fingerprint(a) != rtp._news_fingerprint(b)
+
+    def test_nasdaq_intraday_updates_no_collision(self):
+        """仅命中宽泛词(纳指)的盘中快讯 → 退回标题指纹，不互撞（推送级兜底合并）"""
+        a = self._n("纳指涨超2%，科技股普涨")
+        b = self._n("纳指现报25882点，Meta涨超6%")
+        assert rtp._news_fingerprint(a) != rtp._news_fingerprint(b)
+
+    def test_core_signal_still_shared(self):
+        """核心事件词(降准)多源报道仍共享指纹（原合并能力不破坏）"""
+        a = self._n("央行宣布降准0.5个百分点 释放长期流动性")
+        b = self._n("央行宣布降准0.5个百分点 释放万亿流动性")
+        assert rtp._news_fingerprint(a) == rtp._news_fingerprint(b)
+
+    def test_find_signal_fp_keywords_excludes_broad(self):
+        """指纹专用信号词排除宽泛词；全量信号词保留（预筛直通不受影响）"""
+        from src.tools.keyword_tables import find_signal_keywords, find_signal_fp_keywords
+        text = "韩国央行宣布降准0.5个百分点"
+        all_hits = find_signal_keywords(text)
+        fp_hits = find_signal_fp_keywords(text)
+        assert "韩国" in all_hits and "央行" in all_hits, "预筛直通需保留全量信号词"
+        assert "降准" in fp_hits
+        assert "韩国" not in fp_hits and "央行" not in fp_hits
+
+
+# ============================================================
+# 2026-08-07 修复回归：overflow 分层配额（#3）
+# ============================================================
+
+class TestOverflowPriorityFix:
+    """溢出时高信号核心事件优先于高分普通候选；高信号条目不放弃"""
+
+    def _setup(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "dedup_news_3layer", lambda lst: list(lst))
+        monkeypatch.setattr(rtp, "_llm_judge", self._judge_ok)
+        monkeypatch.setenv("RT_MAX_CANDIDATES", "40")
+
+    def _news(self, title, content, **extra):
+        n = {"title": title, "content": content, "source": "财联社",
+             "published_at": "2026-08-01 10:00:00"}
+        n.update(extra)
+        return n
+
+    def _mock_sources(self, monkeypatch, news_list):
+        news = type("T", (), {"func": staticmethod(lambda: news_list)})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+
+    def _judge_ok(self, items, **kw):
+        return [{"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                 "sectors": [], "entities": [], "is_leader_stock": False,
+                 "reason": "宏观"} for _ in items]
+
+    def test_high_signal_kept_over_higher_score_normal(self, monkeypatch, tmp_path):
+        """41 条候选(40 普通高分 + 1 低分高信号) → 高信号进判定，普通末尾被挤出"""
+        self._setup(monkeypatch, tmp_path)
+        judged = []
+
+        def recording(items, **kw):
+            judged.extend(i["title"] for i in items)
+            return self._judge_ok(items, **kw)
+        monkeypatch.setattr(rtp, "_llm_judge", recording)
+
+        news_list = [
+            self._news("普通研报第%d期 存储涨价" % i, "半导体 芯片 光模块 PCB 存储芯片" * 2)
+            for i in range(40)
+        ]
+        news_list.append(self._news("某某公司被证监会立案调查", "立案调查 重大违法 退市风险"))
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+
+        assert len(judged) == 40, "应恰好判定 40 条（上限）"
+        assert any("立案调查" in t for t in judged), "高信号核心事件必须进入 LLM 判定（不被低分科技噪声挤出）"
+
+    def test_normal_overflow_gives_up_after_retry_limit(self, monkeypatch, tmp_path):
+        """普通条目连续 3 轮溢出 → 写 seen 放弃（防无限重试）"""
+        self._setup(monkeypatch, tmp_path)
+        state_path = tmp_path / "real_time_state.json"
+        y_title = "普通低分研报Y 存储涨价"
+        y_fp = rtp._news_fingerprint(self._news(y_title, "半导体 芯片 光模块"))
+        pre_state = {"version": 2, "seen": {},
+                     "pending": {y_fp: {"t": "2026-08-01 09:00:00", "retry": 2, "title": y_title}},
+                     "pushed_events": []}
+        state_path.write_text(json.dumps(pre_state, ensure_ascii=False), encoding="utf-8")
+
+        news_list = [
+            self._news("普通研报第%d期 存储涨价" % i, "半导体 芯片 光模块 PCB 存储芯片" * 2)
+            for i in range(40)
+        ]
+        news_list.append(self._news(y_title, "半导体 芯片 光模块"))
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        assert y_fp not in saved["pending"], "普通条目达上限后应从 pending 移除"
+        assert y_fp in saved["seen"] and "[溢出放弃]" in saved["seen"][y_fp]["title"]
+
+    def test_high_signal_overflow_never_gives_up(self, monkeypatch, tmp_path):
+        """45 条全高信号候选(40+5 溢出) → 溢出高信号条目不写 seen 放弃"""
+        self._setup(monkeypatch, tmp_path)
+        from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
+        from src.tools.calculators import _EVENT_KEYWORD_GROUPS
+        ev_kws = set()
+        for _g, kws in _EVENT_KEYWORD_GROUPS:
+            ev_kws.update(kws)
+        kws = [kw for kw in HIGH_SIGNAL_KEYWORDS if kw not in ev_kws][:45]
+        news_list = [
+            self._news("主体%d %s 动态" % (i, kw), "%s 相关事项" % kw,
+                       affected_stocks=["主体%d" % i])
+            for i, kw in enumerate(kws)
+        ]
+        self._mock_sources(monkeypatch, news_list)
+        rtp.run_once(dry_run=False)
+
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        abandoned = [r for r in saved["seen"].values() if "[溢出放弃]" in r.get("title", "")]
+        assert abandoned == [], "高信号条目溢出不得写 seen 放弃"
+        assert len(saved["pending"]) >= 1, "溢出高信号条目持续挂起 pending"
+
+
+# ============================================================
+# 2026-08-07 修复回归：LLM 布尔字段严格解析（#4）
+# ============================================================
+
+class TestAsBool:
+    def test_string_false_is_false(self):
+        assert rtp._as_bool("false") is False
+        assert rtp._as_bool("0") is False
+        assert rtp._as_bool("False") is False
+
+    def test_string_true_is_true(self):
+        assert rtp._as_bool("true") is True
+        assert rtp._as_bool("1") is True
+
+    def test_real_bool_passthrough(self):
+        assert rtp._as_bool(True) is True
+        assert rtp._as_bool(False) is False
+
+    def test_unknown_defaults_false(self):
+        assert rtp._as_bool("banana") is False
+        assert rtp._as_bool(None) is False
+        assert rtp._as_bool("") is False
+
+    def test_llm_push_string_false_respected(self, monkeypatch):
+        """LLM 返回 push/is_leader_stock 为字符串 "false" 时不得误判为 True"""
+        items = [{"title": "央行宣布降准", "content": "", "_pref_score": 0.8, "_hit_signal": True}]
+
+        def fake_llm(system_prompt, user_prompt, timeout=90, max_retries=1, deadline=0):
+            return json.dumps([{"idx": 0, "title": "央行宣布降准", "push": "false",
+                                "score": 2, "direction": "neutral", "scope": "stock",
+                                "is_leader_stock": "false", "reason": "r"}], ensure_ascii=False)
+        monkeypatch.setattr(rtp, "_call_llm_api", fake_llm)
+        judges = rtp._llm_judge(items)
+        assert judges[0]["push"] is False, "push=\"false\" 不得因 bool() 误判为 True"
+        assert judges[0]["is_leader_stock"] is False
+
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
 
 

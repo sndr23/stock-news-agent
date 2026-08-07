@@ -83,6 +83,7 @@ from src.tools.keyword_tables import (                      # 共享关键词表
     OVERSEAS_SOURCE_MARKERS,
     has_signal_keyword,        # 2026-08-06: 词边界感知的信号词匹配（ST/IPO 防误命中）
     find_signal_keywords,      # 返回命中的信号词列表（事件指纹 sig 路径用）
+    find_signal_fp_keywords,   # 2026-08-07: 指纹专用信号词（排除宽泛市场词，防跨事件指纹合并）
 )
 
 # ============================================================
@@ -170,6 +171,12 @@ def _passes_threshold(mode: str, score, direction: str, scope: str,
     - 全市场级影响: 必推
     - 板块级: 强档方向 或 影响分≥6 → 推（2026-08-01 由≥7放宽：用户反馈大量有用板块资讯被卡）
     - 个股级: 仅行业龙头（龙头股重大消息）且 强档 或 分≥6 → 推；非龙头不推
+
+    注（2026-08-07 注释对齐）：生产入口 run_once 5c 已在调用本函数之前执行
+    "强档硬门槛"——direction 非 bullish/bearish 一律不推（2026-08-04 用户口径：
+    仅强利好/强利空推送），覆盖 market/sector/stock 全 scope。因此本函数中
+    market 必推、sector score>=6、loose 模式等分支在当前生产入口下属于
+    保留设计（历史/未来模式扩展用），实际运行时能走到这里的判定必然已是强档。
     """
     try:
         score = float(score or 0)
@@ -246,7 +253,11 @@ def _news_fingerprint(news: dict) -> str:
     stocks, events, numbers = _event_signature_light(news)
     # 2026-08-06 修复：find_signal_keywords 用词边界匹配英文缩写（ST/IPO），
     # 防 "STorage" 误命中 ST 导致不同事件指纹合并（漏推）
-    hit_signal = find_signal_keywords(text)
+    # 2026-08-07 修复：改用 find_signal_fp_keywords——排除宽泛市场/机构词
+    # （韩国/纳指/央行/油价等，实测"韩国总统宣布新产业计划"与"韩国半导体出口大增"
+    # 因共享"韩国"被合并成同一指纹 → 后一条漏推）。仅命中宽泛词时退回
+    # 下方标题指纹分支；跨源同事件仍由推送级 _is_same_event 兜底合并。
+    hit_signal = find_signal_fp_keywords(text)
     if hit_signal:
         # 命中高信号词（宏观/监管级）：以信号词+事件组+个股为指纹，不掺入数字——
         # 数字表达不稳定（"1700亿" vs "一千七百亿"），且同信号词下数字分叉
@@ -270,6 +281,26 @@ def _to_float(v, default: float = 0.0) -> float:
         return float(v or 0)
     except (ValueError, TypeError):
         return default
+
+
+def _as_bool(v, default: bool = False) -> bool:
+    """严格布尔解析（LLM 返回的 push/is_leader_stock 可能是字符串）
+
+    2026-08-07 修复：此前用 bool(e.get("push"))——LLM 输出 "push": "false"
+    （带引号字符串，非标准 JSON）时 bool("false")==True → 误判为要推。
+    本函数: bool 直通；数字按真值；字符串按 true/1/yes 等白名单解析，
+    无法识别时返回 default（宁可保守不推，也不因类型误判漏推/滥推）。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v or "").strip().lower()
+    if s in ("true", "1", "yes", "y"):
+        return True
+    if s in ("false", "0", "no", "n"):
+        return False
+    return default
 
 
 def _push_event_sig(news: dict, judge: dict) -> dict:
@@ -952,14 +983,14 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
                     continue
                 results[i] = {
                     "title": t,
-                    "push": bool(e.get("push", False)),
+                    "push": _as_bool(e.get("push", False), False),
                     "judged": True,
                     "score": e.get("score", 0),
                     "direction": _normalize_direction(e.get("direction", "neutral"), n),
                     "scope": str(e.get("scope", "stock") or "stock").lower(),
                     "sectors": e.get("sectors") or [],
                     "entities": [str(x).strip() for x in (e.get("entities") or []) if str(x).strip()],
-                    "is_leader_stock": bool(e.get("is_leader_stock", False)),
+                    "is_leader_stock": _as_bool(e.get("is_leader_stock", False), False),
                     "reason": str(e.get("reason", "") or "").strip(),
                 }
             logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成（回显{len(entries)}条）")
@@ -1161,12 +1192,17 @@ def run_once(dry_run: bool = False) -> dict:
     # 1. 多源聚合抓取：6 大新闻源 + 龙虎榜/业绩预告信号
     # 注意: get_stock_news/get_market_signals 是 LangChain @tool 包装的
     # StructuredTool 实例，需用 .func 取原始函数调用
+    # 2026-08-07 修复：新闻与信号分开 try，单类失败不清空另一类成功数据
+    # （此前共用 try，signals 抛异常会把已成功的 news_list 也置空 → 误判"无资讯"）
     try:
         news_list = get_stock_news.func()
+    except Exception as e:
+        logger.error(f"多源新闻抓取失败: {e}", exc_info=True)
+        news_list = []
+    try:
         signals = get_market_signals.func()
     except Exception as e:
-        logger.error(f"多源抓取失败: {e}", exc_info=True)
-        news_list = []
+        logger.error(f"市场信号抓取失败: {e}", exc_info=True)
         signals = []
 
     # 跨源近似去重（URL/精确标题之外补一层 SimHash）：同一事件不同措辞的多源
@@ -1211,18 +1247,26 @@ def run_once(dry_run: bool = False) -> dict:
     # 候选上限保护：突发大行情候选激增时，按预筛分排序取前 N 条
     # 2026-08-06 修复（P1-2）：溢出条目不写 seen（此前被末尾循环永久 seen → 48h 漏推），
     # 改为记入 pending 挂起，下轮重新进入增量检测与 LLM 判定。
-    # 保护：同一 fp 连续 MAX_PENDING_RETRY 轮仍溢出则放弃（写 seen），防无限重试。
+    # 2026-08-07 修复（分层配额）：此前仅按 _pref_score 全局截断——预筛分混合了
+    # 科技/板块/来源偏好，极端行情下"立案调查/降准"等高信号核心事件可能被
+    # 低分科技噪声挤出第 41 位。现改为两级排序：命中高信号词（核心事件）恒优先，
+    # 普通候选再按预筛分排序，保证核心事件在溢出时不被挤占。
+    # 放弃策略同步收紧：仅普通条目连续 MAX_PENDING_RETRY 轮溢出后放弃（写 seen 防无限重试）；
+    # 高信号条目永不放弃（持续挂起 pending，行情回落后自动进入判定）——核心事件不许漏推。
     max_candidates = int(os.getenv("RT_MAX_CANDIDATES", str(MAX_CANDIDATES_PER_ROUND)))
     overflow = []
     if len(candidates) > max_candidates:
-        candidates.sort(key=lambda x: x["_pref_score"], reverse=True)
+        candidates.sort(
+            key=lambda x: (1 if x.get("_hit_signal") else 0, x["_pref_score"]),
+            reverse=True)
         overflow = candidates[max_candidates:]
         candidates = candidates[:max_candidates]
         now_for_pend = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
         for n in overflow:
             retry = int(n.get("_pend_retry", 0)) + 1
-            if retry >= MAX_PENDING_RETRY:
-                # 连续多轮溢出：放弃该条目，记 seen 防无限重试
+            if retry >= MAX_PENDING_RETRY and not n.get("_hit_signal"):
+                # 连续多轮溢出：放弃普通条目，记 seen 防无限重试
+                # （高信号核心事件不放弃——漏推立案调查/降准等比多一轮重试代价大得多）
                 seen[n["_fp"]] = {"t": now_for_pend, "pushed": False,
                                   "title": str(n.get("title", ""))[:60] + "[溢出放弃]"}
                 logger.info(f"候选溢出重试{retry}轮仍无法进入判定，放弃: {n.get('title', '')[:40]}")
