@@ -1312,3 +1312,225 @@ class TestHeartbeatAndCache:
         data["_mtime"] = 0
         p.write_text(json.dumps(data), encoding="utf-8")
         assert df._hs300_load_cache() is None, "过期缓存应失效"
+
+
+# ============================================================
+# 2026-08-11 修复回归：噪声过滤（栏目/指数播报/盘面异动）
+# + 实体模糊重叠跨日同事件合并 + LLM prompt 必推场景补充
+# ============================================================
+
+class TestNoiseFilter:
+    """修复1：栏目汇总/指数播报/盘面异动类即使强档也过滤（13/61 滥推实证）"""
+
+    def _judge(self, **kw):
+        j = {"push": True, "score": 8, "direction": "bullish", "scope": "sector",
+             "is_leader_stock": False, "entities": []}
+        j.update(kw)
+        return j
+
+    def test_column_markers_filtered(self):
+        """栏目汇总类一律不推：晚间新闻精选/隔夜要闻/九点特供/风口研报/午评/涨停分析"""
+        cases = [
+            "财联社8月10日晚间新闻精选",
+            "周二你需要知道的隔夜全球要闻",
+            "九点特供获美法院初步禁令 国产CXO龙头司法反制1260H名单迎阶段胜利",
+            "风口研报公司模拟芯片多轮涨价驱动周期反转",
+            "8月10日午间涨停分析",
+            "金十数据整理A股盘前市场要闻速递",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "栏目汇总", t
+
+    def test_index_move_filtered(self):
+        """指数盘中行情播报不推：KOSPI涨超/韩国综指涨幅扩大/日经上涨"""
+        cases = [
+            "财联社8月10日电 韩国KOSPI指数涨超2 现报639406点",
+            "韩国综指涨幅扩大至2",
+            "日经225指数期货早盘上涨1.13%",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "指数播报", t
+
+    def test_intraday_move_filtered_non_leader(self):
+        """板块/概念盘面异动（非龙头）不推：异动拉升/直线涨停/盘初走强"""
+        cases = [
+            "智能驾驶概念异动拉升 大众交通直线涨停",
+            "算力租赁概念异动拉升 杭钢股份鸿博股份直线涨停",
+            "电网设备板块盘初走强 中电鑫龙等多股涨停",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "盘面异动", t
+
+    def test_leader_intraday_kept(self):
+        """龙头个股盘面保留：LLM 龙头标记或命中自选名单 → 不过滤"""
+        t = "中际旭创跌超3% 成交额超110亿元"
+        assert rtp._is_noise_push({"title": t}, self._judge(is_leader_stock=True), set()) == ""
+        assert rtp._is_noise_push({"title": t}, self._judge(), {"中际旭创"}) == ""
+
+    def test_major_news_not_filtered(self):
+        """正常重大消息不被误伤（防漏推守卫）"""
+        ok = [
+            "央行印发中国人民银行十五五改革发展规划",
+            "私募巨头集体入局 据称英伟达将牵头5000亿美元融资大单",
+            "OpenAI发布GPT-5.6-Cyber",
+            "日媒关注中国对日美稀土出口大幅下降 6月对日钇出口降至零",
+            "期货早报美国非农意外减少23万人 加息预期骤变",  # 含非农硬数据，勿因"早报"误伤
+            "微软计划最快9月发布其下一代MAIA300人工智能芯片",
+            "摩根大通全球存储芯片短缺或持续至2028年",
+        ]
+        for t in ok:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "", t
+
+
+class TestEntityOverlapMerge:
+    """修复2：实体模糊重叠 + 放宽 LCS → 跨日同事件合并（防 48h 重复推送）"""
+
+    def _sig(self, title, entities):
+        return rtp._push_event_sig({"title": title, "content": ""}, {"entities": entities})
+
+    def test_entity_overlap_substring(self):
+        assert rtp._entity_overlap({"索尼", "台积电"}, {"索尼半导体解决方案公司", "台积电"})
+        assert rtp._entity_overlap({"苹果"}, {"苹果"})
+        assert not rtp._entity_overlap({"苹果"}, {"谷歌"})
+        assert not rtp._entity_overlap({"索尼"}, {"台积电"})
+
+    def test_sony_tsmc_jv_three_reports_merged(self):
+        """索尼×台积电合资 48h 三推实证：跨日措辞差异大 → 应两两合并"""
+        s1 = self._sig("索尼与台积电拟合资建厂1万亿日元布局下一代图像传感器芯片",
+                       ["索尼", "台积电"])
+        s2 = self._sig("台积电批准与索尼半导体解决方案公司成立新的合资企业",
+                       ["台积电", "索尼半导体"])
+        s3 = self._sig("索尼与台积电将在日本成立先进图像传感器合资公司 采用先进制程技术2029年量产",
+                       ["台积电", "索尼"])
+        assert rtp._is_same_event(s1, s2), "拟合资 vs 批准成立 应合并"
+        assert rtp._is_same_event(s1, s3), "隔日报道应合并"
+        assert rtp._is_same_event(s2, s3), "批准成立 vs 日本合资公司 应合并"
+
+    def test_korea_5t_fund_two_reports_merged(self):
+        """韩国5万亿韩元基金两条报道（隔1小时双推实证）→ 应合并"""
+        s1 = self._sig("韩国将设立一项价值5万亿韩元新基金 重点投资于前景广阔的半导体材料零部件和设备领域",
+                       ["韩国政府"])
+        s2 = self._sig("韩国砸5万亿韩元设专项基金 瞄准半导体材料与无晶圆厂企业",
+                       ["韩国政府"])
+        assert rtp._is_same_event(s1, s2)
+
+    def test_sk_hynix_different_events_not_merged(self):
+        """漏推守卫：SK海力士不同事件（股东回报 vs EUV vs 中国产能）不得误并"""
+        a = self._sig("SK海力士韩股上涨 该公司之前确定了股东回报细节的公布时间", ["SK海力士"])
+        b = self._sig("消息称SK海力士推进EUV工艺 开始引入新材料PSM", ["SK海力士"])
+        c = self._sig("韩媒SK海力士计划将在中国的NAND产能提高50", ["SK海力士"])
+        assert not rtp._is_same_event(a, b)
+        assert not rtp._is_same_event(a, c)
+        assert not rtp._is_same_event(b, c)
+
+    def test_apple_changxin_two_reports_merged(self):
+        """苹果测试长鑫存储芯片：跨日两条报道 → 应合并（双推实证）"""
+        s1 = self._sig("知情人士 苹果测试长鑫科技存储芯片 用于iPhone和MacBook", ["苹果", "长鑫存储"])
+        s2 = self._sig("存储芯片重磅来袭 苹果找上长鑫 iPhone MacBook都在测试", ["苹果", "长鑫科技"])
+        assert rtp._is_same_event(s1, s2)
+
+    def test_same_entity_different_amount_not_merged(self):
+        """金额守卫：同实体不同金额（50亿建厂 vs 10亿回购）→ 不得误并（漏推守卫）"""
+        s1 = self._sig("宁德时代投资50亿元新建电池工厂", ["宁德时代"])
+        s2 = self._sig("宁德时代拟投资10亿元回购股份", ["宁德时代"])
+        assert not rtp._is_same_event(s1, s2)
+
+    def test_shared_entity_name_only_not_merged(self):
+        """误并守卫：仅共享实体名（中国人民银行），标题无其他共享内容 → 不同事件"""
+        s1 = self._sig("央行根据中国人民银行与德意志联邦银行备忘录 决定授权德意志银行",
+                       ["中国人民银行", "德意志银行"])
+        s2 = self._sig("中国人民银行印发中国人民银行十五五改革发展规划", ["中国人民银行"])
+        assert not rtp._is_same_event(s1, s2)
+
+    def test_shared_entity_plus_anchor_merged(self):
+        """同实体 + 共享高置信事件锚（合资）→ 合并（索尼×台积电三推实证）"""
+        s1 = self._sig("索尼与台积电拟合资建厂1万亿日元布局下一代图像传感器芯片",
+                       ["索尼", "台积电"])
+        s2 = self._sig("台积电批准与索尼半导体解决方案公司成立新的合资企业",
+                       ["台积电", "索尼半导体"])
+        assert rtp._is_same_event(s1, s2)
+
+    def test_tsmc_cowos_vs_sony_jv_not_merged(self):
+        """主题词误并守卫：台积电 CoWoS量产 vs 索尼合资2029量产（仅共享'量产'）→ 不同事件"""
+        s1 = self._sig("台积电55倍光罩CoWoS已进入量产", ["台积电"])
+        s2 = self._sig("索尼与台积电将在日本成立先进图像传感器合资公司 2029年量产",
+                       ["台积电", "索尼"])
+        assert not rtp._is_same_event(s1, s2)
+
+
+class TestLlmPromptScenarios:
+    """修复3：LLM prompt 补充必推场景（AI发布/监管/见顶警示）"""
+
+    def test_prompt_covers_ai_release(self):
+        p = rtp._LLM_SYSTEM_PROMPT
+        assert "新模型、新芯片发布" in p or "GPT-5.6" in p
+        assert "OpenAI" in p and "自研芯片" in p
+
+    def test_prompt_covers_ai_regulation(self):
+        p = rtp._LLM_SYSTEM_PROMPT
+        assert "AI 监管与政策" in p
+        assert "暂停AI开发" in p or "参议员" in p
+
+    def test_prompt_covers_peak_warning(self):
+        p = rtp._LLM_SYSTEM_PROMPT
+        assert "行业见顶" in p and "目标价被大幅下调" in p
+
+    def test_prompt_still_excludes_views_and_routine(self):
+        p = rtp._LLM_SYSTEM_PROMPT
+        assert "纯个人观点" in p
+        assert "外围央行" in p  # 新增：外围央行日常表态明确不推
+        assert "分析师评级调整" in p  # 新增：评级调整明确不推
+
+
+class TestRunOnceNoiseFilterIntegration:
+    """修复1 接入点：run_once 中强档但命中噪声 → 不推送、记 seen 标注"""
+
+    def _setup(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "dedup_news_3layer", lambda lst: list(lst))
+        monkeypatch.setattr(rtp, "_llm_judge", self._judge_strong)
+
+    def _judge_strong(self, items, **kw):
+        # 全部判为强档 bullisih + push=True（噪声过滤前的行为是全部推送）
+        return [{"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                 "sectors": [], "entities": [], "is_leader_stock": False,
+                 "reason": "强档"} for _ in items]
+
+    def test_column_news_not_pushed_despite_strong(self, monkeypatch, tmp_path):
+        """LLM 判强档的栏目汇总类 → 仍不推送（标题含央行/降准高信号词，确保过预筛走到 5c）"""
+        self._setup(monkeypatch, tmp_path)
+        news = type("T", (), {"func": staticmethod(lambda: [
+            {"title": "财联社8月10日晚间新闻精选：央行宣布降准0.5个百分点 释放流动性",
+             "content": "央行降准 释放长期流动性",
+             "source": "财联社", "published_at": "2026-08-10 22:00:00"}])})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 0, "栏目汇总类即使强档也不得推送"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        titles = [r.get("title", "") for r in saved["seen"].values()]
+        assert any("[栏目汇总不推]" in t for t in titles), "应记录 seen 并标注原因"
+
+    def test_major_news_still_pushed(self, monkeypatch, tmp_path):
+        """正常强档重大消息不受影响，仍推送"""
+        self._setup(monkeypatch, tmp_path)
+        sent = []
+        def record(cfg, t, c):
+            sent.append(t)
+            return {"code": 200}
+        monkeypatch.setattr(rtp, "_send_alert_item", record)
+        news = type("T", (), {"func": staticmethod(lambda: [
+            {"title": "英伟达牵头5000亿美元融资 私募巨头集体入局", "content": "融资",
+             "source": "财联社", "published_at": "2026-08-11 08:00:00"}])})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 1, "重大消息应正常推送"
+        assert len(sent) == 1 and "英伟达" in sent[0]

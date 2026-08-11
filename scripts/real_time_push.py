@@ -409,6 +409,43 @@ _INDEX_TOKENS = [
     "沪指", "深成指", "创业板指", "科创50", "上证", "沪深300", "富时100",
 ]
 
+# 栏目汇总/盘面播报类噪声识别（2026-08-11 审核实证：48h 内 61 条推送中 13 条为
+# 栏目汇总/指数播报/盘面异动类——"晚间新闻精选""隔夜要闻""九点特供""风口研报"
+# "KOSPI涨超2%""概念异动拉升"等被 LLM 判强档后仍推送，属"非重大消息"，按用户
+# 口径（仅强利好/强利空 + 重大事件）不应推。以下三组规则在 5c 强档门槛后硬过滤，
+# 即使 LLM 判强档也降级不推，记录 seen 并标注原因。
+# 注意：勿加"早报/晚报"等过宽词——"期货早报"含非农等重大宏观数据，曾实证合理推送。
+_NOISE_COLUMN_MARKERS = [
+    "新闻精选", "晚间新闻", "要闻速递", "隔夜要闻", "全球要闻", "九点特供", "风口研报",
+    "投资避雷针", "午评", "收评", "盘前速递", "新闻速览", "涨停分析",
+    "盘前要闻", "市场要闻", "研报精选",
+]
+# 指数盘中行情播报的波动措辞（与 _INDEX_TOKENS 组合判定，避免误伤个股消息）
+_NOISE_INDEX_MOVE = [
+    "涨超", "跌超", "涨逾", "跌逾", "涨幅扩大", "跌幅扩大", "涨幅扩大至",
+    "跌幅扩大至", "现报", "开涨", "开跌", "收涨", "收跌", "上涨", "下跌",
+]
+# 纯盘面异动措辞（板块/概念异动、非龙头个股异动；龙头个股消息由 is_leader 例外放行）
+_NOISE_INTRADAY_MARKERS = [
+    "异动拉升", "直线涨停", "直线跌停", "盘初走强", "盘中走强", "短线走高",
+    "震荡拉升", "尾盘拉升", "午后拉升", "冲高回落", "快速走强", "集体走强",
+]
+# 指数行情播报需额外覆盖的指数名（_INDEX_TOKENS 之外的出现形式）
+_NOISE_INDEX_NAMES = _INDEX_TOKENS + ["KOSPI", "恒生指数", "综合指数"]
+
+# 同实体跨日报道的事件短语锚（2026-08-11 修复：索尼×台积电合资 48h 三推实证——
+# "拟合资建厂" vs "批准成立合资企业" 实体顺序相反（索尼在前 vs 台积电在前），
+# LCS 子序列仅 ~7 字达不到放宽阈值；同实体 + 共享事件动词 → 直接判定同事件。
+# 仅保留高置信"事件动词"（合并后必为同一事件）；主题词（扩产/量产/良率/产能/
+# 涨价/投资/营收等）易造成不同事件误并（台积电 CoWoS量产 vs 索尼合资 2029量产
+# 实证），一律不进锚表，交由放宽 LCS 分支处理。金额守卫：
+# 双方金额均明确且无交集 → 不同事件（防"50亿建厂 vs 10亿回购"误并漏推）。）
+_EVENT_PHRASE_ANCHORS = [
+    "合资", "收购", "并购", "建厂", "成立", "融资", "回购", "入股",
+    "签约", "中标", "停牌", "重组", "破产", "退市", "处罚", "立案",
+    "增持", "减持",
+]
+
 
 def _session_group(ta: str, tb: str) -> str | None:
     """两条标题是否属于同一市场时段组（开盘组/午评组/收盘组），返回组名或 None"""
@@ -434,6 +471,69 @@ def _session_conflict(ta: str, tb: str) -> bool:
     ga = next((g for g, kws in _SESSION_GROUPS.items() if any(k in ta for k in kws)), None)
     gb = next((g for g, kws in _SESSION_GROUPS.items() if any(k in tb for k in kws)), None)
     return ga is not None and gb is not None and ga != gb
+
+
+def _entity_overlap(ent_a: set, ent_b: set) -> bool:
+    """实体模糊重叠（2026-08-11 修复：跨源同事件合并失败实证）
+
+    LLM 对同一实体的表述不稳定："索尼" vs "索尼半导体解决方案公司"、
+    "台积电" vs "台积电(TSM.N)"。仅靠精确相等会把同一事件拆成多条
+    （索尼×台积电合资 48h 内三推实证）。判定：
+    1. 完全相等
+    2. 互相包含（"索尼" ⊂ "索尼半导体解决方案公司"）
+    3. 共享连续子串占较短实体 ≥60% 且 ≥2 字（"索尼半导体" vs "索尼"）
+    """
+    for ea in ent_a:
+        for eb in ent_b:
+            if not ea or not eb:
+                continue
+            if ea == eb:
+                return True
+            if len(ea) >= 2 and len(eb) >= 2 and (ea in eb or eb in ea):
+                return True
+            m = min(len(ea), len(eb))
+            if m >= 2:
+                l = _lcs_len(ea, eb)
+                if l >= 2 and l / m >= 0.6:
+                    return True
+    return False
+
+
+def _strip_entities(text: str, entities: set) -> str:
+    """从归一化标题剔除实体词（长词优先），用于"是否除主体外还共享内容"判定
+
+    2026-08-11 修复：实体名重复出现会使 LCS 子序列虚高——
+    "央行授权德银" 与 "央行十五五规划" 因"中国人民银行"各出现 1-2 次，
+    子序列占比 0.52 被误并。剔除实体后计算共享连续子串可消除该假象。
+    """
+    for e in sorted(entities, key=len, reverse=True):
+        if e:
+            text = text.replace(str(e), "")
+    return text
+
+
+def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
+    """栏目汇总/指数播报/盘面异动类噪声识别（2026-08-11 修复）
+
+    返回噪声原因字符串（非空=应过滤不推），空串=正常条目。
+    判定顺序：
+    1. 栏目汇总类（新闻精选/要闻速递/九点特供/风口研报/午评/收评等）→ 一律不推
+    2. 指数盘中行情播报（指数名 + 涨跌幅度措辞）→ 不推
+    3. 板块/概念盘面异动（异动拉升/直线涨停等）→ 非龙头不推；
+       LLM 龙头标记或命中自选名单（如"中际旭创跌超3%"）保留
+    """
+    title = str(news.get("title", "") or "")
+    if not title:
+        return ""
+    if any(m in title for m in _NOISE_COLUMN_MARKERS):
+        return "栏目汇总"
+    if any(i in title for i in _NOISE_INDEX_NAMES) and any(m in title for m in _NOISE_INDEX_MOVE):
+        return "指数播报"
+    if any(m in title for m in _NOISE_INTRADAY_MARKERS):
+        is_leader = bool(judge.get("is_leader_stock")) or _hit_watchlist(news, leader_watchlist)
+        if not is_leader:
+            return "盘面异动"
+    return ""
 
 
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
@@ -466,12 +566,32 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     num_a = set(sig_a.get("numbers") or [])
     num_b = set(sig_b.get("numbers") or [])
     shared_ev = ev_a & ev_b
+    # 2026-08-11 修复：实体模糊重叠（"索尼"⊂"索尼半导体解决方案公司"），
+    # 此前仅精确相等，跨源同事件（索尼×台积电合资）48h 内三推实证
+    ent_overlap = _entity_overlap(ent_a, ent_b)
 
-    if shared_ev and (ent_a & ent_b):
-        return True
+    if shared_ev and ent_overlap:
+        # 2026-08-11 修复（误并实证）：共享事件组 + 实体模糊重叠 直接合并会把
+        # "期货早报…连续21月增持黄金"（事件组=增持）与"多重稳市信号释放…"
+        # （content 含"增持"事件组）误并为同事件——两者标题零共享。
+        # 守卫：标题需共享 ≥3 字连续子串、字符集 Jaccard ≥0.15、或共享高置信
+        # 事件短语锚（寒武纪股权激励类：同个股+同事件组+标题同主题 仍合并）。
+        ta0 = str(sig_a.get("title_norm", "") or "")
+        tb0 = str(sig_b.get("title_norm", "") or "")
+        if ta0 and tb0:
+            title_ok = (
+                _lcs_len(ta0, tb0) >= 3
+                or len(set(ta0) & set(tb0)) / len(set(ta0) | set(tb0)) >= 0.15
+                or any(p in ta0 and p in tb0 for p in _EVENT_PHRASE_ANCHORS)
+            )
+            if title_ok:
+                return True
+        elif ta0 or tb0:
+            return True
+        return False
     if shared_ev and (num_a & num_b):
         return True
-    if shared_ev and not (ent_a & ent_b):
+    if shared_ev and not ent_overlap:
         if _lcs_len(sig_a.get("title_norm", ""), sig_b.get("title_norm", "")) >= 5:
             return True
     if not ev_a and not ev_b:
@@ -491,15 +611,41 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
             jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
             if jaccard >= 0.6:
                 return True
+            # 2026-08-11 修复：同实体 + 共享事件短语 → 同事件（跨日报道实体顺序相反、
+            # 措辞差异大，LCS 兜不住：索尼×台积电合资三推实证）。金额守卫：
+            # 双方金额均明确且无交集 → 不同事件（防"50亿建厂 vs 10亿回购"误并漏推）。
+            if ent_overlap and not _title_direction_conflict(ta, tb):
+                if (num_a and num_b) and not (num_a & num_b):
+                    return False
+                if any(p in ta and p in tb for p in _EVENT_PHRASE_ANCHORS):
+                    return True
             shorter = min(len(ta), len(tb))
             if shorter >= 8:
+                # 2026-08-11 修复：同主体(实体模糊重叠)或同金额时放宽标题相似阈值——
+                # 跨日报道措辞差异大（"拟合资建厂" vs "批准成立合资企业"），
+                # 但主体+金额一致，放宽 LCS 即可合并，防 48h 内重复推送
+                # （韩国5万亿基金×2、索尼台积电合资×3 实证）。
+                # 放宽仅对"同实体/同金额"生效：SK海力士不同事件（扩产 vs 股东回报）
+                # 标题无共享长段，仍不会被误并（漏推守卫）。
+                same_anchor = ent_overlap or bool(num_a & num_b)
+                # 误并守卫（2026-08-11 实证）："央行授权德银" vs "央行十五五规划"
+                # 仅因实体名"中国人民银行"重复出现，LCS 子序列虚高至 0.52 被误并。
+                # 同锚放宽前要求：剔除实体词后标题仍有 ≥3 字连续共享内容，
+                # 即两条报道除主体外确实描述同一件事。
+                if same_anchor:
+                    strip_a = _strip_entities(ta, ent_a)
+                    strip_b = _strip_entities(tb, ent_b)
+                    if strip_a and strip_b and _lcs_len(strip_a, strip_b) < 3:
+                        return False
                 # 连续子串兜底（比例足够高 → 同事件）
-                if _lcs_len(ta, tb) / shorter >= 0.55:
+                if _lcs_len(ta, tb) / shorter >= (0.35 if same_anchor else 0.55):
                     return True
                 # 子序列兜底：允许单字替换（"存储ETF" vs "内存ETF"）
                 # 仅在匹配长度绝对充足且占比高时启用，避免日常流水误并
                 sub = _lcs_subseq_len(ta, tb)
-                if sub >= 12 and sub / shorter >= 0.6:
+                sub_min = 10 if same_anchor else 12
+                sub_ratio = 0.45 if same_anchor else 0.6
+                if sub >= sub_min and sub / shorter >= sub_ratio:
                     return True
     return False
 
@@ -766,12 +912,24 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 3. 科技龙头个股的重大消息（寒武纪、中际旭创、宁德时代、英伟达产业链相关等第一梯队
    公司的重大经营事件、大额订单、业绩剧变、监管动向）
 4. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块
+5. AI/科技龙头的新产品、新模型、新芯片发布（OpenAI/微软/英伟达/谷歌/三星/SK海力士等发布
+   新模型版本、自研芯片、HBM新品等）——只要消息经证实或来自权威媒体，即属重大，即使
+   没有点名A股公司（2026-08-11 实证漏推：OpenAI发布GPT-5.6-Cyber）
+6. 核心科技板块的利空警示（行业见顶信号、龙头目标价被大幅下调、产能过剩担忧、重大诉讼/
+   监管审查）——利空警示同样属于必须推送的重大消息，方向为 bearish（2026-08-11 实证漏推：
+   韩国券商砍三星/SK海力士目标价约30%）
+7. AI 监管与政策（立法机构、监管机构、政府要员对 AI 开发/使用/出口的限制、调查、听证）——
+   即使不点名具体公司（2026-08-11 实证漏推：美参议员致信要求暂停AI开发）
 明确不推（无论业绩多好、涨跌多剧烈）：
 - 纯个人观点/猜测类言论：政客或机构单方面"怀疑""认为""预计"等表态，没有真实事件或官方立场
   变化、没有实际市场反应佐证，则不视为重大事件——即便话题涉及地缘、石油或美股
 - 只影响中小市值个股自身股价的消息：业绩预告/业绩变动、小额回购、增持/减持、中标/签约、
   日常经营、子公司事项、分红送转等——除非该股是行业龙头或直接改变板块逻辑
-- 与上述四条优先级均无关的其他资讯
+- 外围央行（非中国）的日常表态/会议纪要/储备数据（日本央行委员意见、印度央行、匈牙利央行等），
+  除非涉及重大政策转向或直接影响 A 股
+- 分析师评级调整/目标价小幅变动（杰富瑞、伯恩斯坦等），除非幅度极大且已引发市场剧烈反应
+- 无官方确认的产品传闻/路线图预测（苹果折叠 iPhone、郭明錤预测等）
+- 与上述优先级均无关的其他资讯
 
 对每条输入严格输出一个 JSON 数组元素，字段：
 {"idx": 输入的idx原样回显, "title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
@@ -1354,6 +1512,16 @@ def run_once(dry_run: bool = False) -> dict:
         if j.get("direction") not in ("bullish", "bearish"):
             logger.info(f"非强档方向({j.get('direction')})，不推: {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
+            skipped += 1
+            continue
+        # 2026-08-11 修复（审核实证 13/61 滥推）：栏目汇总/指数播报/盘面异动类
+        # 即使 LLM 判强档也硬过滤（"晚间新闻精选""隔夜要闻""KOSPI涨超2%""概念异动拉升"），
+        # 属"非重大消息"，按用户口径（仅重大事件推送）不应推。记 seen 标注原因。
+        noise_reason = _is_noise_push(n, j, leader_watchlist)
+        if noise_reason:
+            logger.info(f"噪声过滤({noise_reason})，不推: {n.get('title', '')[:40]}")
+            seen[n["_fp"]] = {"t": now, "pushed": False,
+                              "title": str(n.get("title", ""))[:52] + f"[{noise_reason}不推]"}
             skipped += 1
             continue
         # 判定顺序：
