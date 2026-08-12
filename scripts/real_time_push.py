@@ -312,11 +312,14 @@ def _push_event_sig(news: dict, judge: dict) -> dict:
     """
     stocks, events, numbers = _event_signature_light(news)
     entities = {str(e).strip() for e in (judge.get("entities") or []) if str(e).strip()}
+    sectors = {str(s).strip() for s in (judge.get("sectors") or []) if str(s).strip()}
     return {
         "stocks": sorted(stocks),
         "entities": sorted(entities),
         "events": sorted(events),
         "numbers": sorted(numbers),
+        "sectors": sorted(sectors),
+        "scope": str(judge.get("scope") or "stock"),
         "title_norm": _normalize_title(news.get("title", "")),
     }
 
@@ -328,6 +331,7 @@ def _merge_event_sig(sig_a: dict, sig_b: dict) -> dict:
         "entities": sorted(set(sig_a.get("entities") or []) | set(sig_b.get("entities") or [])),
         "events": sorted(set(sig_a.get("events") or []) | set(sig_b.get("events") or [])),
         "numbers": sorted(set(sig_a.get("numbers") or []) | set(sig_b.get("numbers") or [])),
+        "sectors": sorted(set(sig_a.get("sectors") or []) | set(sig_b.get("sectors") or [])),
         "title_norm": sig_a.get("title_norm", "") if len(sig_a.get("title_norm", "")) >= len(sig_b.get("title_norm", "")) else sig_b.get("title_norm", ""),
     }
 
@@ -419,6 +423,10 @@ _NOISE_COLUMN_MARKERS = [
     "新闻精选", "晚间新闻", "要闻速递", "隔夜要闻", "全球要闻", "九点特供", "风口研报",
     "投资避雷针", "午评", "收评", "盘前速递", "新闻速览", "涨停分析",
     "盘前要闻", "市场要闻", "研报精选",
+    # 2026-08-12 审核实证漏网："金十数据整理欧盘美盘重要新闻汇总"（8-11 23:32）被推送，
+    # 既有词表有"新闻精选"但无"新闻汇总"。补入，含"重要新闻汇总/要闻汇总"等变体。
+    # 勿加"早报/晚报"——"期货早报"含非农等宏观数据曾实证合理推送。
+    "新闻汇总", "要闻汇总", "市场汇总",
 ]
 # 指数盘中行情播报的波动措辞（与 _INDEX_TOKENS 组合判定，避免误伤个股消息）
 _NOISE_INDEX_MOVE = [
@@ -534,6 +542,59 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
         if not is_leader:
             return "盘面异动"
     return ""
+
+
+# 宏观/政策/地缘类（2026-08-12 修复：防偏科分层配额用——
+# 命中此类词条的候选在溢出时优先于普通科技/行情候选，保证宏观不被打压。
+# 命中词与 HIGH_SIGNAL_KEYWORDS 的宏观区保持一致，另补少量地缘/数据词。）
+_MACRO_POLICY_KEYWORDS = [
+    "央行", "证监会", "国常会", "政治局", "国务院", "降准", "降息", "加息",
+    "CPI", "PPI", "通胀", "物价", "利率决议", "FOMC", "GDP", "失业率", "就业数据",
+    "非农", "美债", "社融", "LPR", "PMI", "印花税", "注册制", "平准基金", "汇金", "国家队",
+    "美联储", "鲍威尔", "欧央行", "地缘", "战争", "关税", "贸易战", "制裁", "出口管制",
+    "中东", "台海", "原油暴跌", "原油暴涨",
+]
+
+# 同题材推送饱和上限（2026-08-12 审核实证：存储/半导体当日推 17 条占 47%，
+# 信息价值递减、用户观感"推的都是不重要的"。同一题材（共享板块或实体）
+# 24h 内已推 ≥ 上限后，新条目不再推，记 seen 标注；market 级（宏观数据/
+# 大盘事件）豁免，保证 CPI 等 market 级数据永不被饱和拦截。
+# 上限可通过环境变量 RT_TOPIC_LIMIT 调整。）
+TOPIC_PUSH_LIMIT = int(os.getenv("RT_TOPIC_LIMIT", "5"))
+TOPIC_PUSH_WINDOW_H = 24.0
+
+
+def _is_macro_policy(news: dict) -> bool:
+    """候选是否属宏观/政策/地缘类（溢出排序优先，防宏观被科技噪声挤占）"""
+    title = str(news.get("title", "") or "")
+    content = str(news.get("content", "") or "")
+    text = f"{title} {content}"
+    return any(k in text for k in _MACRO_POLICY_KEYWORDS)
+
+
+def _topic_saturated(sig: dict, pushed_events: list) -> bool:
+    """同题材推送是否已达饱和：market 级豁免；板块/实体 24h 内已推 ≥ 上限"""
+    if str(sig.get("scope") or "stock") == "market":
+        return False
+    secs = set(sig.get("sectors") or [])
+    ents = set(sig.get("stocks") or []) | set(sig.get("entities") or [])
+    if not secs and not ents:
+        return False
+    now_ts = time.time()
+    cnt = 0
+    for pe in pushed_events:
+        t = str(pe.get("t") or "")
+        try:
+            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
+            continue
+        psecs = set(pe.get("sectors") or [])
+        pents = set(pe.get("stocks") or []) | set(pe.get("entities") or [])
+        if (secs & psecs) or (ents & pents):
+            cnt += 1
+    return cnt >= TOPIC_PUSH_LIMIT
 
 
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
@@ -884,8 +945,38 @@ def save_state(state: dict) -> None:
 # ============================================================
 # 规则预筛
 # ============================================================
+# 宏观数据发布识别（2026-08-12 修复：美国7月CPI系列87条全漏推——
+# 根因是 HIGH_SIGNAL_KEYWORDS 缺 CPI/PPI 等词（已补），此为第二层兜底：
+# 覆盖"消费者物价指数""生产者出厂价格"等全称变体，以及数据语境快讯。
+# 命中 = 宏观数据词 + 数据语境（公布/预期/年率/录得等），确定性事件直接送 LLM 判定。
+# 注：数据词用词边界匹配（CPI 不误命中普通文本）；不含数据语境的数据词
+# （如"芯片通胀""油价上涨"）不在此直通，仍走常规打分路径。
+_MACRO_DATA_PATTERNS = [
+    r"(?<![A-Za-z0-9])CPI(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])PPI(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])FOMC(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])GDP(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])PMI(?![A-Za-z0-9])", r"(?<![A-Za-z0-9])LPR(?![A-Za-z0-9])",
+    "非农", "失业率", "通胀", "物价", "利率决议", "美债", "社融", "贸易帐",
+    "消费者物价", "生产者物价", "出厂价格", "居民消费价格", "工业生产者",
+]
+_MACRO_RELEASE_CONTEXT = ["公布", "发布", "数据", "预期", "前值", "年率", "月率",
+                          "录得", "符合预期", "同比", "环比", "符合市场预期"]
+
+
+def _is_macro_data_release(text: str) -> bool:
+    """宏观数据发布类快讯识别：数据词 + 数据语境 → 直通 LLM 判定"""
+    if not text:
+        return False
+    if not any(re.search(p, text) for p in _MACRO_DATA_PATTERNS):
+        return False
+    return any(c in text for c in _MACRO_RELEASE_CONTEXT)
+
+
 def _prefilter(news: dict) -> tuple:
-    """规则预筛：返回 (预筛评分, 是否命中高信号词)"""
+    """规则预筛：返回 (预筛评分, 是否命中高信号词)
+
+    2026-08-12 修复：高信号词命中 或 宏观数据发布识别（_is_macro_data_release）
+    均直通 LLM 判定——确定性宏观数据事件即使预筛分低也不允许静默丢弃。
+    """
     score = calculate_prefilter_importance(news)
     title = str(news.get("title", "") or "")
     content = str(news.get("content", "") or "")
@@ -897,7 +988,7 @@ def _prefilter(news: dict) -> tuple:
         text = text.replace(name, "")
     # 2026-08-06 修复：改用共享词边界匹配（has_signal_keyword），
     # "STorage/STMicroelectronics" 不再误命中 "ST" 信号词
-    hit = has_signal_keyword(text)
+    hit = has_signal_keyword(text) or _is_macro_data_release(text)
     return float(score), hit
 
 
@@ -906,7 +997,11 @@ def _prefilter(news: dict) -> tuple:
 # ============================================================
 _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯是否属于"必须立即推送的重大消息"。
 推送优先级由高到低，以下任一条件成立则应判为推送：
-1. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件）
+1. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件；
+   以及中国/美国核心宏观数据发布——CPI、PPI、非农、GDP、利率决议、PMI 等——
+   数据发布本身即 market 级重大消息，方向按数据对市场的实际含义判定，
+   公布后的市场反应（股债汇、加息/降息预期变化、机构点评）同属重大，与数据本体
+   合并为一条推送即可，不必每条机构点评都单独推）
 2. 影响科技板块/科技产业链的资讯（AI、算力、半导体、芯片、存储、光模块/CPO、PCB、MLCC、
    机器人、消费电子等）：板块景气变化、龙头动向、技术突破、产业政策——即使标题未点名个股
 3. 科技龙头个股的重大消息（寒武纪、中际旭创、宁德时代、英伟达产业链相关等第一梯队
@@ -926,7 +1021,8 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 - 只影响中小市值个股自身股价的消息：业绩预告/业绩变动、小额回购、增持/减持、中标/签约、
   日常经营、子公司事项、分红送转等——除非该股是行业龙头或直接改变板块逻辑
 - 外围央行（非中国）的日常表态/会议纪要/储备数据（日本央行委员意见、印度央行、匈牙利央行等），
-  除非涉及重大政策转向或直接影响 A 股
+  除非涉及重大政策转向或直接影响 A 股；注意：此条不含宏观数据发布本身——
+  外围重要数据（美国 CPI/PPI/非农/利率决议等）因直接影响全球市场与 A 股，仍按优先级 1 推送
 - 分析师评级调整/目标价小幅变动（杰富瑞、伯恩斯坦等），除非幅度极大且已引发市场剧烈反应
 - 无官方确认的产品传闻/路线图预测（苹果折叠 iPhone、郭明錤预测等）
 - 与上述优先级均无关的其他资讯
@@ -1414,8 +1510,17 @@ def run_once(dry_run: bool = False) -> dict:
     max_candidates = int(os.getenv("RT_MAX_CANDIDATES", str(MAX_CANDIDATES_PER_ROUND)))
     overflow = []
     if len(candidates) > max_candidates:
+        # 2026-08-12 修复（防偏科分层）：高信号核心事件恒优先 → 宏观/政策/地缘类
+        # 次优先 → 普通候选按预筛分。此前"高信号>预筛分"两级排序中，同为高信号的
+        # 科技条目（韩国/存储/英伟达等宽泛词也命中）仍可能把宏观数据挤出——
+        # 今日 36 推中存储 17 条、宏观 0 条实证。宏观优先确保 CPI/降准等
+        # 确定性宏观事件在溢出时不被打压。
         candidates.sort(
-            key=lambda x: (1 if x.get("_hit_signal") else 0, x["_pref_score"]),
+            key=lambda x: (
+                1 if x.get("_hit_signal") else 0,
+                1 if _is_macro_policy(x) else 0,
+                x["_pref_score"],
+            ),
             reverse=True)
         overflow = candidates[max_candidates:]
         candidates = candidates[:max_candidates]
@@ -1568,6 +1673,16 @@ def run_once(dry_run: bool = False) -> dict:
             logger.info(f"同事件48h内已推送，跳过: {n.get('title', '')[:50]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[同事件已推]"}
+            skipped += 1
+            continue
+
+        # 同题材饱和拦截（2026-08-12 防偏科）：同一板块/实体 24h 内已推达上限
+        # （默认 5 条）后不再推——存储行情日 17 推实证；market 级（宏观数据/大盘）
+        # 豁免，CPI 等宏观数据永不受限。
+        if _topic_saturated(n["_sig"], pushed_events):
+            logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
+            seen[n["_fp"]] = {"t": now, "pushed": False,
+                              "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
             skipped += 1
             continue
 
