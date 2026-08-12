@@ -1686,3 +1686,45 @@ class TestMacroPolicyPriority:
             1 if rtp._is_macro_policy(x) else 0,
             x["_pref_score"]), reverse=True)
         assert "CPI" in cands[0]["title"], "宏观类应在科技噪声之前"
+
+
+class TestSameEventEveningRepeat:
+    """2026-08-12 修复：晚间推送重复（22:01 同轮双推 + 21:31/22:01 跨轮重复）"""
+
+    def _sig(self, title, entities=(), sectors=(), scope="sector"):
+        return {"stocks": [], "entities": list(entities), "events": [], "numbers": [],
+                "sectors": list(sectors), "scope": scope,
+                "title_norm": rtp._normalize_title(title)}
+
+    def test_same_round_sector_move_merge(self):
+        """22:01 同轮双推：美股光通信/存储普涨多源报道应合并"""
+        a = self._sig("美股光通信存储概念股普涨 诺基亚升逾9 Ciena Lumentum Coherent",
+                      ["Ciena", "Coherent", "Lumentum", "诺基亚"], ["光模块/CPO", "半导体", "存储"])
+        b = self._sig("美国7月通胀表现温和 美股盘初纳指涨09 光通信股存储芯片股普涨",
+                      ["CoreWeave", "Lumentum", "超微电脑"], ["AI算力", "光通信", "半导体"], scope="market")
+        assert rtp._is_same_event(a, b) is True
+
+    def test_cross_round_macro_reaction_merge(self):
+        """21:31 与 22:01 跨轮：CPI 后美股反应同一宏观事件应合并"""
+        a = self._sig("美国7月通胀表现温和 美股盘初纳指涨09 光通信股存储芯片股普涨",
+                      ["CoreWeave", "Lumentum", "超微电脑"], ["AI算力", "光通信", "半导体"], scope="market")
+        b = self._sig("美国CPI数据符合预期 美股高开", ["SK海力士", "美光科技", "闪迪"])
+        assert rtp._is_same_event(a, b) is True
+
+    def test_diff_country_cpi_not_merge(self):
+        """不同国家 CPI 不误并（无同市场域词）"""
+        a = self._sig("德国7月CPI同比终值 2.8% 预期2.8%", ["德国"])
+        b = self._sig("美国7月CPI同比 3.4% 符合预期", ["美国"])
+        assert rtp._is_same_event(a, b) is False
+
+    def test_opposite_direction_not_merge(self):
+        """板块行情方向对立不合并"""
+        a = self._sig("存储芯片价格上涨 涨幅扩大", ["三星"], ["半导体", "存储"])
+        b = self._sig("半导体板块走弱 集体下挫", ["三星"], ["半导体"])
+        assert rtp._is_same_event(a, b) is False
+
+    def test_diff_sector_not_merge(self):
+        """不同板块（光模块 vs 存储）不合并"""
+        a = self._sig("光模块涨价逻辑延续 龙头提价", ["中际旭创"], ["光模块/CPO"])
+        b = self._sig("存储芯片涨价 三星美光跟进", ["三星"], ["存储"])
+        assert rtp._is_same_event(a, b) is False
