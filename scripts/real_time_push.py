@@ -454,6 +454,27 @@ _EVENT_PHRASE_ANCHORS = [
     "增持", "减持",
 ]
 
+# 宏观数据发布后的市场反应合并词（2026-08-12 实证：21:31"美国CPI符合预期美股高开"
+# vs 22:01"美国7月通胀表现温和美股盘初纳指涨09光通信存储普涨"——同一宏观事件
+# 48h 内推两次。entities 各抽各的（SK海力士/美光 vs CoreWeave/超微电脑）无交集，
+# 标题共享段短，既有 7 个合并分支全部兜不住。守卫：双方均含宏观数据词 +
+# 同市场域（防"德国CPI vs 美国CPI"误并——德国CPI标题无美股域词）+ 方向一致。）
+_MACRO_EVENT_WORDS = ["CPI", "PPI", "通胀", "物价", "非农", "失业率", "GDP",
+                      "利率决议", "FOMC", "就业数据"]
+
+# 行情普涨/普跌类措辞（sectors 交集合并用，2026-08-12 实证：22:01 同轮双推
+# "美股光通信存储概念股普涨诺基亚升逾9" vs "美国7月通胀表现温和美股盘初纳指涨09
+# 光通信股存储芯片股普涨"——entities 各抽各的（诺基亚/Ciena/Coherent vs
+# CoreWeave/超微电脑），无共享时段词/指数词，LCS 仅"光通信"3 字兜不住。
+# 两标题共享板块（光通信/半导体/存储）且均为美股行情 → 合并。
+# 不含单字"涨/跌"防"涨价/跌幅"等非行情语境误并。）
+_MARKET_MOVE_WORDS = [
+    "普涨", "普跌", "高开", "低开", "走强", "走弱", "上涨", "下跌",
+    "涨超", "跌超", "升逾", "涨逾", "跳水", "回升", "大涨", "大跌",
+    "拉升", "上扬", "下挫", "冲高", "回落", "涨近", "跌近",
+    "涨幅扩大", "跌幅扩大",
+]
+
 
 def _session_group(ta: str, tb: str) -> str | None:
     """两条标题是否属于同一市场时段组（开盘组/午评组/收盘组），返回组名或 None"""
@@ -669,6 +690,26 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
             if (not _session_conflict(ta, tb) and _market_domain_overlap(ta, tb)
                     and _shared_index_token(ta, tb)):
                 return True
+            # 2026-08-12 修复（22:01 同轮双推实证）：美股盘初"光通信/存储普涨"
+            # 多源报道 entities 各抽各的、无共享时段/指数词、LCS 仅"光通信"3字——
+            # 既有分支全部兜不住。新增 sectors 交集合并：均无事件组 + 板块交集
+            # + 同市场域 + 任一含行情措辞（方向一致已在入口守卫）。
+            # 误并评估：sectors 不同（涨价逻辑 vs 行情情绪）通常交集为空；
+            # 交集非空且同域时，少推一条比重复推送更符合用户口径。
+            sec_a = set(sig_a.get("sectors") or [])
+            sec_b = set(sig_b.get("sectors") or [])
+            if (sec_a & sec_b) and _market_domain_overlap(ta, tb):
+                if any(w in ta for w in _MARKET_MOVE_WORDS) or any(w in tb for w in _MARKET_MOVE_WORDS):
+                    return True
+            # 2026-08-12 修复（21:31 vs 22:01 跨轮重复实证）：同一宏观数据事件
+            # （CPI符合预期美股高开 / 通胀温和美股盘初纳指涨）48h 内推两次。
+            # 双方均含宏观数据词 + 同市场域 → 同事件（方向一致已在入口守卫）。
+            # 市场域守卫防不同国家 CPI 误并（德国/意大利 CPI 标题无美股域词）。
+            if _market_domain_overlap(ta, tb):
+                mac_a = any(w in ta for w in _MACRO_EVENT_WORDS)
+                mac_b = any(w in tb for w in _MACRO_EVENT_WORDS)
+                if mac_a and mac_b:
+                    return True
             jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
             if jaccard >= 0.6:
                 return True
