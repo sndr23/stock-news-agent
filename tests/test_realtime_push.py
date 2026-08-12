@@ -1534,3 +1534,155 @@ class TestRunOnceNoiseFilterIntegration:
         stats = rtp.run_once(dry_run=False)
         assert stats["pushed"] == 1, "重大消息应正常推送"
         assert len(sent) == 1 and "英伟达" in sent[0]
+
+
+class TestMacroDataPrefilter:
+    """2026-08-12 修复：美国7月CPI 87条全漏推——宏观数据发布类预筛直通 LLM"""
+
+    def test_cpi_data_release_direct_llm(self):
+        """数据本体/前瞻/市场反应/全称变体均直通（此前预筛 0.14 被拦）"""
+        cases = [
+            "美国7月CPI同比 3.4%，预期 3.4%，前值 3.5%。",
+            "美国7月CPI同比增长3.4% 符合市场预期",
+            "高盛：美国七月消费者物价指数表现令人鼓舞",
+            "新闻交易员：今夜美国CPI，可能掀翻整个利率剧本",
+            "美国7月CPI数据公布后，交易员略微降低9月份美联储加息的压注",
+            "提醒：北京时间20:30，将公布美国7月CPI数据",
+            "德国7月CPI同比终值 2.8%，预期2.8%，前值2.80%。",
+            "美国7月未季调核心CPI年率 2.5%，预期2.50%，前值2.60%。",
+        ]
+        for t in cases:
+            score, hit = rtp._prefilter({"title": t, "content": "", "category": "news"})
+            assert hit, f"应直通 LLM: {t}"
+            assert score >= 0.55 or hit, f"命中高信号词应视为直通: {t}"
+
+    def test_ppl_gdp_rate_decision_direct_llm(self):
+        """PPI/GDP/利率决议/失业率等同级宏观数据同样直通"""
+        cases = [
+            "中国7月PPI同比下降2.1% 环比下降0.3%",
+            "美国二季度GDP年化季率修正值 2.1%，预期 2.0%",
+            "美联储利率决议：维持利率不变 符合市场预期",
+            "美国7月失业率 4.1%，预期 4.2%，前值 4.3%。",
+        ]
+        for t in cases:
+            _, hit = rtp._prefilter({"title": t, "content": "", "category": "news"})
+            assert hit, f"应直通 LLM: {t}"
+
+    def test_non_macro_context_not_bypassed(self):
+        """非数据语境（芯片通胀/普通行情）不因宏观词误直通"""
+        cases = [
+            "AI需求引爆芯片通胀？大摩：或会持续多年",
+            "韩国KOSPI指数日内涨5% 现报6665点",
+            "中金：高端感光干膜需求扩张 具备长期投资价值",
+        ]
+        for t in cases:
+            score, hit = rtp._prefilter({"title": t, "content": "", "category": "news"})
+            if not hit:
+                assert score < 0.55, f"未命中高信号词不应直通: {t}"
+
+    def test_fingerprint_broad_words_include_macro(self):
+        """宏观词在指纹宽泛排除表中：美CPI 与 德CPI 不同指纹（防互相覆盖漏推）"""
+        from src.tools.keyword_tables import find_signal_fp_keywords
+        fp_us = find_signal_fp_keywords("美国7月CPI同比 3.4% 预期3.4%")
+        fp_de = find_signal_fp_keywords("德国7月CPI同比终值 2.8% 预期2.8%")
+        assert fp_us == [] and fp_de == [], \
+            f"宏观词应退出指纹 sig 路径（退回标题指纹），实际: {fp_us} / {fp_de}"
+
+
+class TestNoiseColumnSummary:
+    """2026-08-12 修复：金十"欧盘美盘重要新闻汇总"漏推→补"新闻汇总"类栏目词"""
+
+    def test_news_summary_variants(self):
+        """新闻汇总/要闻汇总/市场汇总 均识别为栏目汇总"""
+        cases = [
+            "金十数据整理欧盘美盘重要新闻汇总20260811",
+            "金十数据整理隔夜要闻汇总",
+            "今日市场要闻汇总：三大指数集体收涨",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, {"is_leader_stock": False}, set()) == "栏目汇总", t
+
+    def test_macro_early_report_not_hit(self):
+        """防误伤：含宏观数据的早报类不被"新闻汇总"误伤"""
+        t = "期货早报美国非农意外减少23万人 加息预期骤变"
+        assert rtp._is_noise_push({"title": t}, {"is_leader_stock": False}, set()) == "", t
+
+
+class TestTopicSaturation:
+    """2026-08-12 防偏科：同题材 24h 内推送饱和拦截（存储 17 推实证）"""
+
+    def _sig(self, sectors=(), entities=(), scope="sector"):
+        return {"sectors": sorted(sectors), "stocks": [], "entities": sorted(entities),
+                "events": [], "numbers": [], "title_norm": "x", "scope": scope}
+
+    def test_same_entity_saturated(self):
+        """同实体 24h 内已推 5 条 → 饱和拦截"""
+        pushed = [{"sectors": [], "stocks": [], "entities": ["SK海力士"],
+                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+        assert rtp._topic_saturated(self._sig(entities=["SK海力士"]), pushed) is True
+
+    def test_same_sector_saturated(self):
+        """同板块 24h 内已推 5 条 → 饱和拦截"""
+        pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
+                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+        assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is True
+
+    def test_below_limit_not_saturated(self):
+        """4 条未达上限 → 放行"""
+        pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
+                   "t": "2026-08-12 10:00:00"} for _ in range(4)]
+        assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is False
+
+    def test_market_scope_exempt(self):
+        """market 级（宏观数据/大盘）豁免：CPI 永不受饱和拦截"""
+        pushed = [{"sectors": ["宏观"], "stocks": [], "entities": [],
+                   "t": "2026-08-12 10:00:00"} for _ in range(10)]
+        assert rtp._topic_saturated(self._sig(sectors=["宏观"], scope="market"), pushed) is False
+
+    def test_outside_window_not_counted(self):
+        """24h 窗口外的推送不计入饱和"""
+        pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
+                   "t": "2026-08-10 09:00:00"} for _ in range(5)]
+        assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is False
+
+    def test_different_topic_not_saturated(self):
+        """不同题材不互相影响"""
+        pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
+                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+        assert rtp._topic_saturated(self._sig(sectors=["光模块"]), pushed) is False
+
+
+class TestMacroPolicyPriority:
+    """2026-08-12 防偏科：溢出排序宏观/政策类优先于普通科技噪声"""
+
+    def test_macro_policy_detected(self):
+        """宏观/政策/地缘类识别"""
+        macro = [
+            {"title": "中国央行宣布降准0.5个百分点"},
+            {"title": "美国7月CPI同比 3.4% 符合预期"},
+            {"title": "证监会就上市公司监管新规公开征求意见"},
+            {"title": "中东局势升级 国际油价大涨"},
+        ]
+        normal = [
+            {"title": "港股存储概念走强 南方两倍做多三星电子涨16.87%"},
+            {"title": "中金：高端感光干膜需求扩张"},
+        ]
+        for n in macro:
+            assert rtp._is_macro_policy(n) is True, n["title"]
+        for n in normal:
+            assert rtp._is_macro_policy(n) is False, n["title"]
+
+    def test_overflow_sort_macro_first(self):
+        """同命中高信号词时，宏观/政策类排在前（防存储行情挤出宏观）"""
+        import types
+        cands = [
+            {"title": "港股存储概念走强 南方两倍做多三星电子涨16.87%",
+             "_hit_signal": True, "_pref_score": 0.9},
+            {"title": "美国7月CPI数据公布后 交易员降低加息压注",
+             "_hit_signal": True, "_pref_score": 0.8},
+        ]
+        cands.sort(key=lambda x: (
+            1 if x.get("_hit_signal") else 0,
+            1 if rtp._is_macro_policy(x) else 0,
+            x["_pref_score"]), reverse=True)
+        assert "CPI" in cands[0]["title"], "宏观类应在科技噪声之前"
