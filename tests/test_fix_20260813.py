@@ -255,4 +255,67 @@ class TestEntitySectorNormalize:
         assert rtp._is_same_event(a, b)
 
 
+# ============================================================
+# 8. 2026-08-13 全链路复审修复：tech_override 排除观点 + 饱和口径对齐
+# ============================================================
+class TestTechOverrideViewGuard:
+    """P0：tech_override 不得放行研报/观点/主题类（即使 LLM 判 push=false）"""
+
+    def _judge(self, **kw):
+        j = {"push": False, "score": 6, "direction": "bullish", "scope": "sector",
+             "sectors": ["AI"], "is_leader_stock": False}
+        j.update(kw)
+        return j
+
+    def test_research_view_not_override(self):
+        """机构称/市场空间 → 不放行（LLM 的 push=false 生效）"""
+        n = {"title": "产业资本加速投入 机构称物理AI市场空间将迈向星辰大海", "content": "",
+             "source": "东方财富快讯"}
+        assert rtp._tech_override_enabled(n, self._judge(), set()) is False
+
+    def test_transmission_view_not_override(self):
+        """研报/传导类 → 不放行"""
+        n = {"title": "AI服务器液冷投资向零部件纵深传导 液冷产业链迎订单验证关键窗口", "content": "",
+             "source": "东方财富快讯"}
+        assert rtp._tech_override_enabled(n, self._judge(sectors=["AI算力", "液冷散热"]), set()) is False
+
+    def test_hard_event_still_override(self):
+        """硬数据科技事件（无观点词）仍兜底放行"""
+        n = {"title": "台积电部分CoWoS产品生产良率升至98%", "content": "", "source": "财联社"}
+        assert rtp._tech_override_enabled(n, self._judge(sectors=["先进封装", "半导体"]), set()) is True
+
+    def test_leader_hard_event_still_override(self):
+        """科技龙头硬事件（无观点词）仍兜底放行"""
+        n = {"title": "寒武纪签署50亿元大额订单", "content": "", "source": "东方财富快讯"}
+        assert rtp._tech_override_enabled(
+            n, self._judge(scope="stock", is_leader_stock=True, sectors=["AI芯片"]), set()) is True
+
+
+class TestTopicSaturatedConsistency:
+    """P1：饱和判定与合并口径对齐（板块子串包含 + 实体归一化）"""
+
+    @staticmethod
+    def _ts(hours_ago=2):
+        from datetime import datetime, timedelta
+        return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_sector_substring_counts(self):
+        """板块'AI算力' vs 已推'AI/算力'（实体空）→ 计入饱和"""
+        sig = {"entities": [], "sectors": ["AI算力"], "stocks": [], "scope": "sector"}
+        pushed = [{"sectors": ["AI", "算力"], "stocks": [], "entities": [], "t": self._ts()} for _ in range(5)]
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_entity_alias_counts(self):
+        """实体'摩根士丹利'（归一化）vs 旧数据'大摩'（未归一化）→ 计入饱和"""
+        sig = {"entities": ["摩根士丹利"], "sectors": [], "stocks": [], "scope": "sector"}
+        pushed = [{"sectors": [], "stocks": [], "entities": ["大摩"], "t": self._ts()} for _ in range(5)]
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_different_topic_not_saturated(self):
+        """不同板块不互相影响（回归）"""
+        sig = {"entities": [], "sectors": ["光模块"], "stocks": [], "scope": "sector"}
+        pushed = [{"sectors": ["存储"], "stocks": [], "entities": [], "t": self._ts()} for _ in range(5)]
+        assert rtp._topic_saturated(sig, pushed) is False
+
+
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用

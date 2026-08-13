@@ -497,6 +497,14 @@ _NOISE_INTRADAY_MARKERS = [
     "表现活跃", "概念活跃", "持续活跃", "反复活跃", "概念走强", "概念走高",
     "集体大涨", "涨停潮", "活跃拉升",
 ]
+# 研报/观点/主题类措辞（2026-08-13 P0 修复：tech_override 排除守卫用——
+# 命中此类措辞的科技消息属"无具体事件的定性判断"，即使 LLM 判 push=false
+# 也**不得**被科技兜底强制放行，让 LLM 的否决生效。实测："机构称物理AI市场空间"
+# "液冷投资向零部件纵深传导" 均命中，此前被 tech_override 放行误推。）
+_TECH_OVERRIDE_VIEW_WORDS = [
+    "机构称", "机构认为", "研报", "点评", "观点", "看好", "展望", "解读",
+    "市场空间", "有望", "传导", "开启", "浪潮", "风口", "逻辑", "下注方向",
+]
 # 指数行情播报需额外覆盖的指数名（_INDEX_TOKENS 之外的出现形式）
 _NOISE_INDEX_NAMES = _INDEX_TOKENS + ["KOSPI", "恒生指数", "综合指数"]
 
@@ -667,11 +675,18 @@ def _is_macro_policy(news: dict) -> bool:
 
 
 def _topic_saturated(sig: dict, pushed_events: list) -> bool:
-    """同题材推送是否已达饱和：market 级豁免；板块/实体 24h 内已推 ≥ 上限"""
+    """同题材推送是否已达饱和：market 级豁免；板块/实体 24h 内已推 ≥ 上限
+
+    2026-08-13 P1 修复（口径对齐）：板块重叠改用 _sectors_overlap（子串包含，
+    "AI算力"与"AI/算力"同板块）、实体重叠用归一化后交集（"大摩"与"摩根士丹利"
+    同实体）——此前用精确交集，与 _is_same_event 合并口径不一致，实体为空时
+    板块表述不一致会漏判同题材，饱和限流失准。
+    """
     if str(sig.get("scope") or "stock") == "market":
         return False
     secs = set(sig.get("sectors") or [])
-    ents = set(sig.get("stocks") or []) | set(sig.get("entities") or [])
+    ents = {_normalize_entity(e) for e in (sig.get("stocks") or [])} | \
+           {_normalize_entity(e) for e in (sig.get("entities") or [])}
     if not secs and not ents:
         return False
     now_ts = time.time()
@@ -685,8 +700,9 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
         if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
             continue
         psecs = set(pe.get("sectors") or [])
-        pents = set(pe.get("stocks") or []) | set(pe.get("entities") or [])
-        if (secs & psecs) or (ents & pents):
+        pents = {_normalize_entity(e) for e in (pe.get("stocks") or [])} | \
+                {_normalize_entity(e) for e in (pe.get("entities") or [])}
+        if _sectors_overlap(secs, psecs) or (ents & pents):
             cnt += 1
     return cnt >= TOPIC_PUSH_LIMIT
 
@@ -1477,6 +1493,30 @@ def _hit_watchlist(news: dict, watchlist: set) -> bool:
     return False
 
 
+def _tech_override_enabled(news: dict, judge: dict, leader_watchlist: set) -> bool:
+    """科技兜底放行判定（2026-08-13 P0 重构：从 run_once 5c 提取，便于测试）
+
+    防 LLM 漏推科技硬事件：scope=sector 且含国内科技词（或 stock 且龙头且科技）
+    时，LLM 判 push=false 也兜底放行。但命中研报/观点/主题措辞
+    （_TECH_OVERRIDE_VIEW_WORDS，如"机构称/市场空间/传导/开启"）的定性判断不放行——
+    实测"机构称物理AI市场空间"等研报/观点类曾因此被强制放行误推，让 LLM 的
+    push=false 否决恢复生效。
+    """
+    sectors = judge.get("sectors") or []
+    scope = str(judge.get("scope", "stock") or "stock").lower()
+    is_leader = bool(judge.get("is_leader_stock")) or _hit_watchlist(news, leader_watchlist)
+    strong = str(judge.get("direction", "neutral")) in ("bullish", "bearish")
+    score_ok = _to_float(judge.get("score", 0)) >= 5
+    view_text = f"{str(news.get('title', ''))} {str(news.get('content', '') or '')}"
+    if any(w in view_text for w in _TECH_OVERRIDE_VIEW_WORDS):
+        return False
+    if scope == "sector" and _is_domestic_tech(news, sectors) and (score_ok or strong):
+        return True
+    if scope == "stock" and is_leader and _is_domestic_tech(news, sectors) and (score_ok or strong):
+        return True
+    return False
+
+
 def _normalize_direction(value, news: dict = None) -> str:
     """归一化 LLM 返回的方向值到 6 档标准值
 
@@ -1827,17 +1867,13 @@ def run_once(dry_run: bool = False) -> dict:
         is_leader = bool(j.get("is_leader_stock")) or _hit_watchlist(n, leader_watchlist)
         sectors = j.get("sectors") or []
         scope = str(j.get("scope", "stock") or "stock").lower()
-        tech_override = (
-            # 板块级科技资讯：LLM 即使判不推也放行（score≥5 或 强方向，避免滥推）
-            scope == "sector" and _is_domestic_tech(n, sectors)
-            and (_to_float(j.get("score", 0)) >= 5
-                 or str(j.get("direction", "neutral")) in ("bullish", "bearish"))
-        ) or (
-            # 科技龙头个股的重大消息：LLM 判不推时仍放行
-            scope == "stock" and is_leader and _is_domestic_tech(n, sectors)
-            and (_to_float(j.get("score", 0)) >= 5
-                 or str(j.get("direction", "neutral")) in ("bullish", "bearish"))
-        )
+        # 2026-08-13 P0 修复：tech_override 排除研报/观点/主题类。
+        # 强档门槛后 `score>=5 or strong` 恒真，tech_override 原本退化为
+        # "scope=sector+科技词即放行"——"机构称物理AI"等研报/观点类在 LLM 判
+        # push=false 后被强制放行（抵消 prompt 收紧，今日误推实证）。
+        # 命中 _TECH_OVERRIDE_VIEW_WORDS（定性判断措辞）的科技消息不放行，
+        # 让 LLM 的 push=false 生效；仅未命中观点词（可能被 LLM 漏判的硬事件）兜底放行。
+        tech_override = _tech_override_enabled(n, j, leader_watchlist)
         if j.get("push") and _passes_threshold(
                 mode, j.get("score", 0), j.get("direction", "neutral"),
                 j.get("scope", "stock"), leader_stock=is_leader):
