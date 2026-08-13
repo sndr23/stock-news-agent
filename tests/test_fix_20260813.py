@@ -290,6 +290,30 @@ class TestTechOverrideViewGuard:
         assert rtp._tech_override_enabled(
             n, self._judge(scope="stock", is_leader_stock=True, sectors=["AI芯片"]), set()) is True
 
+    def test_analyst_warning_not_override(self):
+        """晚间复审残余：分析师'警告/示警'措辞 → 不放行（大摩/摩根士丹利观点）"""
+        n = {"title": "AI不缺需求缺算力 摩根士丹利警告供应瓶颈或持续数年", "content": "", "source": "财联社"}
+        assert rtp._tech_override_enabled(
+            n, self._judge(sectors=["AI算力", "半导体"]), set()) is False
+
+    def test_analyst_forecast_not_override(self):
+        """分析师'预计/目标价/评级'措辞 → 不放行"""
+        n = {"title": "机构预计英伟达下季度出货量翻倍 上调目标价", "content": "", "source": "东方财富快讯"}
+        assert rtp._tech_override_enabled(
+            n, self._judge(sectors=["AI芯片", "半导体"]), set()) is False
+
+    def test_generic_sector_trend_not_override(self):
+        """晚间复审残余：无事件佐证的'加码X业务'泛板块动态 → 不放行"""
+        n = {"title": "多家上市公司加码液冷散热业务", "content": "", "source": "东方财富快讯"}
+        assert rtp._tech_override_enabled(
+            n, self._judge(sectors=["AI算力基础设施", "液冷散热"]), set()) is False
+
+    def test_warning_hard_event_still_override(self):
+        """硬数据科技事件（无观点词）仍兜底放行——补词不误伤硬事件"""
+        n = {"title": "台积电部分CoWoS产品生产良率升至98%", "content": "", "source": "财联社"}
+        assert rtp._tech_override_enabled(
+            n, self._judge(sectors=["先进封装", "半导体"]), set()) is True
+
 
 class TestTopicSaturatedConsistency:
     """P1：饱和判定与合并口径对齐（板块子串包含 + 实体归一化）"""
