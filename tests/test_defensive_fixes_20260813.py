@@ -222,6 +222,130 @@ class TestWecomFatalErrcode:
 
 
 # ============================================================
+# P0: Gist 状态读取/合并失败 fail-stop（2026-08-13 状态丢失事故根因）
+# ============================================================
+class TestGistLoadFailStop:
+    def test_read_failure_raises(self, monkeypatch):
+        """3 次读取失败 → raise（禁止静默空状态）"""
+        import requests as real_requests
+
+        def fake_get(url, timeout=None):
+            raise IOError("network down")
+
+        monkeypatch.setattr(real_requests, "get", fake_get)
+        with pytest.raises(RuntimeError, match="读取失败"):
+            rtp._gist_load("token", "gid")
+
+    def test_json_corrupt_raises(self, monkeypatch):
+        """JSON 截断损坏 → raise JSONDecodeError（18:02 轮 0.72MB 截断实证）"""
+        import requests as real_requests
+        broken = '{"seen": {"a": {"t": "2026-08-13 10:00:00", "pushed": true, "title": "未闭合'
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"files": {"real_time_state.json": {"content": broken}}}
+
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        with pytest.raises(json.JSONDecodeError):
+            rtp._gist_load("token", "gid")
+
+    def test_missing_seen_key_raises(self, monkeypatch):
+        """结构缺 seen 键 → raise ValueError（拒绝把畸形内容当空状态）"""
+        import requests as real_requests
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"files": {"real_time_state.json": {"content": '{"pending": {}}'}}}
+
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        with pytest.raises(ValueError, match="seen"):
+            rtp._gist_load("token", "gid")
+
+    def test_valid_state_ok(self, monkeypatch):
+        """合法状态正常返回"""
+        import requests as real_requests
+        good = '{"seen": {"fp": {"t": "2026-08-13 10:00:00", "pushed": true}}, "pending": {}, "pushed_events": []}'
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"files": {"real_time_state.json": {"content": good}}}
+
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        st = rtp._gist_load("token", "gid")
+        assert "fp" in st["seen"]
+
+
+class TestSaveStateFailStop:
+    def test_merge_failure_ci_raises(self, monkeypatch):
+        """CI 下合并失败 → 拒绝覆盖并报错（防 19:03 覆盖事故重演）"""
+        monkeypatch.setenv("CI", "true")
+        monkeypatch.setenv("GIST_TOKEN", "t")
+        monkeypatch.setenv("GIST_ID", "g")
+
+        def boom(token, gid):
+            raise RuntimeError("gist down")
+
+        monkeypatch.setattr(rtp, "_gist_load", boom)
+        with pytest.raises(RuntimeError, match="拒绝覆盖"):
+            rtp.save_state(rtp._empty_state())
+
+    def test_merge_failure_local_does_not_write_gist(self, monkeypatch, tmp_path):
+        """本地模式合并失败 → 拒绝写 Gist，降级写本地文件"""
+        monkeypatch.setenv("CI", "false")
+        monkeypatch.setenv("GIST_TOKEN", "t")
+        monkeypatch.setenv("GIST_ID", "g")
+        gist_called = []
+
+        def boom(token, gid):
+            raise RuntimeError("gist down")
+
+        monkeypatch.setattr(rtp, "_gist_load", boom)
+        monkeypatch.setattr(rtp, "_gist_save", lambda token, gid, state: gist_called.append(1))
+        monkeypatch.setattr(rtp, "_state_path", lambda: Path(tmp_path) / "state.json")
+        rtp.save_state(rtp._empty_state())
+        assert gist_called == []  # 未写 Gist
+        assert (Path(tmp_path) / "state.json").exists()  # 降级写本地
+
+    def test_load_state_ci_gist_failure_raises(self, monkeypatch):
+        """CI 下 Gist 读取失败 → load_state 报错退出（不再空状态运行）"""
+        monkeypatch.setenv("CI", "true")
+        monkeypatch.setenv("GIST_TOKEN", "t")
+        monkeypatch.setenv("GIST_ID", "g")
+
+        def boom(token, gid):
+            raise RuntimeError("gist down")
+
+        monkeypatch.setattr(rtp, "_gist_load", boom)
+        with pytest.raises(RuntimeError):
+            rtp.load_state()
+
+    def test_seen_cap_limits_state_size(self, monkeypatch, tmp_path):
+        """seen 超上限按时间保留最新（状态文件体积控制，防 Gist 写入截断）"""
+        monkeypatch.setenv("CI", "false")
+        monkeypatch.delenv("GIST_TOKEN", raising=False)
+        monkeypatch.delenv("GIST_ID", raising=False)
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        state = rtp._empty_state()
+        for i in range(rtp.SEEN_MAX + 100):
+            state["seen"][f"fp{i:04d}"] = {"t": now, "pushed": False, "title": f"t{i}"}
+        monkeypatch.setattr(rtp, "_state_path", lambda: Path(tmp_path) / "state.json")
+        rtp.save_state(state)
+        saved = json.loads((Path(tmp_path) / "state.json").read_text(encoding="utf-8"))
+        assert len(saved["seen"]) <= rtp.SEEN_MAX
+        assert "fp0000" not in saved["seen"]  # 最早的被截断
+
+
+# ============================================================
 # run_once 主流程 mock 端到端（P3-2 补集成测试）
 # ============================================================
 class _FuncHolder:
