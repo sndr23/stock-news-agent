@@ -156,4 +156,69 @@ class TestNewsFingerprintCollision:
         assert a == b
 
 
+# ============================================================
+# 6. 2026-08-13 审核修复：盘面异动词表 + 预筛主体词 + prompt + 板块政策合并
+# ============================================================
+class TestIntradayNoiseExpanded:
+    def test_concept_active_filtered(self):
+        """盘面异动漏网："PCB概念表现活跃 方邦股份涨超10%" → 盘面异动不推"""
+        t = "PCB概念表现活跃 方邦股份涨超10%"
+        assert rtp._is_noise_push({"title": t}, {"is_leader_stock": False}, set()) == "盘面异动"
+
+    def test_leader_active_kept(self):
+        """龙头"表现活跃"仍放行（中际旭创是龙头）"""
+        t = "中际旭创表现活跃 成交额超百亿"
+        assert rtp._is_noise_push({"title": t}, {"is_leader_stock": True}, set()) == ""
+
+
+class TestHeadlineEntityPrefilter:
+    def test_tech_leader_events_direct_llm(self):
+        """科技龙头发布/里程碑/适配类不再被预筛丢弃（此前 0.14 被拦）"""
+        cases = [
+            "DeepSeek V4 Pro 正式版API上线 大幅增强Agent能力",
+            "长江存储首次跻身全球NAND出货量前三 超越铠侠",
+            "寒武纪董事长陈天石：五大国产模型完成适配",
+            "腾讯单季营收首超2000亿元",
+            "中国钙钛矿量产技术再登《自然》",
+        ]
+        for t in cases:
+            score, hit = rtp._prefilter({"title": t, "content": "", "category": "news"})
+            assert hit, f"科技龙头/重要主体事件应直通 LLM: {t} (score={score})"
+
+    def test_ordinary_company_not_bypassed(self):
+        """无主体词、无动作词、无金额的普通消息不直通"""
+        _, hit = rtp._prefilter({"title": "某公司召开例行股东大会", "content": "", "category": "news"})
+        assert not hit
+
+
+class TestPromptRejectsResearch:
+    def test_prompt_rejects_research_views(self):
+        """LLM prompt 明确不推研报/机构观点/主题性分析"""
+        p = rtp._LLM_SYSTEM_PROMPT
+        assert "券商研报" in p or "机构观点" in p
+        assert "主题性分析" in p
+
+
+class TestSameEventPolicyMerge:
+    def test_sichuan_compute_policy_merged(self):
+        """四川算力政策同轮双推 → 应判同事件（同实体+同板块+无事件组）"""
+        a = rtp._push_event_sig(
+            {"title": "四川：建强成都平原算力核心区 打造攀西—川西北算电融合发展带", "content": ""},
+            {"entities": ["四川省政府"], "sectors": ["东数西算", "算力"]})
+        b = rtp._push_event_sig(
+            {"title": "四川：布局建设万卡级以上智算集群 探索建设高安全算力设施", "content": ""},
+            {"entities": ["四川省政府"], "sectors": ["东数西算", "智算集群", "算力"]})
+        assert rtp._is_same_event(a, b)
+
+    def test_different_sector_same_entity_not_merged(self):
+        """守卫：同实体但板块交集<2（仅宽泛AI）→ 不同事件不误并"""
+        a = rtp._push_event_sig(
+            {"title": "英伟达发布新一代AI芯片", "content": ""},
+            {"entities": ["英伟达"], "sectors": ["AI芯片"]})
+        b = rtp._push_event_sig(
+            {"title": "英伟达拿下大型数据中心订单", "content": ""},
+            {"entities": ["英伟达"], "sectors": ["AI服务器"]})
+        assert not rtp._is_same_event(a, b)
+
+
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
