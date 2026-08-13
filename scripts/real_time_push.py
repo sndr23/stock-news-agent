@@ -316,6 +316,47 @@ def _as_bool(v, default: bool = False) -> bool:
     return default
 
 
+# 实体别名归一化表（2026-08-13 修复：LLM 对同一实体的表述不稳定——"大摩" vs "摩根士丹利"、
+# "三星电子" vs "三星"、英文 vs 中文，导致跨源同事件合并失效、重复推送）。
+# 仅收"无歧义"的别名（简称→规范全称/中英对照），不收录有歧义的简称。
+_ENTITY_ALIAS = {
+    "大摩": "摩根士丹利", "小摩": "摩根大通",
+    "TSMC": "台积电", "三星电子": "三星", "Samsung": "三星",
+    "海力士": "SK海力士", "SK Hynix": "SK海力士",
+    "NVIDIA": "英伟达", "Tesla": "特斯拉", "Apple": "苹果",
+    "Google": "谷歌", "Alphabet": "谷歌", "Microsoft": "微软",
+    "Amazon": "亚马逊", "欧洲央行": "欧央行", "ECB": "欧央行",
+    "日央行": "日本央行", "BOJ": "日本央行", "Fed": "美联储",
+    "上海市": "上海", "北京市": "北京",
+}
+
+
+def _normalize_entity(e: str) -> str:
+    """实体归一化：剥离股票代码后缀（台积电(TSM.N)→台积电）+ 别名映射"""
+    if not e:
+        return e
+    e = str(e).strip()
+    # 剥离末尾股票代码后缀 "(TSM.N)" / "(AAPL.O)" / "(00700.HK)"
+    e = re.sub(r"[（(][A-Za-z0-9.\-]+[)）]$", "", e).strip()
+    return _ENTITY_ALIAS.get(e, e)
+
+
+def _sectors_overlap(sec_a, sec_b) -> set:
+    """板块交集（子串包含语义，2026-08-13 修复）
+
+    LLM 抽的 sectors 不稳定："AI算力" vs "AI"+"算力"、"算力/CPO" vs "CPO"，
+    精确相等导致同板块事件漏合并（上海算力补贴×2 实证）。用子串包含判断同板块。
+    """
+    a = {str(s).strip() for s in (sec_a or []) if str(s).strip()}
+    b = {str(s).strip() for s in (sec_b or []) if str(s).strip()}
+    hit = set()
+    for sa in a:
+        for sb in b:
+            if sa and sb and (sa == sb or sa in sb or sb in sa):
+                hit.add(sa if len(sa) <= len(sb) else sb)
+    return hit
+
+
 def _push_event_sig(news: dict, judge: dict) -> dict:
     """生成推送级事件签名：规则抽取(个股/事件组/金额) + LLM主体(entities) + 归一化标题
 
@@ -324,7 +365,7 @@ def _push_event_sig(news: dict, judge: dict) -> dict:
     恩智浦收购Ambarella三源三推实证）。
     """
     stocks, events, numbers = _event_signature_light(news)
-    entities = {str(e).strip() for e in (judge.get("entities") or []) if str(e).strip()}
+    entities = {_normalize_entity(str(e).strip()) for e in (judge.get("entities") or []) if str(e).strip()}
     sectors = {str(s).strip() for s in (judge.get("sectors") or []) if str(s).strip()}
     return {
         "stocks": sorted(stocks),
@@ -526,12 +567,14 @@ def _entity_overlap(ent_a: set, ent_b: set) -> bool:
     LLM 对同一实体的表述不稳定："索尼" vs "索尼半导体解决方案公司"、
     "台积电" vs "台积电(TSM.N)"。仅靠精确相等会把同一事件拆成多条
     （索尼×台积电合资 48h 内三推实证）。判定：
-    1. 完全相等
+    1. 完全相等（先经 _normalize_entity 归一化别名/代码后缀）
     2. 互相包含（"索尼" ⊂ "索尼半导体解决方案公司"）
     3. 共享连续子串占较短实体 ≥60% 且 ≥2 字（"索尼半导体" vs "索尼"）
     """
-    for ea in ent_a:
-        for eb in ent_b:
+    na = {_normalize_entity(ea) for ea in ent_a if ea}
+    nb = {_normalize_entity(eb) for eb in ent_b if eb}
+    for ea in na:
+        for eb in nb:
             if not ea or not eb:
                 continue
             if ea == eb:
@@ -757,7 +800,9 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
                 # LCS 仅 2 字，既有分支全兜不住）。
                 # 守卫：金额冲突已排除；sectors 交集≥2 防"英伟达AI芯片 vs 英伟达AI服务器"
                 # 仅共享宽泛"AI"被误并（漏推守卫）。
-                if len(sec_a & sec_b) >= 2 and _lcs_len(ta, tb) >= 2:
+                # 2026-08-13 二轮：sectors 用 _sectors_overlap（子串包含）替代精确交集，
+                # 修复 LLM 抽板块"AI算力"vs"AI/算力"不一致导致的漏合并（上海算力补贴×2）。
+                if len(_sectors_overlap(sec_a, sec_b)) >= 2 and _lcs_len(ta, tb) >= 2:
                     return True
             shorter = min(len(ta), len(tb))
             if shorter >= 8:

@@ -221,4 +221,38 @@ class TestSameEventPolicyMerge:
         assert not rtp._is_same_event(a, b)
 
 
+# ============================================================
+# 7. 实体/板块归一化（2026-08-13 二轮：上海算力补贴×2 重复实证）
+# ============================================================
+class TestEntitySectorNormalize:
+    def test_normalize_entity_code_suffix(self):
+        """实体归一化：剥离股票代码后缀"""
+        assert rtp._normalize_entity("台积电(TSM.N)") == "台积电"
+        assert rtp._normalize_entity("苹果(AAPL.O)") == "苹果"
+
+    def test_normalize_entity_alias(self):
+        """实体归一化：别名映射"""
+        assert rtp._normalize_entity("大摩") == "摩根士丹利"
+        assert rtp._normalize_entity("三星电子") == "三星"
+        assert rtp._normalize_entity("上海市") == "上海"
+
+    def test_entity_overlap_alias(self):
+        """大摩 vs 摩根士丹利 → 同实体"""
+        assert rtp._entity_overlap({"大摩"}, {"摩根士丹利"})
+
+    def test_sectors_overlap_substring(self):
+        """板块子串包含：AI算力 vs AI+算力 → 交集≥2"""
+        assert len(rtp._sectors_overlap({"AI算力", "大模型"}, {"AI", "算力"})) >= 2
+
+    def test_shanghai_compute_policy_merged(self):
+        """上海算力补贴×2：实体别名 + 板块子串交集 → 同事件"""
+        a = rtp._push_event_sig(
+            {"title": "上海：推广发放算力券模型券语料券 降低公共数据", "content": ""},
+            {"entities": ["上海"], "sectors": ["AI算力", "大模型"]})
+        b = rtp._push_event_sig(
+            {"title": "上海：依法依规开展算力补贴 支持民营企业租用智算资源", "content": ""},
+            {"entities": ["上海市"], "sectors": ["AI", "算力"]})
+        assert rtp._is_same_event(a, b)
+
+
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
