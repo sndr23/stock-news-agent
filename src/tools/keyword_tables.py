@@ -76,6 +76,28 @@ OVERSEAS_TECH_KEYWORDS = [
 # 外围资讯源标记（富途全球 + 华尔街见闻 + 金十数据）
 OVERSEAS_SOURCE_MARKERS = ["富途", "华尔街", "金十"]
 
+# 英文缩写词边界匹配（2026-08-13 修复：OVERSEAS_TECH_KEYWORDS 中的 AI/GPU/CPO/PCB/MLCC
+# 此前在 real_time_push._is_overseas_tech/_is_domestic_tech 中裸子串匹配，
+# "DUBAI"（迪拜）含 "AI" 被误判为外围科技触发必推。此处与 HIGH_SIGNAL_KEYWORDS
+# 的词边界保护对齐：英文缩写加词边界，中文词保持子串匹配。）
+_OVERSEAS_TECH_ENGLISH = {
+    kw for kw in OVERSEAS_TECH_KEYWORDS
+    if re.fullmatch(r"[A-Za-z*]+", kw or "")
+}
+_OVERSEAS_TECH_PATTERNS = {
+    kw: re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])" if kw in _OVERSEAS_TECH_ENGLISH else re.escape(kw)
+    )
+    for kw in OVERSEAS_TECH_KEYWORDS
+}
+
+
+def has_overseas_tech_keyword(text: str) -> bool:
+    """检测文本是否命中外围科技关键词（英文缩写词边界感知，AI 不误命中 DUBAI）"""
+    if not text:
+        return False
+    return any(p.search(text) for p in _OVERSEAS_TECH_PATTERNS.values())
+
 
 # ============================================================
 # 英文缩写词边界匹配（2026-08-06 新增，两管线共享）
