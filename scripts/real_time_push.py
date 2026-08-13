@@ -58,11 +58,42 @@ from datetime import datetime, timedelta, timezone
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-os.chdir(PROJECT_ROOT)
 
 BJT = timezone(timedelta(hours=8))
 
 logger = logging.getLogger("real_time_push")
+
+
+def _as_list(v):
+    """LLM 字段类型防御：字符串→单元素列表，杜绝 set()/join 拆字
+
+    2026-08-13 P1 修复：LLM 返回 sectors/entities/affected_stocks 为字符串
+    （非 JSON 数组）时，`set('半导体')` 会拆成 {'半','导','体'}、`' '.join('半导体')`
+    变 '半 导 体'——科技词匹配失效（漏推科技）、同事件合并/饱和计数失真。
+    统一收敛为：None→[]；str→[v]；list/tuple/set→list；其他→[]。
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return list(v)
+    return []
+
+
+def _env_int(name: str, default: int) -> int:
+    """安全读取整数环境变量：非法值回退默认并告警（2026-08-13 P2 修复）
+
+    此前 RT_TOPIC_LIMIT 模块级 int() 无防御，env 非法值 → import 即崩（云端 CI 同挂）。
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        logger.warning(f"环境变量 {name} 无效: {raw!r}，使用默认值 {default}")
+        return default
 
 # ============================================================
 # 复用项目现有能力（不重复造轮子）
@@ -116,6 +147,8 @@ MAX_PENDING_RETRY = 3
 HEARTBEAT_ZERO_PUSH_WARN_ROUNDS = 6
 # 进程内计数器（本地 --loop 常驻进程跨轮累计；云端单轮运行无影响）
 _zero_push_streak = [0]
+# watchlist 空名单告警去重（2026-08-13 P1-2：--loop 模式只告警一次，避免每轮刷屏）
+_watchlist_warned = [False]
 
 # Gist 内状态文件名
 GIST_STATE_FILENAME = "real_time_state.json"
@@ -226,7 +259,7 @@ def _event_signature_light(news: dict) -> tuple:
     本函数 stocks 仅取显式字段（龙虎榜/业绩预告等自带 name/affected_stocks），
     events/numbers 复用项目的事件关键词组与金额提取。
     """
-    stocks = set(news.get("affected_stocks", []) or [])
+    stocks = set(_as_list(news.get("affected_stocks")))
     name = news.get("name", "")
     if name:
         stocks.add(name)
@@ -347,8 +380,8 @@ def _sectors_overlap(sec_a, sec_b) -> set:
     LLM 抽的 sectors 不稳定："AI算力" vs "AI"+"算力"、"算力/CPO" vs "CPO"，
     精确相等导致同板块事件漏合并（上海算力补贴×2 实证）。用子串包含判断同板块。
     """
-    a = {str(s).strip() for s in (sec_a or []) if str(s).strip()}
-    b = {str(s).strip() for s in (sec_b or []) if str(s).strip()}
+    a = {str(s).strip() for s in _as_list(sec_a) if str(s).strip()}
+    b = {str(s).strip() for s in _as_list(sec_b) if str(s).strip()}
     hit = set()
     for sa in a:
         for sb in b:
@@ -365,8 +398,8 @@ def _push_event_sig(news: dict, judge: dict) -> dict:
     恩智浦收购Ambarella三源三推实证）。
     """
     stocks, events, numbers = _event_signature_light(news)
-    entities = {_normalize_entity(str(e).strip()) for e in (judge.get("entities") or []) if str(e).strip()}
-    sectors = {str(s).strip() for s in (judge.get("sectors") or []) if str(s).strip()}
+    entities = {_normalize_entity(str(e).strip()) for e in _as_list(judge.get("entities")) if str(e).strip()}
+    sectors = {str(s).strip() for s in _as_list(judge.get("sectors")) if str(s).strip()}
     return {
         "stocks": sorted(stocks),
         "entities": sorted(entities),
@@ -381,11 +414,11 @@ def _push_event_sig(news: dict, judge: dict) -> dict:
 def _merge_event_sig(sig_a: dict, sig_b: dict) -> dict:
     """并集合并两个事件签名（分组内传递合并用），标题保留较长者"""
     return {
-        "stocks": sorted(set(sig_a.get("stocks") or []) | set(sig_b.get("stocks") or [])),
-        "entities": sorted(set(sig_a.get("entities") or []) | set(sig_b.get("entities") or [])),
-        "events": sorted(set(sig_a.get("events") or []) | set(sig_b.get("events") or [])),
-        "numbers": sorted(set(sig_a.get("numbers") or []) | set(sig_b.get("numbers") or [])),
-        "sectors": sorted(set(sig_a.get("sectors") or []) | set(sig_b.get("sectors") or [])),
+        "stocks": sorted(set(_as_list(sig_a.get("stocks"))) | set(_as_list(sig_b.get("stocks")))),
+        "entities": sorted(set(_as_list(sig_a.get("entities"))) | set(_as_list(sig_b.get("entities")))),
+        "events": sorted(set(_as_list(sig_a.get("events"))) | set(_as_list(sig_b.get("events")))),
+        "numbers": sorted(set(_as_list(sig_a.get("numbers"))) | set(_as_list(sig_b.get("numbers")))),
+        "sectors": sorted(set(_as_list(sig_a.get("sectors"))) | set(_as_list(sig_b.get("sectors")))),
         "title_norm": sig_a.get("title_norm", "") if len(sig_a.get("title_norm", "")) >= len(sig_b.get("title_norm", "")) else sig_b.get("title_norm", ""),
     }
 
@@ -662,7 +695,7 @@ _MACRO_POLICY_KEYWORDS = [
 # 24h 内已推 ≥ 上限后，新条目不再推，记 seen 标注；market 级（宏观数据/
 # 大盘事件）豁免，保证 CPI 等 market 级数据永不被饱和拦截。
 # 上限可通过环境变量 RT_TOPIC_LIMIT 调整。）
-TOPIC_PUSH_LIMIT = int(os.getenv("RT_TOPIC_LIMIT", "5"))
+TOPIC_PUSH_LIMIT = _env_int("RT_TOPIC_LIMIT", 5)
 TOPIC_PUSH_WINDOW_H = 24.0
 
 
@@ -684,9 +717,9 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     """
     if str(sig.get("scope") or "stock") == "market":
         return False
-    secs = set(sig.get("sectors") or [])
-    ents = {_normalize_entity(e) for e in (sig.get("stocks") or [])} | \
-           {_normalize_entity(e) for e in (sig.get("entities") or [])}
+    secs = set(_as_list(sig.get("sectors")))
+    ents = {_normalize_entity(e) for e in _as_list(sig.get("stocks"))} | \
+           {_normalize_entity(e) for e in _as_list(sig.get("entities"))}
     if not secs and not ents:
         return False
     now_ts = time.time()
@@ -699,9 +732,9 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
             continue
         if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
             continue
-        psecs = set(pe.get("sectors") or [])
-        pents = {_normalize_entity(e) for e in (pe.get("stocks") or [])} | \
-                {_normalize_entity(e) for e in (pe.get("entities") or [])}
+        psecs = set(_as_list(pe.get("sectors")))
+        pents = {_normalize_entity(e) for e in _as_list(pe.get("stocks"))} | \
+                {_normalize_entity(e) for e in _as_list(pe.get("entities"))}
         if _sectors_overlap(secs, psecs) or (ents & pents):
             cnt += 1
     return cnt >= TOPIC_PUSH_LIMIT
@@ -730,12 +763,12 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
         纳指涨超2 Meta涨超6 无时段词，Jaccard 0.20~0.33、LCS 占比 0.25~0.46，
         但均含"纳指"且方向一致）
     """
-    ent_a = set(sig_a.get("stocks") or []) | set(sig_a.get("entities") or [])
-    ent_b = set(sig_b.get("stocks") or []) | set(sig_b.get("entities") or [])
-    ev_a = set(sig_a.get("events") or [])
-    ev_b = set(sig_b.get("events") or [])
-    num_a = set(sig_a.get("numbers") or [])
-    num_b = set(sig_b.get("numbers") or [])
+    ent_a = set(_as_list(sig_a.get("stocks"))) | set(_as_list(sig_a.get("entities")))
+    ent_b = set(_as_list(sig_b.get("stocks"))) | set(_as_list(sig_b.get("entities")))
+    ev_a = set(_as_list(sig_a.get("events")))
+    ev_b = set(_as_list(sig_b.get("events")))
+    num_a = set(_as_list(sig_a.get("numbers")))
+    num_b = set(_as_list(sig_b.get("numbers")))
     shared_ev = ev_a & ev_b
     # 2026-08-11 修复：实体模糊重叠（"索尼"⊂"索尼半导体解决方案公司"），
     # 此前仅精确相等，跨源同事件（索尼×台积电合资）48h 内三推实证
@@ -785,8 +818,8 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
             # + 同市场域 + 任一含行情措辞（方向一致已在入口守卫）。
             # 误并评估：sectors 不同（涨价逻辑 vs 行情情绪）通常交集为空；
             # 交集非空且同域时，少推一条比重复推送更符合用户口径。
-            sec_a = set(sig_a.get("sectors") or [])
-            sec_b = set(sig_b.get("sectors") or [])
+            sec_a = set(_as_list(sig_a.get("sectors")))
+            sec_b = set(_as_list(sig_b.get("sectors")))
             if (sec_a & sec_b) and _market_domain_overlap(ta, tb):
                 if any(w in ta for w in _MARKET_MOVE_WORDS) or any(w in tb for w in _MARKET_MOVE_WORDS):
                     return True
@@ -1411,7 +1444,7 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
         for offset, n in enumerate(batch):
             n["_judge_idx"] = start + offset
         try:
-            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=90, max_retries=1, deadline=deadline)
+            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=60, max_retries=1, deadline=deadline)
             entries = _parse_llm_array(raw)
             # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
             by_idx = {}
@@ -1446,8 +1479,9 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
                     "score": e.get("score", 0),
                     "direction": _normalize_direction(e.get("direction", "neutral"), n),
                     "scope": str(e.get("scope", "stock") or "stock").lower(),
-                    "sectors": e.get("sectors") or [],
-                    "entities": [str(x).strip() for x in (e.get("entities") or []) if str(x).strip()],
+                    "sectors": _as_list(e.get("sectors")),
+                    "entities": [str(x).strip() for x in _as_list(e.get("entities"))
+                                 if isinstance(x, (str, int, float)) and str(x).strip()],
                     "is_leader_stock": _as_bool(e.get("is_leader_stock", False), False),
                     "reason": str(e.get("reason", "") or "").strip(),
                 }
@@ -1456,6 +1490,16 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
             logger.warning(f"LLM 判定批次失败（{len(batch)} 条），整批挂起下轮重试: {e}")
             for offset, n in enumerate(batch):
                 results[start + offset] = _hang_judge(n)
+        # 2026-08-13 P2 修复：批次完成后检查剩余预算——此前只在批次入口检查，
+        # 单批最坏 90s×2+2s=182s，300s 预算实际可超（8-07 日志实证单轮 380s）。
+        # 批次完成即复查 deadline，逼近则立即挂起剩余批次。
+        if deadline and time.monotonic() >= deadline:
+            rest = list(range(start + LLM_BATCH_SIZE, len(items)))
+            if rest:
+                logger.warning(f"LLM 判定批次完成后超时熔断，剩余 {len(rest)} 条挂起下轮重试")
+                for r in rest:
+                    results[r] = _hang_judge(items[r])
+            break
     # 防御：任何未填充位置挂起（不落指纹，下轮重试）
     for i, r in enumerate(results):
         if r is None:
@@ -1502,7 +1546,7 @@ def _tech_override_enabled(news: dict, judge: dict, leader_watchlist: set) -> bo
     实测"机构称物理AI市场空间"等研报/观点类曾因此被强制放行误推，让 LLM 的
     push=false 否决恢复生效。
     """
-    sectors = judge.get("sectors") or []
+    sectors = _as_list(judge.get("sectors"))
     scope = str(judge.get("scope", "stock") or "stock").lower()
     is_leader = bool(judge.get("is_leader_stock")) or _hit_watchlist(news, leader_watchlist)
     strong = str(judge.get("direction", "neutral")) in ("bullish", "bearish")
@@ -1602,10 +1646,12 @@ def format_push_alert(news: dict, judge: dict) -> str:
     direction = judge.get("direction", "neutral")
     emoji = _DIR_EMOJI.get(direction, "⚪")
     label = _DIR_LABEL.get(direction, "中性")
-    score = judge.get("score", 0)
+    # 2026-08-13 P2 修复：LLM 返回 "score": null 时 e.get 命中 key 返回 None，
+    # 直接 f-string 会显示 "影响分: None"；统一走 _to_float 兜底。
+    score = _to_float(judge.get("score", 0))
     scope = judge.get("scope", "stock")
     scope_label = _SCOPE_LABEL.get(scope, "个股")
-    sectors = judge.get("sectors") or []
+    sectors = _as_list(judge.get("sectors"))
     sector_str = "、".join(str(s) for s in sectors[:4]) if sectors else "—"
     reason = str(judge.get("reason", "") or "").strip()[:100]
     source = str(news.get("source", "") or "多源资讯")
@@ -1735,7 +1781,7 @@ def run_once(dry_run: bool = False) -> dict:
     # 普通候选再按预筛分排序，保证核心事件在溢出时不被挤占。
     # 放弃策略同步收紧：仅普通条目连续 MAX_PENDING_RETRY 轮溢出后放弃（写 seen 防无限重试）；
     # 高信号条目永不放弃（持续挂起 pending，行情回落后自动进入判定）——核心事件不许漏推。
-    max_candidates = int(os.getenv("RT_MAX_CANDIDATES", str(MAX_CANDIDATES_PER_ROUND)))
+    max_candidates = _env_int("RT_MAX_CANDIDATES", MAX_CANDIDATES_PER_ROUND)
     overflow = []
     if len(candidates) > max_candidates:
         # 2026-08-12 修复（防偏科分层）：高信号核心事件恒优先 → 宏观/政策/地缘类
@@ -1791,6 +1837,10 @@ def run_once(dry_run: bool = False) -> dict:
 
     # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
     leader_watchlist = _load_leader_watchlist()
+    if not leader_watchlist and not _watchlist_warned[0]:
+        _watchlist_warned[0] = True
+        logger.warning("自选龙头名单 watchlist.json 为空，龙头放行退化为 LLM is_leader_stock 单通道"
+                       "（如需盘面异动龙头放行/科技龙头兜底双通道，请填入关注名单）")
 
     # 5. 同事件合并（跨源同事件只推最优一条）→ 跨轮已推事件拦截 → 阈值过滤 → 推送
     pushed = 0
@@ -1994,10 +2044,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只诊断不推送不保存状态")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
+    # 2026-08-13 P2 修复：删除重复 basicConfig——src.config 已配置 root logger
+    # （StreamHandler + logs/agent.log FileHandler），此处重复调用为 no-op 且配置不一致。
+    # 仅当 root 无 handler 时兜底配置（如第三方以最小方式导入本模块）。
 
     always_on = os.getenv("RT_ALWAYS_ON", "1").strip() == "1"
     if not always_on and not _is_trading_day():
@@ -2005,7 +2054,7 @@ def main():
         return
 
     if args.loop:
-        poll_seconds = int(os.getenv("RT_POLL_SECONDS", "120"))
+        poll_seconds = _env_int("RT_POLL_SECONDS", 120)
         logger.info(f"实时推送守护进程启动，轮询间隔 {poll_seconds}s（Ctrl+C 退出）")
         if os.getenv("GIST_TOKEN") and os.getenv("GIST_ID"):
             logger.warning("本地轮询与云端 GitHub Actions 共享同一 Gist 状态。"

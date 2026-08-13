@@ -43,10 +43,16 @@ WXPUSHER_API = "https://wxpusher.zjiecode.com/api/send/message"
 _PUSH_MAX_RETRIES = 2
 _PUSH_RETRY_BASE_DELAY = 2  # 指数退避基数: 2s, 4s
 
+# 企业微信群机器人不可重试的确定性错误（2026-08-13 P2 修复）：
+# 此类错误返回 HTTP 200 + errcode≠0，仅靠 4xx 判断会白重试 2 次
+# （93000/93008/93009/93010/93011=webhook 配置类错误，重试无意义；
+#  40058=参数错误；41064=需要群主确认；45009=频率超限，重试只会继续撞限流）
+_WECOM_FATAL_ERRCODES = {93000, 93008, 93009, 93010, 93011, 40058, 41064, 45009}
+
 
 def _post_with_retry(url: str, json_payload: dict, timeout: int = 15,
                      max_retries: int = _PUSH_MAX_RETRIES,
-                     success_checker=None) -> dict:
+                     success_checker=None, fatal_checker=None) -> dict:
     """带指数退避重试的 POST 请求
 
     Args:
@@ -55,6 +61,9 @@ def _post_with_retry(url: str, json_payload: dict, timeout: int = 15,
         timeout: 单次请求超时秒数
         max_retries: 最大重试次数（不含首次）
         success_checker: 判断响应是否成功的回调，返回 True 表示成功
+        fatal_checker: 判断响应是否为"不可重试的确定性错误"的回调，返回 True
+                       立即停止重试（2026-08-13 P2：企业微信 token 错误等返回
+                       HTTP 200 + errcode≠0，仅靠 4xx 判断会白重试 2 次）
 
     Returns:
         API 返回的 JSON dict
@@ -68,6 +77,10 @@ def _post_with_retry(url: str, json_payload: dict, timeout: int = 15,
             except Exception:
                 result = {"code": resp.status_code, "msg": resp.text[:500]}
             last_result = result
+            # 确定性致命错误：立即返回不重试
+            if fatal_checker and fatal_checker(result):
+                logger.warning(f"推送确定性错误，不重试: {result}")
+                return result
             if success_checker and success_checker(result):
                 if attempt > 0:
                     logger.info(f"推送第{attempt+1}次尝试成功")
@@ -314,7 +327,8 @@ def push_via_wecom(webhook_url: str, title: str, content: str) -> dict:
     }
     result = _post_with_retry(
         webhook_url, payload, timeout=15,
-        success_checker=lambda r: r.get("errcode") == 0)
+        success_checker=lambda r: r.get("errcode") == 0,
+        fatal_checker=lambda r: r.get("errcode") in _WECOM_FATAL_ERRCODES)
     if result.get("errcode") == 0:
         logger.info(f"企业微信推送成功: {title}")
     else:
