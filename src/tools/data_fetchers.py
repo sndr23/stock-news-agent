@@ -158,6 +158,12 @@ def dedup_news_3layer(news_list: list, simhash_threshold: int = _SIMHASH_THRESHO
             result.append(news)
             continue
         fp = _simhash(title)
+        # 短标题(<5字) SimHash 返回 0，海明距离恒 0 会把不同短标题误判重复
+        # （"涨停/跌停/异动/回购" 实测 4 条只剩 1 条）。fp==0 时跳过近似去重，
+        # 精确标题去重已在上一层完成，短标题互不相同即保留。
+        if fp == 0:
+            result.append(news)
+            continue
         is_dup = False
         for existing_fp in fingerprints:
             if _hamming(fp, existing_fp) <= simhash_threshold:

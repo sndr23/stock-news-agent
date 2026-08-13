@@ -73,6 +73,7 @@ from src.tools.calculators import (
     _EVENT_KEYWORD_GROUPS,            # 事件关键词组
     _extract_core_numbers,            # 核心金额提取
     predict_direction_by_rules,       # 规则方向兜底（词表全，含扭亏/退市/涨超/走弱等）
+    _has_tech_keyword,                # 科技硬件词匹配（词边界感知，大额经营事件直通用）
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
 # LLM 调用与 JSON 修复（2026-08-06 起从共享模块导入，不再依赖废弃的批处理管线 nodes.py）
@@ -84,6 +85,7 @@ from src.tools.keyword_tables import (                      # 共享关键词表
     has_signal_keyword,        # 2026-08-06: 词边界感知的信号词匹配（ST/IPO 防误命中）
     find_signal_keywords,      # 返回命中的信号词列表（事件指纹 sig 路径用）
     find_signal_fp_keywords,   # 2026-08-07: 指纹专用信号词（排除宽泛市场词，防跨事件指纹合并）
+    has_overseas_tech_keyword, # 2026-08-13: 词边界感知的外围科技词匹配（AI 不误命中 DUBAI）
 )
 
 # ============================================================
@@ -135,7 +137,7 @@ def _is_overseas_tech(news: dict, sectors: list) -> bool:
     if not any(m in source for m in OVERSEAS_SOURCE_MARKERS):
         return False
     text = f"{news.get('title', '')} {news.get('content', '')} {' '.join(str(s) for s in (sectors or []))}"
-    return any(kw in text for kw in OVERSEAS_TECH_KEYWORDS)
+    return has_overseas_tech_keyword(text)
 
 
 def _is_domestic_tech(news: dict, sectors: list) -> bool:
@@ -149,7 +151,7 @@ def _is_domestic_tech(news: dict, sectors: list) -> bool:
     if any(m in source for m in OVERSEAS_SOURCE_MARKERS):
         return False
     text = f"{news.get('title', '')} {news.get('content', '')} {' '.join(str(s) for s in (sectors or []))}"
-    return any(kw in text for kw in OVERSEAS_TECH_KEYWORDS)
+    return has_overseas_tech_keyword(text)
 
 
 def _passes_threshold(mode: str, score, direction: str, scope: str,
@@ -258,17 +260,28 @@ def _news_fingerprint(news: dict) -> str:
     # 因共享"韩国"被合并成同一指纹 → 后一条漏推）。仅命中宽泛词时退回
     # 下方标题指纹分支；跨源同事件仍由推送级 _is_same_event 兜底合并。
     hit_signal = find_signal_fp_keywords(text)
+    title_norm = _normalize_title(news.get('title', ''))
+    # 标题主语片段（2026-08-13 修复：news 类无 affected_stocks/name 字段，st 恒为空，
+    # 导致"寒武纪回购5亿"与"宁德时代回购5亿"事件组+金额相同 → 指纹碰撞漏推。
+    # 掺入标题前 6 字区分公司主语（多源同事件报道的主语通常一致，不影响合并）。
+    title_head = title_norm[:6]
     if hit_signal:
         # 命中高信号词（宏观/监管级）：以信号词+事件组+个股为指纹，不掺入数字——
         # 数字表达不稳定（"1700亿" vs "一千七百亿"），且同信号词下数字分叉
         # 会把同一事件的多源报道拆成不同指纹
-        key = f"{date}|sig:{sorted(hit_signal)}|ev:{sorted(events)}|st:{sorted(stocks)}"
+        if stocks:
+            key = f"{date}|sig:{sorted(hit_signal)}|ev:{sorted(events)}|st:{sorted(stocks)}"
+        else:
+            key = f"{date}|sig:{sorted(hit_signal)}|ev:{sorted(events)}|t:{title_head}"
     elif stocks or events or numbers:
         # 公告/公司事件：个股+事件组+核心金额辅助区分（"XX:回购5亿" vs "XX:回购8亿"）
-        key = f"{date}|st:{sorted(stocks)}|ev:{sorted(events)}|num:{sorted(numbers)}"
+        if stocks:
+            key = f"{date}|st:{sorted(stocks)}|ev:{sorted(events)}|num:{sorted(numbers)}"
+        else:
+            key = f"{date}|ev:{sorted(events)}|num:{sorted(numbers)}|t:{title_head}"
     else:
         # 普通流水新闻：归一化标题指纹
-        key = f"{date}|t:{_normalize_title(news.get('title', ''))}"
+        key = f"{date}|t:{title_norm}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -546,7 +559,8 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
 
     返回噪声原因字符串（非空=应过滤不推），空串=正常条目。
     判定顺序：
-    1. 栏目汇总类（新闻精选/要闻速递/九点特供/风口研报/午评/收评等）→ 一律不推
+    1. 栏目汇总类（新闻精选/要闻速递/九点特供/风口研报/午评/收评等）→ 不推；
+       但剥离栏目词后仍含高信号词/宏观数据（栏目内嵌重大事件）→ 放行
     2. 指数盘中行情播报（指数名 + 涨跌幅度措辞）→ 不推
     3. 板块/概念盘面异动（异动拉升/直线涨停等）→ 非龙头不推；
        LLM 龙头标记或命中自选名单（如"中际旭创跌超3%"）保留
@@ -555,6 +569,17 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
     if not title:
         return ""
     if any(m in title for m in _NOISE_COLUMN_MARKERS):
+        # 2026-08-13 修复（漏推实证）：栏目词仅是栏目前缀/栏目名，真正价值在栏目词之外的内容。
+        # 此前"只要标题含栏目词即一票否决"，会把"晚间新闻精选：央行宣布降准"、
+        # "涨停分析：中际旭创获50亿大单涨停"等栏目内嵌的重大事件误杀。
+        # 现剥离全部命中的栏目词后，若剩余仍含高信号词或宏观数据发布，
+        # 判定为"栏目内嵌重大事件"放行（后续仍走强档门槛 + LLM push 判定把关）。
+        rest = title
+        for m in _NOISE_COLUMN_MARKERS:
+            if m in rest:
+                rest = rest.replace(m, "")
+        if has_signal_keyword(rest) or _is_macro_data_release(rest):
+            return ""
         return "栏目汇总"
     if any(i in title for i in _NOISE_INDEX_NAMES) and any(m in title for m in _NOISE_INDEX_MOVE):
         return "指数播报"
@@ -1012,11 +1037,45 @@ def _is_macro_data_release(text: str) -> bool:
     return any(c in text for c in _MACRO_RELEASE_CONTEXT)
 
 
+# 大额经营事件动作词（2026-08-13 修复：预筛漏判实证——"宁德时代签订200亿储能订单"0.19、
+# "SK海力士重启中国NAND工厂"0.39、"贵州茅台中标50亿工程"0.14 均因词表缺动作词被拦。
+# 中标/签约/建厂/扩产等是"重大经营事件"信号，与 HIGH_SIGNAL 的并购/重组同级，
+# 但刻意不并入 HIGH_SIGNAL_KEYWORDS（避免扩大指纹 sig 路径影响面——
+# 这些词直通 LLM 判定即可，是否推送仍由 LLM 把关龙头/重要性）。
+_DEAL_ACTION_WORDS = [
+    "中标", "签约", "签订", "签署", "斩获", "拿下",
+    "大额订单", "重大合同", "重大工程", "建厂", "投建", "投产", "扩产", "扩建",
+    "重启", "量产", "增资", "落地",
+]
+_DEAL_AMOUNT_RE = re.compile(r"\d+(?:\.\d+)?\s*亿")
+
+
+def _is_major_deal_event(text: str) -> bool:
+    """大额经营事件识别：动作词 + (金额≥1亿 或 科技硬件词) → 直通 LLM 判定
+
+    只影响中小市值个股自身的中标/签约按用户口径不推，但预筛阶段无法知道
+    谁是龙头，故"大额经营事件"统一送 LLM，由 LLM 判断龙头与否（与"回购/并购"
+    等资本运作词的处理一致）。小额（<1亿）且非科技的经营动作不直通，避免
+    中小市值日常经营消息挤占候选。
+    """
+    if not text:
+        return False
+    if not any(a in text for a in _DEAL_ACTION_WORDS):
+        return False
+    if _DEAL_AMOUNT_RE.search(text):
+        return True
+    if _has_tech_keyword(text):
+        return True
+    return False
+
+
 def _prefilter(news: dict) -> tuple:
     """规则预筛：返回 (预筛评分, 是否命中高信号词)
 
     2026-08-12 修复：高信号词命中 或 宏观数据发布识别（_is_macro_data_release）
     均直通 LLM 判定——确定性宏观数据事件即使预筛分低也不允许静默丢弃。
+    2026-08-13 修复：大额经营事件（_is_major_deal_event）同样直通，防科技龙头
+    重大订单/建厂被预筛静默丢弃。
     """
     score = calculate_prefilter_importance(news)
     title = str(news.get("title", "") or "")
@@ -1029,7 +1088,8 @@ def _prefilter(news: dict) -> tuple:
         text = text.replace(name, "")
     # 2026-08-06 修复：改用共享词边界匹配（has_signal_keyword），
     # "STorage/STMicroelectronics" 不再误命中 "ST" 信号词
-    hit = has_signal_keyword(text) or _is_macro_data_release(text)
+    hit = (has_signal_keyword(text) or _is_macro_data_release(text)
+           or _is_major_deal_event(text))
     return float(score), hit
 
 

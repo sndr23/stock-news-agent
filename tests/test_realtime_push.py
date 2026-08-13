@@ -11,6 +11,7 @@
 import importlib.util
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1502,8 +1503,29 @@ class TestRunOnceNoiseFilterIntegration:
                  "reason": "强档"} for _ in items]
 
     def test_column_news_not_pushed_despite_strong(self, monkeypatch, tmp_path):
-        """LLM 判强档的栏目汇总类 → 仍不推送（标题含央行/降准高信号词，确保过预筛走到 5c）"""
+        """LLM 判强档的纯栏目汇总类 → 仍不推送（栏目词之外无重大事件内容）"""
         self._setup(monkeypatch, tmp_path)
+        news = type("T", (), {"func": staticmethod(lambda: [
+            {"title": "8月10日午间涨停分析",
+             "content": "今日涨停个股汇总",
+             "source": "财联社", "published_at": "2026-08-10 22:00:00"}])})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+        stats = rtp.run_once(dry_run=False)
+        assert stats["pushed"] == 0, "纯栏目汇总类即使强档也不得推送"
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        titles = [r.get("title", "") for r in saved["seen"].values()]
+        assert any("[栏目汇总不推]" in t for t in titles), "应记录 seen 并标注原因"
+
+    def test_column_embedding_major_event_pushed(self, monkeypatch, tmp_path):
+        """2026-08-13 修复：栏目词内嵌重大事件（晚间新闻精选：央行降准）→ 不得误杀，应推送"""
+        self._setup(monkeypatch, tmp_path)
+        sent = []
+        def record(cfg, t, c):
+            sent.append(t)
+            return {"code": 200}
+        monkeypatch.setattr(rtp, "_send_alert_item", record)
         news = type("T", (), {"func": staticmethod(lambda: [
             {"title": "财联社8月10日晚间新闻精选：央行宣布降准0.5个百分点 释放流动性",
              "content": "央行降准 释放长期流动性",
@@ -1512,10 +1534,8 @@ class TestRunOnceNoiseFilterIntegration:
         monkeypatch.setattr(rtp, "get_stock_news", news)
         monkeypatch.setattr(rtp, "get_market_signals", sig)
         stats = rtp.run_once(dry_run=False)
-        assert stats["pushed"] == 0, "栏目汇总类即使强档也不得推送"
-        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
-        titles = [r.get("title", "") for r in saved["seen"].values()]
-        assert any("[栏目汇总不推]" in t for t in titles), "应记录 seen 并标注原因"
+        assert stats["pushed"] == 1, "栏目内嵌重大事件（央行降准）不得被栏目词误杀"
+        assert len(sent) == 1 and "降准" in sent[0]
 
     def test_major_news_still_pushed(self, monkeypatch, tmp_path):
         """正常强档重大消息不受影响，仍推送"""
@@ -1615,40 +1635,45 @@ class TestTopicSaturation:
         return {"sectors": sorted(sectors), "stocks": [], "entities": sorted(entities),
                 "events": [], "numbers": [], "title_norm": "x", "scope": scope}
 
+    @staticmethod
+    def _ts(hours_ago=1):
+        """动态时间戳（24h 窗口内的相对时间，避免硬编码日期随时间流逝失效）"""
+        return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
     def test_same_entity_saturated(self):
         """同实体 24h 内已推 5 条 → 饱和拦截"""
         pushed = [{"sectors": [], "stocks": [], "entities": ["SK海力士"],
-                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+                   "t": self._ts(1)} for _ in range(5)]
         assert rtp._topic_saturated(self._sig(entities=["SK海力士"]), pushed) is True
 
     def test_same_sector_saturated(self):
         """同板块 24h 内已推 5 条 → 饱和拦截"""
         pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
-                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+                   "t": self._ts(1)} for _ in range(5)]
         assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is True
 
     def test_below_limit_not_saturated(self):
         """4 条未达上限 → 放行"""
         pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
-                   "t": "2026-08-12 10:00:00"} for _ in range(4)]
+                   "t": self._ts(1)} for _ in range(4)]
         assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is False
 
     def test_market_scope_exempt(self):
         """market 级（宏观数据/大盘）豁免：CPI 永不受饱和拦截"""
         pushed = [{"sectors": ["宏观"], "stocks": [], "entities": [],
-                   "t": "2026-08-12 10:00:00"} for _ in range(10)]
+                   "t": self._ts(1)} for _ in range(10)]
         assert rtp._topic_saturated(self._sig(sectors=["宏观"], scope="market"), pushed) is False
 
     def test_outside_window_not_counted(self):
         """24h 窗口外的推送不计入饱和"""
         pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
-                   "t": "2026-08-10 09:00:00"} for _ in range(5)]
+                   "t": self._ts(48)} for _ in range(5)]
         assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is False
 
     def test_different_topic_not_saturated(self):
         """不同题材不互相影响"""
         pushed = [{"sectors": ["存储"], "stocks": [], "entities": [],
-                   "t": "2026-08-12 10:00:00"} for _ in range(5)]
+                   "t": self._ts(1)} for _ in range(5)]
         assert rtp._topic_saturated(self._sig(sectors=["光模块"]), pushed) is False
 
 
