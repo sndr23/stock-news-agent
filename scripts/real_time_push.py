@@ -450,6 +450,11 @@ _NOISE_INDEX_MOVE = [
 _NOISE_INTRADAY_MARKERS = [
     "异动拉升", "直线涨停", "直线跌停", "盘初走强", "盘中走强", "短线走高",
     "震荡拉升", "尾盘拉升", "午后拉升", "冲高回落", "快速走强", "集体走强",
+    # 2026-08-13 审核实证漏网："PCB概念表现活跃 方邦股份涨超10%" 被推送——
+    # "表现活跃/概念活跃"等盘面情绪措辞不在词表。补入；龙头例外仍由 is_leader 放行
+    # （"中际旭创表现活跃"类不误伤）。
+    "表现活跃", "概念活跃", "持续活跃", "反复活跃", "概念走强", "概念走高",
+    "集体大涨", "涨停潮", "活跃拉升",
 ]
 # 指数行情播报需额外覆盖的指数名（_INDEX_TOKENS 之外的出现形式）
 _NOISE_INDEX_NAMES = _INDEX_TOKENS + ["KOSPI", "恒生指数", "综合指数"]
@@ -745,6 +750,14 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
                 if (num_a and num_b) and not (num_a & num_b):
                     return False
                 if any(p in ta and p in tb for p in _EVENT_PHRASE_ANCHORS):
+                    return True
+                # 2026-08-13 修复：同实体 + 无事件组 + 同板块（sectors 交集≥2 词）
+                # + 标题共享≥2字 → 同事件（四川算力政策同轮双推实证："建强成都平原
+                # 算力核心区" vs "布局万卡级以上智算集群" 同实体同板块、无共享锚、
+                # LCS 仅 2 字，既有分支全兜不住）。
+                # 守卫：金额冲突已排除；sectors 交集≥2 防"英伟达AI芯片 vs 英伟达AI服务器"
+                # 仅共享宽泛"AI"被误并（漏推守卫）。
+                if len(sec_a & sec_b) >= 2 and _lcs_len(ta, tb) >= 2:
                     return True
             shorter = min(len(ta), len(tb))
             if shorter >= 8:
@@ -1069,13 +1082,38 @@ def _is_major_deal_event(text: str) -> bool:
     return False
 
 
+# 预筛直通主体词表（2026-08-13 修复：漏推实证——"DeepSeek V4 Pro 正式版上线"、
+# "长江存储首次跻身全球NAND前三"、"寒武纪五大国产模型适配"、"腾讯营收首超2000亿"、
+# "钙钛矿量产技术登《自然》" 均预筛 0.14 被静默丢弃，根因是 HIGH_SIGNAL 词表缺
+# 具体科技龙头/重要主体名。本表只用于预筛直通（命中即送 LLM 判定），刻意不并入
+# HIGH_SIGNAL_KEYWORDS——避免这些宽泛主体词进入指纹 sig 路径造成不同事件指纹碰撞。
+# 是否推送仍由 LLM 严格判定（日常/行情/中小市值消息由 LLM 否决）。
+_PREFILTER_HEADLINE_ENTITIES = [
+    # 国产 AI/算力/科技龙头
+    "DeepSeek", "寒武纪", "中际旭创", "长江存储", "长鑫存储", "华为", "海思",
+    "腾讯", "阿里", "阿里巴巴", "字节", "百度", "小米", "比亚迪", "宁德时代",
+    # 全球科技/半导体龙头
+    "英伟达", "台积电", "三星", "SK海力士", "海力士", "美光", "铠侠", "ASML",
+    "OpenAI", "Anthropic", "微软", "谷歌", "苹果", "特斯拉", "Meta", "亚马逊",
+    # 新能源/新材料技术
+    "钙钛矿", "固态电池",
+]
+
+
+def _hit_headline_entity(text: str) -> bool:
+    """是否命中预筛直通主体词（科技龙头/重要主体）"""
+    if not text:
+        return False
+    return any(e in text for e in _PREFILTER_HEADLINE_ENTITIES)
+
+
 def _prefilter(news: dict) -> tuple:
     """规则预筛：返回 (预筛评分, 是否命中高信号词)
 
     2026-08-12 修复：高信号词命中 或 宏观数据发布识别（_is_macro_data_release）
     均直通 LLM 判定——确定性宏观数据事件即使预筛分低也不允许静默丢弃。
-    2026-08-13 修复：大额经营事件（_is_major_deal_event）同样直通，防科技龙头
-    重大订单/建厂被预筛静默丢弃。
+    2026-08-13 修复：大额经营事件（_is_major_deal_event）与科技龙头主体词
+    （_hit_headline_entity）同样直通，防龙头重大订单/发布/里程碑被预筛静默丢弃。
     """
     score = calculate_prefilter_importance(news)
     title = str(news.get("title", "") or "")
@@ -1089,7 +1127,7 @@ def _prefilter(news: dict) -> tuple:
     # 2026-08-06 修复：改用共享词边界匹配（has_signal_keyword），
     # "STorage/STMicroelectronics" 不再误命中 "ST" 信号词
     hit = (has_signal_keyword(text) or _is_macro_data_release(text)
-           or _is_major_deal_event(text))
+           or _is_major_deal_event(text) or _hit_headline_entity(text))
     return float(score), hit
 
 
@@ -1125,6 +1163,10 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
   除非涉及重大政策转向或直接影响 A 股；注意：此条不含宏观数据发布本身——
   外围重要数据（美国 CPI/PPI/非农/利率决议等）因直接影响全球市场与 A 股，仍按优先级 1 推送
 - 分析师评级调整/目标价小幅变动（杰富瑞、伯恩斯坦等），除非幅度极大且已引发市场剧烈反应
+- 券商研报/机构观点/主题性分析：无具体事件佐证的定性判断——"机构称""研报""XX投资机会"
+  "XX向XX传导""XX进入XX期""XX有望受益""XX空间广阔"等，即使涉及科技/AI/算力板块也不推；
+  必须是已发生的具体事件（硬数据如"台积电CoWoS良率升至98%"、明确订单金额、政策动作、公司公告）
+  才可能构成重大（2026-08-13 实证滥推："机构称物理AI市场空间""液冷投资向零部件传导"等）
 - 无官方确认的产品传闻/路线图预测（苹果折叠 iPhone、郭明錤预测等）
 - 与上述优先级均无关的其他资讯
 
