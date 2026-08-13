@@ -142,6 +142,11 @@ STATE_WINDOW_HOURS = 48
 # 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
 MAX_PENDING_RETRY = 3
 
+# seen 指纹条数上限（2026-08-13 P0 新增）：48h 清理后仍超上限则按时间保留最新。
+# 此前 seen 无上限（峰值 4759 条 → 状态文件 0.72MB），Gist 写入截断损坏是
+# "状态被覆盖清空"事故的诱因；3000 条 ≈ 0.45MB，留足 Gist 1MB 余量。
+SEEN_MAX = 3000
+
 # 心跳告警（2026-08-06 新增）：有新增资讯但连续 N 轮 0 推送时输出告警日志，
 # 帮助区分"确实没大事" vs "系统静默故障"
 HEARTBEAT_ZERO_PUSH_WARN_ROUNDS = 6
@@ -928,6 +933,7 @@ def _gist_load(token: str, gist_id: str) -> dict:
         "User-Agent": "stock-news-agent-realtime",
     }
     fobj = None
+    last_error = None
     for attempt in range(3):
         try:
             resp = requests.get(url, timeout=20)
@@ -938,17 +944,27 @@ def _gist_load(token: str, gist_id: str) -> dict:
             if fobj is not None:
                 break
         except Exception as e:
+            last_error = e
             logger.warning(f"Gist 读取第{attempt + 1}次失败: {e}")
             fobj = None
         if attempt < 2:
             logger.info(f"Gist 状态文件暂未读到（第{attempt + 1}次，可能命中旧快照），1s 后重试")
             time.sleep(1)
-    content = fobj.get("content") if fobj else "{}"
+    # 2026-08-13 P0 修复（状态丢失事故根因）：3 次均未读到文件时必须报错，
+    # 禁止"空状态运行后覆盖写回"——此前静默返回 "{}" 导致 19:03 轮把
+    # 4759 seen/200 pending/62 pushed 历史去重记录全部冲掉。
+    if fobj is None:
+        raise RuntimeError(f"Gist 状态文件读取失败（3 次尝试均未读到文件）: {last_error}")
+    content = fobj.get("content")
     try:
         state = json.loads(content)
-    except json.JSONDecodeError:
-        logger.warning("Gist 状态文件 JSON 解析失败，重置为空状态")
-        state = _empty_state()
+    except json.JSONDecodeError as e:
+        # JSON 截断/损坏（18:02 轮 0.72MB 写入截断实证）：必须报错，禁止降级空状态
+        logger.error(f"Gist 状态文件 JSON 解析失败（内容 {len(content or '')} 字符，可能写入被截断损坏）: {e}")
+        raise
+    # 结构校验：解析成功但缺 seen 等核心键 → 视为损坏（防"{}"等畸形内容被当空状态）
+    if not isinstance(state, dict) or "seen" not in state:
+        raise ValueError("Gist 状态文件结构异常（缺少 seen 键），拒绝空状态运行")
     return state
 
 
@@ -1066,13 +1082,22 @@ def save_state(state: dict) -> None:
     gist_token = os.getenv("GIST_TOKEN", "").strip()
     gist_id = os.getenv("GIST_ID", "").strip()
 
+    _merge_failed = False
     if gist_token and gist_id:
         # 写入前先合并最新远端状态，避免并发实例互相覆盖
         try:
             latest = _gist_load(gist_token, gist_id)
             state = _merge_state(state, latest)
         except Exception as e:
-            logger.warning(f"Gist 保存前合并失败（将直接覆盖写入）: {e}")
+            # 2026-08-13 P0 修复（状态丢失事故根因）：合并失败禁止静默覆盖。
+            # 此前"直接覆盖写入"导致 19:03 轮把 Gist 中 4759 条历史 seen 全部冲掉。
+            # CI 下报错退出（fail-stop：宁可本轮失败，不可丢去重基准）；
+            # 本地模式下拒绝覆盖 Gist，降级写本地文件（防远端被冲，用户可手动恢复）。
+            logger.error(f"Gist 保存前合并失败: {e}")
+            _merge_failed = True
+            if _is_ci():
+                raise RuntimeError(f"Gist 合并失败，拒绝覆盖写入（防止状态丢失）: {e}")
+            logger.warning("本地模式合并失败：拒绝覆盖 Gist（防远端去重基准被冲），状态降级写入本地文件")
     elif _is_ci():
         # CI 下没有 Gist 配置 → 状态无处可存 → 下轮会重复推送，必须报错
         raise RuntimeError("CI 环境缺少 GIST_TOKEN/GIST_ID，状态无法持久化，禁止无状态运行")
@@ -1085,6 +1110,11 @@ def save_state(state: dict) -> None:
         seen.pop(fp, None)
     if expired:
         logger.info(f"清理过期指纹 {len(expired)} 条，剩余 {len(seen)} 条")
+    # 2026-08-13 P0：seen 无上限导致状态文件膨胀至 0.72MB（Gist 写入截断损坏诱因）。
+    # 48h 清理后仍超上限时，按时间保留最新 SEEN_MAX 条，控制文件体积。
+    if len(seen) > SEEN_MAX:
+        seen = dict(sorted(seen.items(), key=lambda kv: kv[1].get("t", ""))[-SEEN_MAX:])
+        logger.warning(f"seen 超过上限 {SEEN_MAX} 条，按时间保留最新（状态文件体积控制）")
     state["seen"] = seen
 
     # 滚动清理过期挂起重试（48h 窗口）+ 上限 200 条防爆胀
@@ -1104,11 +1134,12 @@ def save_state(state: dict) -> None:
         pe = sorted(pe, key=lambda e: e.get("t", ""))[-300:]
     state["pushed_events"] = pe
 
-    if gist_token and gist_id:
+    if gist_token and gist_id and not _merge_failed:
         _gist_save(gist_token, gist_id, state)
         logger.info(f"状态已保存到 Gist（{len(seen)} 个指纹, {len(pe)} 个已推事件）")
         return
 
+    # 无 Gist 配置 或 合并失败降级（本地模式）→ 写本地文件
     state_path = _state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")

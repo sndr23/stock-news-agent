@@ -757,15 +757,17 @@ class TestGistLoadRetry:
         assert calls["n"] == 3  # 前2次失败重试，第3次成功
         assert state["seen"]["fp1"]["pushed"] is True
 
-    def test_all_fail_returns_empty_state(self, monkeypatch):
+    def test_all_fail_raises_fail_stop(self, monkeypatch):
+        """2026-08-13 P0：3 次读取全部失败 → raise（此前静默返回空状态，
+        导致 19:03 轮空状态运行覆盖写回、4759 条历史去重记录丢失）"""
         import requests
 
         def fake_get(url, timeout=20):
             raise requests.exceptions.Timeout("timeout")
 
         monkeypatch.setattr("requests.get", fake_get)
-        state = rtp._gist_load("token", "gist_id")
-        assert state == {}
+        with pytest.raises(RuntimeError, match="读取失败"):
+            rtp._gist_load("token", "gist_id")
 
 
 # ============================================================
