@@ -1461,6 +1461,72 @@ class TestEntityOverlapMerge:
         assert not rtp._is_same_event(s1, s2)
 
 
+class TestMacroPolicyMerge:
+    """2026-08-14 修复：日本央行加息三连推实证（16:03 同一事件多源报道推 3 次）
+
+    根因①：'行情下跌'由 content 关键词规则提取进 events，属市场状态描述而非
+    事件动词，使 _is_same_event 的共享事件组/双方均无事件组分支同时失效；
+    根因②：多源措辞差异大（LCS 仅 4 字、jaccard 0.15~0.20），既有分支全兜不住。
+    修复：过滤市场状态事件组 + 新增央行宏观政策合并分支（同央行实体 + 标题
+    宏观政策词 + 方向不冲突）。
+    """
+
+    def _sig(self, title, entities, events=None):
+        return {
+            "stocks": [], "entities": entities, "events": events or [],
+            "numbers": [], "sectors": ["整体市场"], "scope": "market",
+            "title_norm": rtp._normalize_title(title),
+        }
+
+    def test_boj_rate_hike_three_reports_merged(self):
+        """真实签名：16:03 三条日本央行加息报道（第一条 events=['行情下跌']）→ 两两合并"""
+        s1 = self._sig("消息人士称日本央行最快可能在9月加息",
+                       ["日本央行"], events=["行情下跌"])
+        s2 = self._sig("日本央行加息或提速美元对日元急跌市场担心潜在流动性冲击",
+                       ["日本央行"])
+        s3 = self._sig("消息人士称日本央行考虑9月加息并加快紧缩步伐",
+                       ["日本央行"])
+        assert rtp._is_same_event(s1, s2), "行情下跌过滤后应走宏观分支合并"
+        assert rtp._is_same_event(s1, s3), "行情下跌过滤后应走标题相似合并"
+        assert rtp._is_same_event(s2, s3), "同央行+加息词应合并"
+
+    def test_market_state_event_filtered_out(self):
+        """行情状态词不作为共享事件组：暴跌 vs 空事件组且标题无关 → 不同事件"""
+        a = self._sig("A公司股价暴跌", ["A公司"], events=["行情下跌"])
+        b = self._sig("B公司宣布重大合同中标", ["B公司"], events=[])
+        assert not rtp._is_same_event(a, b)
+
+    def test_rate_hike_vs_cut_not_merged(self):
+        """方向守卫：同央行 加息 vs 降息 → 不同事件（防误并漏推）"""
+        a = self._sig("消息人士称日本央行考虑9月加息", ["日本央行"])
+        b = self._sig("消息人士称日本央行考虑9月降息", ["日本央行"])
+        assert not rtp._is_same_event(a, b)
+
+    def test_different_central_banks_not_merged(self):
+        """实体守卫：日本央行 vs 美联储 → 不同事件"""
+        a = self._sig("消息人士称日本央行考虑9月加息", ["日本央行"])
+        b = self._sig("美联储官员称9月可能加息", ["美联储"])
+        assert not rtp._is_same_event(a, b)
+
+    def test_neutral_cb_news_not_merged(self):
+        """触发词守卫：中性购债安排 vs 加息传闻（仅共享央行实体）→ 不同事件"""
+        a = self._sig("日本央行公布最新购债操作安排", ["日本央行"])
+        b = self._sig("消息人士称日本央行最快可能在9月加息", ["日本央行"])
+        assert not rtp._is_same_event(a, b)
+
+    def test_same_cb_same_direction_merged(self):
+        """同央行同向政策词（加息 vs 加快紧缩步伐）→ 合并"""
+        a = self._sig("消息人士称日本央行考虑9月加息", ["日本央行"])
+        b = self._sig("日本央行考虑加快紧缩步伐 美元对日元急跌", ["日本央行"])
+        assert rtp._is_same_event(a, b)
+
+    def test_cb_alias_normalized(self):
+        """实体别名归一化：日央行/BOJ → 日本央行，仍合并"""
+        a = self._sig("日央行最快可能在9月加息", ["日央行"])
+        b = self._sig("BOJ考虑加快紧缩步伐", ["BOJ"])
+        assert rtp._is_same_event(a, b)
+
+
 class TestLlmPromptScenarios:
     """修复3：LLM prompt 补充必推场景（AI发布/监管/见顶警示）"""
 
