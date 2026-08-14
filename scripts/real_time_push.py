@@ -571,6 +571,36 @@ _EVENT_PHRASE_ANCHORS = [
 _MACRO_EVENT_WORDS = ["CPI", "PPI", "通胀", "物价", "非农", "失业率", "GDP",
                       "利率决议", "FOMC", "就业数据"]
 
+# 市场状态类事件组（2026-08-14 修复：日本央行加息三连推实证）
+# "行情下跌"由 _EVENT_KEYWORD_GROUPS 规则命中 content 中"走低/暴跌/下挫"等词提取，
+# 属市场状态描述而非事件动词。它使 _is_same_event 的"共享事件组"与
+# "双方均无事件组"分支同时失效——第一条 events=["行情下跌"] 与其余 events=[] 的
+# 报道无法匹配（shared_ev=∅ 且 not ev_a 不成立），同一事件多源报道 48h 内重复推送。
+# _is_same_event 计算事件组前统一过滤，避免污染事件语义。
+_MARKET_STATE_EVENTS = {"行情下跌", "行情上涨", "行情震荡"}
+
+# 央行/货币当局实体（归一化后名称，2026-08-14 修复：宏观流动性事件跨源合并兜底）
+# 日本央行加息类宏观事件：多源快讯措辞差异大（"最快可能在9月加息" vs
+# "加息或提速美元对日元急跌…流动性冲击"），LCS 仅 4 字、jaccard 0.15~0.20、
+# 无事件组/板块交集，既有全部合并分支兜不住（"加息"不在事件锚表、
+# _MACRO_EVENT_WORDS 无"加息"、日股无市场域词）。新增分支守卫：
+# 双方共享同一央行实体 + 标题均含宏观政策词 + 政策方向不冲突 → 同事件。
+_CENTRAL_BANK_ENTITIES = {
+    "日本央行", "美联储", "欧央行", "中国人民银行", "英国央行",
+    "韩国央行", "澳洲联储", "瑞士央行", "加拿大央行",
+}
+# 宏观政策鹰派/鸽派方向词（方向守卫，防"考虑加息 vs 考虑降息"误并——
+# _title_direction_conflict 的涨跌表不含"加息/降息"：加息无"涨/升"字）
+_POLICY_HAWK_WORDS = ("加息", "升息", "缩表", "紧缩", "收紧")
+_POLICY_DOVE_WORDS = ("降息", "扩表", "宽松", "降准", "量化宽松", "放水")
+# 宏观政策事件触发词（合并判定：标题描述同一央行政策动作；需配合央行实体守卫）
+# 仅含方向性政策动作（购债无方向——"购债操作安排"中性日常 vs "削减购债"鹰派，
+# 不宜作为合并触发，避免"购债安排"与"加息传闻"误并）
+_MACRO_POLICY_EVENT_WORDS = (
+    "加息", "降息", "缩表", "扩表", "宽松", "紧缩",
+    "升息", "降准", "量化宽松", "YCC", "收益率曲线控制",
+)
+
 # 行情普涨/普跌类措辞（sectors 交集合并用，2026-08-12 实证：22:01 同轮双推
 # "美股光通信存储概念股普涨诺基亚升逾9" vs "美国7月通胀表现温和美股盘初纳指涨09
 # 光通信股存储芯片股普涨"——entities 各抽各的（诺基亚/Ciena/Coherent vs
@@ -749,6 +779,26 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     return cnt >= TOPIC_PUSH_LIMIT
 
 
+def _central_bank_shared(ent_a: set, ent_b: set) -> bool:
+    """双方实体是否共享同一央行（归一化后精确匹配，防日本央行 vs 美联储误并）"""
+    ca = {_normalize_entity(e) for e in ent_a} & _CENTRAL_BANK_ENTITIES
+    cb = {_normalize_entity(e) for e in ent_b} & _CENTRAL_BANK_ENTITIES
+    return bool(ca & cb)
+
+
+def _policy_direction_conflict(ta: str, tb: str) -> bool:
+    """宏观政策方向冲突（鹰派 vs 鸽派），防"考虑加息 vs 考虑降息"被宏观分支误并
+
+    _title_direction_conflict 的涨跌表不含"加息/降息"（"加息"无"涨/升"字、
+    "降息"含"降"但不含"跌"），对货币政策方向对立识别失效，需单独守卫。
+    """
+    hawk_a = any(w in ta for w in _POLICY_HAWK_WORDS)
+    dove_b = any(w in tb for w in _POLICY_DOVE_WORDS)
+    dove_a = any(w in ta for w in _POLICY_DOVE_WORDS)
+    hawk_b = any(w in tb for w in _POLICY_HAWK_WORDS)
+    return (hawk_a and dove_b) or (dove_a and hawk_b)
+
+
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
 
@@ -774,8 +824,12 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """
     ent_a = set(_as_list(sig_a.get("stocks"))) | set(_as_list(sig_a.get("entities")))
     ent_b = set(_as_list(sig_b.get("stocks"))) | set(_as_list(sig_b.get("entities")))
-    ev_a = set(_as_list(sig_a.get("events")))
-    ev_b = set(_as_list(sig_b.get("events")))
+    # 2026-08-14 修复：过滤市场状态类事件组（"行情下跌"由 content 关键词规则提取，
+    # 属市场状态描述而非事件动词）。否则非空 events 使"共享事件组"分支
+    # （shared_ev=∅）与"双方均无事件组"分支（not ev_a 不成立）同时失效，
+    # 同事件多源报道无法合并（日本央行加息三连推实证）。
+    ev_a = {e for e in set(_as_list(sig_a.get("events"))) if e not in _MARKET_STATE_EVENTS}
+    ev_b = {e for e in set(_as_list(sig_b.get("events"))) if e not in _MARKET_STATE_EVENTS}
     num_a = set(_as_list(sig_a.get("numbers")))
     num_b = set(_as_list(sig_b.get("numbers")))
     shared_ev = ev_a & ev_b
@@ -840,6 +894,20 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
                 mac_a = any(w in ta for w in _MACRO_EVENT_WORDS)
                 mac_b = any(w in tb for w in _MACRO_EVENT_WORDS)
                 if mac_a and mac_b:
+                    return True
+            # 2026-08-14 修复（日本央行加息三连推实证）：宏观流动性/货币政策事件
+            # 多源报道措辞差异大（"最快可能在9月加息" vs "加息或提速美元对日元急跌
+            # …流动性冲击"），LCS 仅 4 字、jaccard 0.15~0.20、无事件组/板块交集，
+            # 且三条均 market 级（_topic_saturated 豁免），既有分支全部兜不住。
+            # 新增：共享同一央行实体 + 标题均含宏观政策词 + 政策方向不冲突 → 同事件。
+            # 守卫：①同一央行实体（防日本央行 vs 美联储误并）；②方向守卫（防
+            # "考虑加息 vs 考虑降息"）；③标题均含政策词（防仅共享"日本央行"实体
+            # 的两条无关央行新闻被误并）。
+            if _central_bank_shared(ent_a, ent_b):
+                if _policy_direction_conflict(ta, tb):
+                    return False
+                if (any(w in ta for w in _MACRO_POLICY_EVENT_WORDS)
+                        and any(w in tb for w in _MACRO_POLICY_EVENT_WORDS)):
                     return True
             jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
             if jaccard >= 0.6:
@@ -1279,6 +1347,9 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
      对冲成本与仓位）、融资余额/两融/北向资金等资金流大额异动
    以上即使来自"外围央行"或"官员表态"，只要涉及重大政策转向或直接影响全球/A 股流动性，
    均属 market 级必推，不适用下方"外围央行日常表态不推"条款
+   （2026-08-14 补充：同一央行政策动作的多源报道/衍生快讯——如"日本央行考虑9月加息"
+   "加息或提速美元对日元急跌""消息人士称最快可能在9月加息"——属同一事件的多个角度，
+   判定时按同一事件口径处理，不要因角度不同而各自判为独立重大消息）
 2. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件；
    以及中国/美国核心宏观数据发布——CPI、PPI、非农、GDP、利率决议、PMI 等——
    数据发布本身即 market 级重大消息，方向按数据对市场的实际含义判定，
