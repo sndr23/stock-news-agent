@@ -415,8 +415,9 @@ def calc_risk_state(signals: list) -> str:
 
 # ============================================================
 # 量化方向信号（2026-08-14 用户核心需求："利好因子买、利空因子卖，和量化同步"）
-# 把量化因子翻译成"买卖方向信号"：每个维度打分（+1 利好=买向 / -1 利空=卖向 / 0 中性），
-# 多因子合成综合方向（偏多/偏空/中性），方向改变时推送"量化方向信号"（含各因子明细）。
+# 把量化因子翻译成"方向信号"：每个维度打分（+1 利好 / -1 利空 / 0 中性），
+# 多因子合成综合方向（偏多=利好 / 偏空=利空 / 中性），方向改变时推送"量化方向信号"。
+# 注：推送展示只用"利好/利空"口径（用户明确不写"买卖方向"）。
 # ============================================================
 def _calc_basis_direction(history: dict) -> dict:
     """各股指合约贴水方向：走扩(贴水加深=中性策略防守/减仓) / 收敛(贴水变浅=进攻/加仓) / 走平
@@ -444,12 +445,12 @@ def _calc_basis_direction(history: dict) -> dict:
 def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, history: dict) -> dict:
     """多因子合成量化方向信号
 
-    四个维度各打分（+1 买向 / -1 卖向 / 0 中性）：
-    - 对冲（IC/IM 贴水方向）：收敛=+1（中性策略加仓），走扩=-1（减仓）
-    - 风险（risk_state）：neutral=0，risk_off=-1（风险收缩=卖向）
+    四个维度各打分（+1 利好 / -1 利空 / 0 中性）：
+    - 对冲（IC/IM 贴水方向）：收敛=+1（中性策略加仓→利好），走扩=-1（减仓→利空）
+    - 风险（risk_state）：neutral=0，risk_off=-1（风险收缩=利空）
     - 量价（上证/创业板放量突破/破位）：突破=+1，破位=-1
-    - 汇率（美元/日元）：单日波动>=1.5% 且日元急升(美元/日元跌)=-1（套息平仓），日元急贬=+1
-    综合分 = 有效维度均值，>=0.5 偏多 / <=-0.5 偏空 / 否则中性。
+    - 汇率（美元/日元）：单日波动>=1.5% 且日元急升(美元/日元跌)=-1（套息平仓→利空），日元急贬=+1
+    综合分 = 有效维度均值，>=0.5 偏多(利好) / <=-0.5 偏空(利空) / 否则中性。
     """
     dims = []  # (名称, 分值, 说明)
     # ① 对冲
@@ -675,35 +676,36 @@ def format_alert(signal: dict) -> str:
     return f"<font color=\"{color}\">{icon} {tag}</font> **{signal['title']}**\n> {signal['detail']}"
 
 
-def format_state_change(signal: dict) -> str:
-    """单条量化资金状态变化（与告警同款红涨绿跌风格）"""
-    icon = "▲" if signal["direction"] == "bullish" else "▼"
-    color = _RED if signal["direction"] == "bullish" else _GREEN
-    tag = "量化进攻" if signal["direction"] == "bullish" else "量化防守"
-    return f"<font color=\"{color}\">{icon} {tag}</font> **{signal['title']}**\n> {signal['detail']}"
+_DIR_LABEL = {"偏多": "利好", "偏空": "利空", "中性": "中性"}
 
 
 def format_direction_signal(analysis: dict, last_dir: str = "") -> str:
-    """量化方向信号推送正文：综合方向 + 各因子明细（买向/卖向标注）"""
+    """量化方向信号推送正文：综合方向（利好/利空/中性）+ 各因子明细
+
+    用户口径（2026-08-14）：只用"利好/利空"表述，不写"买卖方向"。
+    """
     direction = analysis["direction"]
     score = analysis["score"]
+    display = _DIR_LABEL.get(direction, direction)
     if direction == "偏多":
-        color, tag, arrow = _RED, "买入方向", "▲"
+        color, arrow = _RED, "▲"
     elif direction == "偏空":
-        color, tag, arrow = _GREEN, "卖出方向", "▼"
+        color, arrow = _GREEN, "▼"
     else:
-        color, tag, arrow = "#888888", "观望", "◆"
-    suffix = f"（前值 {last_dir}）" if last_dir and last_dir != direction else ""
+        color, arrow = "#888888", "◆"
+    suffix = ""
+    if last_dir and last_dir != direction:
+        suffix = f"（前值 {_DIR_LABEL.get(last_dir, last_dir)}）"
     lines = [
-        f"<font color=\"{color}\">{arrow} 量化方向：{direction}（{score:+.2f}）</font>｜{tag}{suffix}",
+        f"<font color=\"{color}\">{arrow} 量化方向：{display}（{score:+.2f}）</font>{suffix}",
         "",
         "因子明细：",
     ]
     for name, s, desc in analysis.get("factors", []):
         if s > 0:
-            mark = "▲ 买向"
+            mark = "▲ 利好"
         elif s < 0:
-            mark = "▼ 卖向"
+            mark = "▼ 利空"
         else:
             mark = "— 中性"
         lines.append(f"- {mark}｜{name}：{desc}")
@@ -768,7 +770,7 @@ def run_once(push: bool) -> dict:
         else:
             print("\n[推送] 本轮无异动（或均在冷却期）")
         # 量化方向信号（核心需求"利好买、利空卖，和量化同步"）：多因子合成方向
-        # （偏多/偏空/中性），方向改变时推送"量化方向信号"（含各因子买向/卖向明细）。
+        # （偏多=利好/偏空=利空/中性），方向改变时推送"量化方向信号"（含各因子利好/利空明细）。
         # 独立冷却（change_cooldown）防盘中方向抖动反复推。
         analysis = _direction_analysis(tech, basis, fx, risk_state, new_history)
         last_dir = state.get("last_direction")
