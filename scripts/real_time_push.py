@@ -1265,32 +1265,48 @@ def _prefilter(news: dict) -> tuple:
 # ============================================================
 _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯是否属于"必须立即推送的重大消息"。
 推送优先级由高到低，以下任一条件成立则应判为推送：
-1. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件；
+1. 全球流动性/利率/汇率/套息/资金面事件（驱动万亿级量化资金系统性调仓的因子信号，market 级必推）：
+   - 日本央行货币政策（加息/降息/YCC 调整/购债变化/植田和男等重要官员释放政策转向信号）及
+     日元急升急贬——日元是全球核心融资货币，日本加息会引发日元套息交易(carry trade)平仓、
+     全球风险资产去杠杆，是 A 股大跌的直接导火索（2026-08-13 实证漏推：午后"日本首相支持央行
+     近期加息"引发日元急升、A股尾盘跳水超 4300 股下跌，但系统全天未推任何日本/日元/套息资讯）
+   - 美债收益率异动（10 年期/2 年期/30 年期中标收益率创阶段新高/新低、收益率曲线倒挂/陡峭化）、
+     美国财政部拍卖结果、中美利差变化
+   - 人民币/离岸人民币汇率急变、美元指数异动、央行汇率干预
+   - 中国央行流动性操作与资金面：逆回购/MLF/买断式逆回购/降准降息/公开市场净投放净回笼、
+     社融/M2/信贷等货币信用数据发布
+   - 市场波动率与对冲成本：VIX 急升、股指期货基差/贴水大幅走扩或收敛（直接决定中性策略
+     对冲成本与仓位）、融资余额/两融/北向资金等资金流大额异动
+   以上即使来自"外围央行"或"官员表态"，只要涉及重大政策转向或直接影响全球/A 股流动性，
+   均属 market 级必推，不适用下方"外围央行日常表态不推"条款
+2. 影响整个市场/大盘（宏观政策、央行、证监会、国常会、政治局会议、重大地缘政治事件；
    以及中国/美国核心宏观数据发布——CPI、PPI、非农、GDP、利率决议、PMI 等——
    数据发布本身即 market 级重大消息，方向按数据对市场的实际含义判定，
    公布后的市场反应（股债汇、加息/降息预期变化、机构点评）同属重大，与数据本体
    合并为一条推送即可，不必每条机构点评都单独推）
-2. 影响科技板块/科技产业链的资讯（AI、算力、半导体、芯片、存储、光模块/CPO、PCB、MLCC、
+3. 影响科技板块/科技产业链的资讯（AI、算力、半导体、芯片、存储、光模块/CPO、PCB、MLCC、
    机器人、消费电子等）：板块景气变化、龙头动向、技术突破、产业政策——即使标题未点名个股
-3. 科技龙头个股的重大消息（寒武纪、中际旭创、宁德时代、英伟达产业链相关等第一梯队
+4. 科技龙头个股的重大消息（寒武纪、中际旭创、宁德时代、英伟达产业链相关等第一梯队
    公司的重大经营事件、大额订单、业绩剧变、监管动向）
-4. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块
-5. AI/科技龙头的新产品、新模型、新芯片发布（OpenAI/微软/英伟达/谷歌/三星/SK海力士等发布
+5. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块
+6. AI/科技龙头的新产品、新模型、新芯片发布（OpenAI/微软/英伟达/谷歌/三星/SK海力士等发布
    新模型版本、自研芯片、HBM新品等）——只要消息经证实或来自权威媒体，即属重大，即使
    没有点名A股公司（2026-08-11 实证漏推：OpenAI发布GPT-5.6-Cyber）
-6. 核心科技板块的利空警示（行业见顶信号、龙头目标价被大幅下调、产能过剩担忧、重大诉讼/
+7. 核心科技板块的利空警示（行业见顶信号、龙头目标价被大幅下调、产能过剩担忧、重大诉讼/
    监管审查）——利空警示同样属于必须推送的重大消息，方向为 bearish（2026-08-11 实证漏推：
    韩国券商砍三星/SK海力士目标价约30%）
-7. AI 监管与政策（立法机构、监管机构、政府要员对 AI 开发/使用/出口的限制、调查、听证）——
+8. AI 监管与政策（立法机构、监管机构、政府要员对 AI 开发/使用/出口的限制、调查、听证）——
    即使不点名具体公司（2026-08-11 实证漏推：美参议员致信要求暂停AI开发）
 明确不推（无论业绩多好、涨跌多剧烈）：
 - 纯个人观点/猜测类言论：政客或机构单方面"怀疑""认为""预计"等表态，没有真实事件或官方立场
   变化、没有实际市场反应佐证，则不视为重大事件——即便话题涉及地缘、石油或美股
 - 只影响中小市值个股自身股价的消息：业绩预告/业绩变动、小额回购、增持/减持、中标/签约、
   日常经营、子公司事项、分红送转等——除非该股是行业龙头或直接改变板块逻辑
-- 外围央行（非中国）的日常表态/会议纪要/储备数据（日本央行委员意见、印度央行、匈牙利央行等），
-  除非涉及重大政策转向或直接影响 A 股；注意：此条不含宏观数据发布本身——
-  外围重要数据（美国 CPI/PPI/非农/利率决议等）因直接影响全球市场与 A 股，仍按优先级 1 推送
+- 外围央行（非中国）的日常表态/会议纪要/储备数据（印度央行、匈牙利央行、澳洲联储等的例行表态），
+  除非涉及重大政策转向或直接影响 A 股；注意：①此条不含宏观数据发布本身——
+  外围重要数据（美国 CPI/PPI/非农/利率决议等）因直接影响全球市场与 A 股，仍按优先级 1 推送；
+  ②日本央行加息/降息/YCC 调整及日元套息交易动向不属于"日常表态"——日元是全球核心融资货币，
+  日本货币政策转向会通过套息平仓直接冲击 A 股与全球风险资产，按优先级 1 必推（2026-08-13 实证漏推）
 - 分析师评级调整/目标价小幅变动（杰富瑞、伯恩斯坦等），除非幅度极大且已引发市场剧烈反应
 - 券商研报/机构观点/主题性分析：无具体事件佐证的定性判断——"机构称""研报""XX投资机会"
   "XX向XX传导""XX进入XX期""XX有望受益""XX空间广阔"等，即使涉及科技/AI/算力板块也不推；
@@ -1594,6 +1610,113 @@ def _tech_override_enabled(news: dict, judge: dict, leader_watchlist: set) -> bo
     if scope == "stock" and is_leader and _is_domestic_tech(news, sectors) and (score_ok or strong):
         return True
     return False
+
+
+# ============================================================
+# 风险收缩期联动（2026-08-14 第二阶段）
+# factor_collector 检测到贴水走扩/日元急升/放量破位 → risk_off 时，
+# 资讯管线对"无硬事件佐证的科技利好"降级不推，与量化资金风险期降杠杆一致；
+# 利空/风险资讯不受影响（风险期用户更关心利空）。
+# ============================================================
+_FACTOR_STATE_PATH = PROJECT_ROOT / "logs" / "factor_state.json"
+
+# 硬事件佐证词（已发生的完成态动作）：命中任一即视为"具体事件"（放行）。
+# 2026-08-14 实证调优：移除过宽的"订单/协议/合作/投资/业绩"（常见于"迎订单验证窗口"
+# "战略合作""机构投资"等展望/情绪语境，会误放行）；"扩建/投运/良率/产能"等补入。
+_HARD_EVENT_WORDS = (
+    "中标", "签约", "签署", "获批", "收购", "并购", "入股", "回购", "增持",
+    "量产", "扩产", "扩建", "投产", "建成", "投运", "上线", "发布", "拿下",
+    "交付", "落户", "良率", "产能", "出货",
+)
+# 展望修饰词：硬事件动词前 6 字内出现 → 视为"展望/未发生"而非已发生事件，
+# 不构成硬事件佐证（如"有望中标""拟收购""订单验证窗口"）。
+_FORWARD_MODIFIERS = ("有望", "预期", "预计", "或", "计划", "拟", "验证", "窗口", "开启", "迎")
+
+# 科技板块宽词（降级判定用，偏宽：宁可漏降级不可误伤非科技）。
+# _is_domestic_tech/_is_overseas_tech 依赖 OVERSEAS_TECH_KEYWORDS，缺"液冷/散热/数据中心"
+# 等词（实测 sectors=['液冷'] 返回 False），此处补全。
+_TECH_SECTOR_WORDS = (
+    "半导体", "芯片", "集成电路", "算力", "AI", "人工智能", "英伟达", "存储",
+    "光模块", "CPO", "PCB", "MLCC", "液冷", "散热", "服务器", "数据中心",
+    "通信", "光通信", "消费电子", "机器人", "电子", "软件", "互联网", "科技",
+    "GPU", "CPU", "晶圆", "封测", "先进封装", "智能驾驶", "卫星", "量子", "数据要素",
+)
+
+
+def _is_tech_by_sectors(sectors) -> bool:
+    """板块是否科技类（降级判定专用宽词表）"""
+    secs = " ".join(str(s) for s in (sectors or []))
+    return any(kw in secs for kw in _TECH_SECTOR_WORDS)
+
+
+def _load_factor_risk_state() -> str:
+    """读取 factor_collector 的风险状态：云端从 Gist 的 factor_state.json 读，本地读文件
+
+    缺失/解析失败/非预期值 → neutral（不影响现有推送）。云端未跑 factor_collector
+    时读不到 → 联动自动失效，保证向后兼容。
+    """
+    gist_token = os.getenv("GIST_TOKEN", "").strip()
+    gist_id = os.getenv("GIST_ID", "").strip()
+    if gist_token and gist_id:
+        try:
+            import requests
+            url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
+            headers = {"Authorization": f"token {gist_token}",
+                       "Accept": "application/vnd.github+json",
+                       "User-Agent": "stock-news-agent-realtime"}
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            files = resp.json().get("files") or {}
+            fobj = files.get("factor_state.json")
+            if fobj is not None:
+                data = json.loads(fobj.get("content") or "{}")
+                rs = data.get("risk_state", "neutral")
+                return rs if rs in ("risk_off", "neutral") else "neutral"
+        except Exception as e:
+            # 联动是增强功能，读取失败降级本地，不影响资讯主流程
+            logger.debug(f"Gist 风险状态读取失败，降级本地: {e}")
+    try:
+        data = json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
+        rs = data.get("risk_state", "neutral")
+        return rs if rs in ("risk_off", "neutral") else "neutral"
+    except (OSError, ValueError):
+        return "neutral"
+
+
+def _risk_off_downgrade(news: dict, judge: dict) -> bool:
+    """风险收缩期降级判定：科技 bullish 且无硬事件佐证 → True（降级不推）
+
+    规则：
+    - 仅作用于 bullish 科技资讯（板块/个股级）；利空/中性/非科技不受影响
+    - 硬事件佐证（任一即放行）：①具体金额（_extract_core_numbers）②百分比/倍数硬数据
+      （如"良率98%""产能翻倍"）③完成态硬事件动词（中标/收购/扩建/投产等），
+      且动词前无展望修饰（"有望/拟/验证窗口"等）
+    - 纯情绪/板块利好（"景气提升""有望受益""空间广阔"等无事件佐证）→ 降级
+    """
+    if judge.get("direction") != "bullish":
+        return False
+    sectors = _as_list(judge.get("sectors"))
+    # 科技识别三合一（宽松兜底 _is_tech_by_sectors，补 OVERSEAS_TECH_KEYWORDS 缺词）
+    if not (_is_domestic_tech(news, sectors) or _is_overseas_tech(news, sectors)
+            or _is_tech_by_sectors(sectors)):
+        return False
+    text = f"{str(news.get('title', ''))} {str(news.get('content', '') or '')[:200]}"
+    # ① 具体金额 → 硬事件，放行
+    if _extract_core_numbers(text):
+        return False
+    # ② 百分比/倍数硬数据（良率98%、市占率升至X%、产能翻倍）→ 放行
+    if re.search(r"\d+(\.\d+)?%", text) or re.search(r"翻[一二两三四五六七八九十百\d]倍|倍增", text):
+        return False
+    # ③ 完成态硬事件动词（排除展望修饰）
+    for w in _HARD_EVENT_WORDS:
+        if w not in text:
+            continue
+        idx = text.find(w)
+        ctx = text[max(0, idx - 6):idx]
+        if any(m in ctx for m in _FORWARD_MODIFIERS):
+            continue  # 展望性表述（"有望中标"），不算已发生
+        return False
+    return True
 
 
 def _normalize_direction(value, news: dict = None) -> str:
@@ -1917,6 +2040,9 @@ def run_once(dry_run: bool = False) -> dict:
 
     # 5c. 逐代表：LLM未判定挂起 → 强档方向门槛 → 阈值过滤 → 跨轮同事件拦截 → 推送
     pushed_events = state.setdefault("pushed_events", [])
+    # 风险收缩期联动（2026-08-14 第二阶段）：factor_collector 写入的 risk_state，
+    # risk_off 时对无硬事件佐证的科技利好降级不推（每轮加载一次）
+    risk_state = _load_factor_risk_state()
     for n, j in reps:
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
@@ -1974,6 +2100,16 @@ def run_once(dry_run: bool = False) -> dict:
 
         if not pass_round:
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
+            skipped += 1
+            continue
+
+        # 风险收缩期降级（2026-08-14 第二阶段联动）：risk_off 时，科技利好若无硬事件
+        # 佐证（金额/订单/公告/获批等）则降级不推——与量化资金风险期降杠杆一致；
+        # 利空/风险资讯不受影响（风险期更应提示）。seen 标注原因便于复核。
+        if risk_state == "risk_off" and _risk_off_downgrade(n, j):
+            logger.info(f"风险收缩期降级(科技利好无硬事件佐证): {n.get('title', '')[:40]}")
+            seen[n["_fp"]] = {"t": now, "pushed": False,
+                              "title": str(n.get("title", ""))[:52] + "[风险收缩期降级]"}
             skipped += 1
             continue
 
