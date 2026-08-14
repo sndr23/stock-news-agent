@@ -1,0 +1,65 @@
+# filepath: .github/workflows/realtime-factor.yml
+name: 量化因子采集推送
+
+# 触发方式（与实时重大资讯推送一致，外部定时服务 + 手动，不用 GitHub 自带 cron）:
+#   1. cron-job.org 按分时段策略 POST 到 Actions API 触发 workflow_dispatch
+#      URL: https://api.github.com/repos/{owner}/{repo}/actions/workflows/realtime-factor.yml/dispatches
+#      Method: POST   Headers: Authorization: Bearer <PAT>、Accept: application/vnd.github+json
+#      Body: {"ref": "main"}
+#      分时段建议（覆盖 A股交易时段为主）:
+#      - A股盘中（9,10,11,13,14 小时）: 每 15 分钟 —— 基差/汇率/量比盘中分分钟变化
+#      - 其余时段（含美股盘中）: 每 60 分钟 —— 日元/隔夜套息风险低频监测
+#      （美股盘中 A股基差闭市静止，无需高频；总次数 ≈ 20+12 = 32/日，私仓配额友好）
+#   2. 手动 workflow_dispatch 立即执行一轮（验证用）
+on:
+  workflow_dispatch:
+
+# 防并发: 与资讯推送(concurrency: realtime-push)独立 group，两者可并行；
+# 同 group 内同时只允许一个运行，避免 factor_state.json 写回互相覆盖
+concurrency:
+  group: realtime-factor
+  cancel-in-progress: false
+
+jobs:
+  factor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    env:
+      # 推送后端（复用现有 secrets；factor 采集器不用 LLM，无需 OPENROUTER_*）
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      # 状态持久化（必配！云端每次全新容器，贴水基线/risk_state 必须存 Gist 才能跨轮积累）
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      # 测试门禁：拦截纯函数回归（同资讯管线）
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 执行因子采集
+        run: python scripts/factor_collector.py --push
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: factor-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
