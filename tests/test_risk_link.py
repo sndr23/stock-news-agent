@@ -101,6 +101,10 @@ def test_downgrade_emotion_research():
 
 
 def test_load_risk_state(tmp_path, monkeypatch):
+    # 关键：移除 Gist 环境变量，强制走本地文件分支——云端 CI 设置了 GIST_TOKEN/GIST_ID，
+    # _load_factor_risk_state 会优先读 Gist 真实状态导致本测试读到 neutral 而非构造值
+    monkeypatch.delenv("GIST_TOKEN", raising=False)
+    monkeypatch.delenv("GIST_ID", raising=False)
     monkeypatch.setattr(rtp, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
     # 文件不存在 → neutral（向后兼容：云端未跑 factor_collector 不影响现有推送）
     assert rtp._load_factor_risk_state() == "neutral"
