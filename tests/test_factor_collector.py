@@ -152,6 +152,45 @@ def test_calc_risk_state():
     assert calc_risk_state([]) == "neutral"
 
 
+def test_calc_basis_direction():
+    from factor_collector import _calc_basis_direction
+    # 贴水逐期加深（更负）→ 走扩；逐期变浅 → 收敛；不单调/样本不足 → 走平
+    assert _calc_basis_direction({"IC": [-1.0, -1.2, -1.4]})["IC"] == "走扩"
+    assert _calc_basis_direction({"IC": [-1.4, -1.2, -1.0]})["IC"] == "收敛"
+    assert _calc_basis_direction({"IC": [-1.2, -1.1, -1.3]})["IC"] == "走平"
+    assert _calc_basis_direction({"IC": [-1.0, -1.1]})["IC"] == "走平"
+
+
+def test_direction_analysis_bullish():
+    from factor_collector import _direction_analysis
+    # 贴水收敛(中性加仓) + 风险中性 + 放量突破 + 汇率平稳 → 偏多
+    tech = _base_tech(breakout=True, vol_ratio5=1.6)
+    fx = {"fx_susdjpy": {"name": "美元/日元", "price": 159.0, "change_pct": -0.3}}
+    history = {"IC": [-1.4, -1.2, -1.0], "IM": [-1.5, -1.3, -1.1]}
+    a = _direction_analysis(tech, {}, fx, "neutral", history)
+    assert a["direction"] == "偏多"
+    assert a["score"] > 0
+
+
+def test_direction_analysis_bearish():
+    from factor_collector import _direction_analysis
+    # 贴水走扩(中性减仓) + risk_off + 放量破位 + 日元急升 → 偏空
+    tech = _base_tech(breakdown=True, vol_ratio5=1.8)
+    fx = {"fx_susdjpy": {"name": "美元/日元", "price": 156.0, "change_pct": -2.0}}
+    history = {"IC": [-1.0, -1.2, -1.4], "IM": [-1.1, -1.3, -1.5]}
+    a = _direction_analysis(tech, {}, fx, "risk_off", history)
+    assert a["direction"] == "偏空"
+    assert a["score"] < 0
+
+
+def test_direction_changed():
+    from factor_collector import _direction_changed
+    assert _direction_changed({"direction": "偏多"}, "中性") is True
+    assert _direction_changed({"direction": "偏多"}, "偏空") is True
+    assert _direction_changed({"direction": "偏多"}, "偏多") is False
+    assert _direction_changed({"direction": "偏多"}, "") is False  # 首次无基准
+
+
 def test_next_expiry_days():
     from datetime import date
     from factor_collector import _next_expiry_days, _third_friday

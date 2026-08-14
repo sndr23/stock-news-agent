@@ -85,6 +85,13 @@ TH_BREAK_WINDOW = 20      # 突破窗口：20日新高/新低
 TH_BASIS_HISTORY = 20     # 贴水"走扩"历史窗口：当前基差率创近20日最深才告警（相对分位，防常态贴水误报）
 TH_COOLDOWN_HOURS = 6     # 同一因子告警冷却时长（小时）
 
+# 量化资金状态变化推送（2026-08-14 用户需求："追踪万亿级量化资金走势"）：
+# 盘中每轮检测"量化资金状态"（基差对冲方向 + 风险状态），发生变化才推送"量化资金动态"
+# （如 IC 贴水由收敛转走扩、risk_off 切换），平时静默。冷却防盘中抖动反复推。
+STATE_CHANGE_COOLDOWN_HOURS = 4  # 状态变化推送冷却（小时）
+# 基差方向判断：贴水率"持续加深/变浅"的期数（>=3 才判方向，防单期抖动）
+BASIS_DIR_LOOKBACK = 3
+
 STATE_PATH = PROJECT_ROOT / "logs" / "factor_state.json"
 
 # ============================================================
@@ -407,6 +414,107 @@ def calc_risk_state(signals: list) -> str:
 
 
 # ============================================================
+# 量化方向信号（2026-08-14 用户核心需求："利好因子买、利空因子卖，和量化同步"）
+# 把量化因子翻译成"买卖方向信号"：每个维度打分（+1 利好=买向 / -1 利空=卖向 / 0 中性），
+# 多因子合成综合方向（偏多/偏空/中性），方向改变时推送"量化方向信号"（含各因子明细）。
+# ============================================================
+def _calc_basis_direction(history: dict) -> dict:
+    """各股指合约贴水方向：走扩(贴水加深=中性策略防守/减仓) / 收敛(贴水变浅=进攻/加仓) / 走平
+
+    用最近 BASIS_DIR_LOOKBACK 期（>=3）单调判断，防单期抖动：
+    - 贴水率更负且逐期加深（-1.0 > -1.2 > -1.4）→ 走扩
+    - 贴水率逐期变浅（-1.4 < -1.2 < -1.0）→ 收敛
+    """
+    result = {}
+    for code in ("IC", "IM", "IF", "IH"):
+        seq = history.get(code, [])
+        if len(seq) < BASIS_DIR_LOOKBACK:
+            result[code] = "走平"  # 样本不足
+            continue
+        last3 = seq[-BASIS_DIR_LOOKBACK:]
+        if last3[0] > last3[1] > last3[2]:
+            result[code] = "走扩"
+        elif last3[0] < last3[1] < last3[2]:
+            result[code] = "收敛"
+        else:
+            result[code] = "走平"
+    return result
+
+
+def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, history: dict) -> dict:
+    """多因子合成量化方向信号
+
+    四个维度各打分（+1 买向 / -1 卖向 / 0 中性）：
+    - 对冲（IC/IM 贴水方向）：收敛=+1（中性策略加仓），走扩=-1（减仓）
+    - 风险（risk_state）：neutral=0，risk_off=-1（风险收缩=卖向）
+    - 量价（上证/创业板放量突破/破位）：突破=+1，破位=-1
+    - 汇率（美元/日元）：单日波动>=1.5% 且日元急升(美元/日元跌)=-1（套息平仓），日元急贬=+1
+    综合分 = 有效维度均值，>=0.5 偏多 / <=-0.5 偏空 / 否则中性。
+    """
+    dims = []  # (名称, 分值, 说明)
+    # ① 对冲
+    basis_dir = _calc_basis_direction(history)
+    hedge_scores = []
+    hedge_parts = []
+    for code in ("IC", "IM"):
+        d = basis_dir.get(code, "走平")
+        if d == "收敛":
+            hedge_scores.append(1); hedge_parts.append(f"{code}贴水收敛")
+        elif d == "走扩":
+            hedge_scores.append(-1); hedge_parts.append(f"{code}贴水走扩")
+    if hedge_scores:
+        dims.append(("对冲", sum(hedge_scores) / len(hedge_scores),
+                     "中性策略加仓/平对冲" if sum(hedge_scores) > 0 else ("中性策略减仓/加对冲" if sum(hedge_scores) < 0 else "对冲方向不明") + "（" + "、".join(hedge_parts) + "）"))
+    # ② 风险
+    if risk_state == "risk_off":
+        dims.append(("风险", -1.0, "风险收缩期（贴水走扩/日元急升/放量破位）"))
+    else:
+        dims.append(("风险", 0.0, "风险中性"))
+    # ③ 量价
+    vol_score = 0.0
+    vol_part = "量价平稳"
+    for name in CORE_INDEXES:
+        t = tech.get(name)
+        if not t or not t.get("available"):
+            continue
+        if t["breakout"] and t["vol_ratio5"] >= TH_VOLUME_RATIO:
+            vol_score = 1.0; vol_part = f"{name} 放量突破"
+            break
+        if t["breakdown"] and t["vol_ratio5"] >= TH_VOLUME_RATIO:
+            vol_score = -1.0; vol_part = f"{name} 放量破位"
+            break
+    dims.append(("量价", vol_score, vol_part))
+    # ④ 汇率
+    fx_score = 0.0
+    fx_part = "汇率平稳"
+    jpy = fx.get("fx_susdjpy")
+    if jpy and abs(jpy["change_pct"]) >= TH_FX_JPY_PCT:
+        if jpy["change_pct"] < 0:
+            fx_score = -1.0; fx_part = f"日元急升 {jpy['change_pct']:+.2f}%（套息平仓风险）"
+        else:
+            fx_score = 1.0; fx_part = f"日元急贬 {jpy['change_pct']:+.2f}%（套息资金回流）"
+    dims.append(("汇率", fx_score, fx_part))
+
+    valid = [s for _, s, _ in dims if s != 0.0]
+    score = sum(s for _, s, _ in dims) / len(dims) if dims else 0.0
+    if score >= 0.5:
+        direction = "偏多"
+    elif score <= -0.5:
+        direction = "偏空"
+    else:
+        direction = "中性"
+    return {
+        "score": round(score, 2), "direction": direction,
+        "factors": dims, "basis_dir": basis_dir, "risk_state": risk_state,
+    }
+
+
+def _direction_changed(analysis: dict, last_dir: str) -> bool:
+    """方向是否改变：偏多↔偏空、或 中性↔(偏多/偏空) 都算变化；首次运行（无基准）不算"""
+    return bool(last_dir) and analysis["direction"] != last_dir
+
+
+# ============================================================
 # 状态持久化 + 冷却时间去重（因子是时序，非事件指纹）
 # 云端（GIST_TOKEN/GIST_ID 存在时）持久化到 Gist 的 factor_state.json，
 # 与 real_time_push 的 real_time_state.json 并列——云端 Actions 每次全新容器，
@@ -567,6 +675,41 @@ def format_alert(signal: dict) -> str:
     return f"<font color=\"{color}\">{icon} {tag}</font> **{signal['title']}**\n> {signal['detail']}"
 
 
+def format_state_change(signal: dict) -> str:
+    """单条量化资金状态变化（与告警同款红涨绿跌风格）"""
+    icon = "▲" if signal["direction"] == "bullish" else "▼"
+    color = _RED if signal["direction"] == "bullish" else _GREEN
+    tag = "量化进攻" if signal["direction"] == "bullish" else "量化防守"
+    return f"<font color=\"{color}\">{icon} {tag}</font> **{signal['title']}**\n> {signal['detail']}"
+
+
+def format_direction_signal(analysis: dict, last_dir: str = "") -> str:
+    """量化方向信号推送正文：综合方向 + 各因子明细（买向/卖向标注）"""
+    direction = analysis["direction"]
+    score = analysis["score"]
+    if direction == "偏多":
+        color, tag, arrow = _RED, "买入方向", "▲"
+    elif direction == "偏空":
+        color, tag, arrow = _GREEN, "卖出方向", "▼"
+    else:
+        color, tag, arrow = "#888888", "观望", "◆"
+    suffix = f"（前值 {last_dir}）" if last_dir and last_dir != direction else ""
+    lines = [
+        f"<font color=\"{color}\">{arrow} 量化方向：{direction}（{score:+.2f}）</font>｜{tag}{suffix}",
+        "",
+        "因子明细：",
+    ]
+    for name, s, desc in analysis.get("factors", []):
+        if s > 0:
+            mark = "▲ 买向"
+        elif s < 0:
+            mark = "▼ 卖向"
+        else:
+            mark = "— 中性"
+        lines.append(f"- {mark}｜{name}：{desc}")
+    return "\n".join(lines)
+
+
 # ============================================================
 # 推送出口（复用 push.py）
 # ============================================================
@@ -624,6 +767,20 @@ def run_once(push: bool) -> dict:
             print(f"\n[推送] {len(fresh)} 条异动：{pushed} → code={r.get('code', r.get('errcode'))}")
         else:
             print("\n[推送] 本轮无异动（或均在冷却期）")
+        # 量化方向信号（核心需求"利好买、利空卖，和量化同步"）：多因子合成方向
+        # （偏多/偏空/中性），方向改变时推送"量化方向信号"（含各因子买向/卖向明细）。
+        # 独立冷却（change_cooldown）防盘中方向抖动反复推。
+        analysis = _direction_analysis(tech, basis, fx, risk_state, new_history)
+        last_dir = state.get("last_direction")
+        if _direction_changed(analysis, last_dir):
+            now_ts = time.time()
+            change_cooldown = state.setdefault("change_cooldown", {})
+            if now_ts - change_cooldown.get("direction", 0) >= STATE_CHANGE_COOLDOWN_HOURS * 3600:
+                content = "## 量化方向信号\n\n" + format_direction_signal(analysis, last_dir)
+                r4 = do_push("量化方向信号", content)
+                print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}）→ code={r4.get('code', r4.get('errcode'))}")
+                change_cooldown["direction"] = now_ts
+        state["last_direction"] = analysis["direction"]
         _save_state(state)
 
     return {"tech": tech, "basis": basis, "fx": fx, "signals": signals, "pushed": pushed}
