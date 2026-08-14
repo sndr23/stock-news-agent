@@ -607,7 +607,7 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
     last_error = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             files = resp.json().get("files") or {}
             fobj = files.get(FACTOR_STATE_FILENAME)

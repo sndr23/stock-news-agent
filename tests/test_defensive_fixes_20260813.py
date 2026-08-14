@@ -229,7 +229,7 @@ class TestGistLoadFailStop:
         """3 次读取失败 → raise（禁止静默空状态）"""
         import requests as real_requests
 
-        def fake_get(url, timeout=None):
+        def fake_get(url, timeout=None, headers=None):
             raise IOError("network down")
 
         monkeypatch.setattr(real_requests, "get", fake_get)
@@ -248,7 +248,7 @@ class TestGistLoadFailStop:
             def json(self):
                 return {"files": {"real_time_state.json": {"content": broken}}}
 
-        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None, headers=None: FakeResp())
         with pytest.raises(json.JSONDecodeError):
             rtp._gist_load("token", "gid")
 
@@ -263,7 +263,7 @@ class TestGistLoadFailStop:
             def json(self):
                 return {"files": {"real_time_state.json": {"content": '{"pending": {}}'}}}
 
-        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None, headers=None: FakeResp())
         with pytest.raises(ValueError, match="seen"):
             rtp._gist_load("token", "gid")
 
@@ -279,7 +279,7 @@ class TestGistLoadFailStop:
             def json(self):
                 return {"files": {"real_time_state.json": {"content": good}}}
 
-        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None: FakeResp())
+        monkeypatch.setattr(real_requests, "get", lambda url, timeout=None, headers=None: FakeResp())
         st = rtp._gist_load("token", "gid")
         assert "fp" in st["seen"]
 

@@ -1008,7 +1008,7 @@ def _gist_load(token: str, gist_id: str) -> dict:
     last_error = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             data = resp.json()
             files = data.get("files") or {}
@@ -1735,7 +1735,7 @@ def _load_factor_risk_state() -> str:
             headers = {"Authorization": f"token {gist_token}",
                        "Accept": "application/vnd.github+json",
                        "User-Agent": "stock-news-agent-realtime"}
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, headers=headers, timeout=15)
             resp.raise_for_status()
             files = resp.json().get("files") or {}
             fobj = files.get("factor_state.json")
