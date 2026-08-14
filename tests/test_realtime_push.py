@@ -746,7 +746,7 @@ class TestGistLoadRetry:
                     "content": '{"seen": {"fp1": {"t": "2026-08-01 00:00:00", "pushed": true}}}'
                 }}}
 
-        def fake_get(url, timeout=20):
+        def fake_get(url, timeout=20, headers=None):
             calls["n"] += 1
             if calls["n"] < 3:
                 raise requests.exceptions.ConnectionError("boom")
@@ -762,7 +762,7 @@ class TestGistLoadRetry:
         导致 19:03 轮空状态运行覆盖写回、4759 条历史去重记录丢失）"""
         import requests
 
-        def fake_get(url, timeout=20):
+        def fake_get(url, timeout=20, headers=None):
             raise requests.exceptions.Timeout("timeout")
 
         monkeypatch.setattr("requests.get", fake_get)
