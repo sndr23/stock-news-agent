@@ -100,28 +100,44 @@ def _base_tech(breakout=False, breakdown=False, vol_ratio5=1.0):
     }
 
 
+def _hist(values):
+    """构造按交易日采样的贴水历史（过去固定日期，保证运行时被 append 而非更新当日样本）"""
+    return [{"d": f"2026-08-{i+1:02d}", "v": v} for i, v in enumerate(values)]
+
+
 def test_detect_basis_spread_relative():
     # 当前贴水率创 20 日最深（-1.6 < 历史最深 -1.1）→ 触发
     basis = {"IC": {"index": "中证500", "fut": 7800, "spot": 7900, "basis": -100, "basis_pct": -1.6, "annual_pct": -16.6, "remaining_days": 35}}
-    history = {"IC": [-1.0, -0.9, -1.1, -1.0, -0.8]}
+    history = {"IC": _hist([-1.0, -0.9, -1.1, -1.0, -0.8])}
     signals, new_history = detect_anomalies(_base_tech(), basis, {}, history)
     assert any(s["key"] == "basis_IC" for s in signals)
-    assert new_history["IC"][-1] == -1.6  # 当前值已追加
+    assert new_history["IC"][-1]["v"] == -1.6  # 当前值已追加（交易日采样）
     assert len(new_history["IC"]) == 6
 
 
 def test_detect_basis_normal_no_alert():
     # 当前贴水 -1.2 未创 20 日最深（历史最深 -1.3）→ 不触发（常态贴水不误报）
     basis = {"IC": {"index": "中证500", "fut": 7800, "spot": 7900, "basis": -100, "basis_pct": -1.2, "annual_pct": -12.5, "remaining_days": 35}}
-    history = {"IC": [-1.0, -1.3, -1.1, -1.0, -0.8]}
+    history = {"IC": _hist([-1.0, -1.3, -1.1, -1.0, -0.8])}
     signals, _ = detect_anomalies(_base_tech(), basis, {}, history)
     assert not any(s["key"] == "basis_IC" for s in signals)
+
+
+def test_detect_basis_same_day_update():
+    # 同日多次采样应更新最后样本而非追加（P0 交易日采样：1 天仅 1 样本）
+    basis = {"IC": {"index": "中证500", "fut": 7800, "spot": 7900, "basis": -100, "basis_pct": -1.4, "annual_pct": -14.0, "remaining_days": 35}}
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    history = {"IC": _hist([-1.0, -1.1]) + [{"d": today, "v": -1.2}]}  # 最后是今天
+    signals, new_history = detect_anomalies(_base_tech(), basis, {}, history)
+    assert new_history["IC"][-1]["v"] == -1.4  # 今天样本被更新
+    assert len(new_history["IC"]) == 3  # 不追加
 
 
 def test_detect_basis_history_insufficient():
     # 历史序列不足 5 个样本 → 不触发（避免冷启动误报）
     basis = {"IC": {"index": "中证500", "fut": 7800, "spot": 7900, "basis": -100, "basis_pct": -2.0, "annual_pct": -20.0, "remaining_days": 35}}
-    history = {"IC": [-1.0, -0.9]}
+    history = {"IC": _hist([-1.0, -0.9])}
     signals, _ = detect_anomalies(_base_tech(), basis, {}, history)
     assert not any(s["key"] == "basis_IC" for s in signals)
 

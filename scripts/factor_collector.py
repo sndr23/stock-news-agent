@@ -143,11 +143,8 @@ def fetch_index_quotes() -> dict:
     return result
 
 
-def fetch_index_kline(symbol: str, lmt: int = 65) -> list:
-    """新浪指数日K → [{date, open, close, high, low, volume}]，升序
-
-    volume 单位为"股"（上证指数成交量 = 东财手数 × 100），用于量比计算（比例无关单位）。
-    """
+def _fetch_kline_sina(symbol: str, lmt: int) -> list:
+    """新浪指数日K → [{date, open, close, high, low, volume}]，volume 单位=股"""
     params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(lmt)}
     text = _http_get(
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
@@ -175,6 +172,54 @@ def fetch_index_kline(symbol: str, lmt: int = 65) -> list:
             })
         except (KeyError, ValueError, TypeError):
             continue
+    return out
+
+
+def _fetch_kline_tencent(symbol: str, lmt: int) -> list:
+    """腾讯指数日K（备选，新浪失败时降级）→ 统一 {date, open, close, high, low, volume}
+
+    腾讯 K 线 volume 单位=手（=股/100），此处 ×100 转成"股"与新浪口径一致。
+    字段顺序：[日期, 开盘, 收盘, 最高, 最低, 成交量(手)]。
+    """
+    text = _http_get(
+        "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{symbol},day,,,{lmt},qfq"},
+    )
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+        node = (data.get("data") or {}).get(symbol) or {}
+        day = node.get("day") or node.get("qfqday") or []
+    except (ValueError, TypeError):
+        return []
+    out = []
+    for item in day:
+        if len(item) < 6:
+            continue
+        try:
+            out.append({
+                "date": item[0],
+                "open": float(item[1]),
+                "close": float(item[2]),
+                "high": float(item[3]),
+                "low": float(item[4]),
+                "volume": float(item[5]) * 100,  # 手 → 股
+            })
+        except (ValueError, TypeError, IndexError):
+            continue
+    return out
+
+
+def fetch_index_kline(symbol: str, lmt: int = 65) -> list:
+    """指数日K → [{date, open, close, high, low, volume}]，升序（volume 单位=股）
+
+    新浪优先，失败降级腾讯（2026-08-14 P1：消除单点依赖，东财已反爬不可用）。
+    """
+    out = _fetch_kline_sina(symbol, lmt)
+    if not out:
+        logger.warning(f"新浪K线失败，降级腾讯: {symbol}")
+        out = _fetch_kline_tencent(symbol, lmt)
     return out
 
 
@@ -341,15 +386,33 @@ def calc_basis(futures: dict, quotes: dict, remaining_days: int = None) -> dict:
 # ============================================================
 # 异动检测层
 # ============================================================
+def _history_values(seq: list) -> list:
+    """提取贴水历史序列的数值（兼容旧 float 格式与新 {date,value} 格式）"""
+    vals = []
+    for x in seq or []:
+        if isinstance(x, dict):
+            v = x.get("v")
+        elif isinstance(x, (int, float)):
+            v = x
+        else:
+            v = None
+        if v is not None:
+            vals.append(v)
+    return vals
+
+
 def detect_anomalies(tech: dict, basis: dict, fx: dict, history: dict = None) -> tuple:
     """返回 (signals, new_history)。
 
     贴水"走扩"用 20 日历史分位：当前基差率创近 20 日最深（且序列≥5 个样本）才告警，
     避免常态贴水（A股股指期货常态日度 -0.8%~-1.3%）误报；其余因子用绝对阈值。
+    2026-08-14 P0 修复：basis_history 按"交易日"采样（每交易日一个样本，取当日最新值），
+    使"20 日最深"真正等于 20 个交易日，而非盘中 15 分钟一轮的约 5 小时。
     """
     signals = []
     history = history or {}
     new_history = {k: list(v) for k, v in history.items()}
+    today = datetime.now().strftime("%Y-%m-%d")
     # 1) 股指期货贴水走扩（中性策略对冲成本上升，量化倾向降仓）
     for code in ("IC", "IM", "IF", "IH"):
         b = basis.get(code)
@@ -357,10 +420,16 @@ def detect_anomalies(tech: dict, basis: dict, fx: dict, history: dict = None) ->
             continue
         cur = b["basis_pct"]
         seq = new_history.setdefault(code, [])
-        seq.append(cur)
-        del seq[:-TH_BASIS_HISTORY]  # 只保留最近 N 个
-        if len(seq) >= 5 and cur < min(seq[:-1]):
-            prev_min = min(seq[:-1])
+        # 按交易日采样：同一天更新最后样本（取当日最新），跨天才 append 新样本
+        last = seq[-1] if seq else None
+        if isinstance(last, dict) and last.get("d") == today:
+            last["v"] = cur
+        else:
+            seq.append({"d": today, "v": cur})
+        del seq[:-TH_BASIS_HISTORY]  # 只保留最近 N 个交易日
+        values = _history_values(seq)
+        if len(values) >= 5 and cur < min(values[:-1]):
+            prev_min = min(values[:-1])
             signals.append({
                 "key": f"basis_{code}",
                 "level": "warning",
@@ -422,17 +491,19 @@ def calc_risk_state(signals: list) -> str:
 def _calc_basis_direction(history: dict) -> dict:
     """各股指合约贴水方向：走扩(贴水加深=中性策略防守/减仓) / 收敛(贴水变浅=进攻/加仓) / 走平
 
-    用最近 BASIS_DIR_LOOKBACK 期（>=3）单调判断，防单期抖动：
+    用最近 BASIS_DIR_LOOKBACK 期（>=3 个交易日）单调判断，防单期抖动：
     - 贴水率更负且逐期加深（-1.0 > -1.2 > -1.4）→ 走扩
     - 贴水率逐期变浅（-1.4 < -1.2 < -1.0）→ 收敛
+    基于按交易日采样的 basis_history（{date,value}），日度贴水比盘中 15 分钟采样更稳。
     """
     result = {}
     for code in ("IC", "IM", "IF", "IH"):
         seq = history.get(code, [])
-        if len(seq) < BASIS_DIR_LOOKBACK:
+        values = _history_values(seq)
+        if len(values) < BASIS_DIR_LOOKBACK:
             result[code] = "走平"  # 样本不足
             continue
-        last3 = seq[-BASIS_DIR_LOOKBACK:]
+        last3 = values[-BASIS_DIR_LOOKBACK:]
         if last3[0] > last3[1] > last3[2]:
             result[code] = "走扩"
         elif last3[0] < last3[1] < last3[2]:
@@ -450,7 +521,7 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
     - 风险（risk_state）：neutral=0，risk_off=-1（风险收缩=利空）
     - 量价（上证/创业板放量突破/破位）：突破=+1，破位=-1
     - 汇率（美元/日元）：单日波动>=1.5% 且日元急升(美元/日元跌)=-1（套息平仓→利空），日元急贬=+1
-    综合分 = 有效维度均值，>=0.5 偏多(利好) / <=-0.5 偏空(利空) / 否则中性。
+    综合分 = 4 个维度均值（含中性维度，多数维度同向才判方向），>=0.5 偏多(利好) / <=-0.5 偏空(利空) / 否则中性。
     """
     dims = []  # (名称, 分值, 说明)
     # ① 对冲
@@ -496,7 +567,7 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
             fx_score = 1.0; fx_part = f"日元急贬 {jpy['change_pct']:+.2f}%（套息资金回流）"
     dims.append(("汇率", fx_score, fx_part))
 
-    valid = [s for _, s, _ in dims if s != 0.0]
+    # 综合分 = 4 个维度均值（含中性维度，保守口径：多数维度同向才判方向，防单维度噪音误判）
     score = sum(s for _, s, _ in dims) / len(dims) if dims else 0.0
     if score >= 0.5:
         direction = "偏多"
@@ -545,7 +616,9 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
         except Exception as e:
             last_error = e
             logger.warning(f"Gist 读取第{attempt + 1}次失败: {e}")
-        time.sleep(1)
+        if attempt < 2:
+            # 指数退避（2s/4s）：短时 rate limit 窗口可被重试跨过，防贴水基线归零
+            time.sleep(2 ** (attempt + 1))
     # 首次运行（文件尚未创建）与读取失败都返回空——factor 状态丢失只影响贴水基线
     # 积累（重新积累即可），不像推送去重基准丢失会造成重复推送，故允许空。
     if last_error:
@@ -571,8 +644,9 @@ def _gist_save_factor(token: str, gist_id: str, state: dict) -> None:
         except Exception as e:
             last_error = e
             if attempt < 2:
-                logger.warning(f"Gist 写入第{attempt + 1}次失败: {e}, 1s 后重试")
-                time.sleep(1)
+                # 指数退避（2s/4s）：短时 rate limit 窗口可被重试跨过
+                logger.warning(f"Gist 写入第{attempt + 1}次失败: {e}, {2 ** (attempt + 1)}s 后重试")
+                time.sleep(2 ** (attempt + 1))
     raise RuntimeError(f"Gist factor_state.json 写入失败（已重试2次）: {last_error}")
 
 
