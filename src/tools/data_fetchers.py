@@ -590,6 +590,8 @@ def _fetch_google_news():
     """
     import urllib.parse as _urlparse
     import xml.etree.ElementTree as _ET
+    import re as _re
+    import html as _html
     from email.utils import parsedate_to_datetime as _parse_rfc822
 
     headers = {
@@ -630,10 +632,17 @@ def _fetch_google_news():
             if not _in_news_window(pub_time, look_back_days=1):
                 continue
 
+            # description 为 <a href="URL">标题</a>&nbsp;<font>来源</font> 形式的
+            # HTML，直接当正文会把整条链接推给用户。剥离标签并解码实体，
+            # 保留可读文本（链接单独存于 url 字段用于溯源）。
+            desc = _txt("description")
+            desc = _re.sub(r"<[^>]+>", "", desc)
+            desc = _html.unescape(desc).strip()
+
             news.append({
                 "title": title,
                 "source": source or "Google News",
-                "content": _txt("description"),
+                "content": desc,
                 "published_at": pub_time,
                 "url": _txt("link"),
                 "category": "news",
