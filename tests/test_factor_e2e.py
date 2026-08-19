@@ -44,6 +44,22 @@ def _mock_data(monkeypatch, tmp_path):
                  "high": 101 + i, "low": 99 + i, "volume": 100} for i in range(65)]
     monkeypatch.setattr(fc, "fetch_index_kline", fake_kline)
 
+    # P1-2/P1-3：个股行情与资金流同样不触网（watchlist 已激活，空行情 → 无自选股异动）
+    monkeypatch.setattr(fc, "fetch_stock_quotes", lambda symbols: {})
+    monkeypatch.setattr(fc, "fetch_market_flows", lambda: {})
+    # P3（2026-08-19）：外盘/宽度/风格同样不触网（空数据 → 无新增异动）
+    monkeypatch.setattr(fc, "fetch_global_quotes", lambda: {})
+    monkeypatch.setattr(fc, "fetch_market_breadth", lambda: {})
+    monkeypatch.setattr(fc, "calc_style_rotation", lambda: {})
+    # P4（2026-08-19）：涨停情绪/行业资金流不触网；胜率标注也隔离（不读 real_time_state）
+    monkeypatch.setattr(fc, "fetch_zt_sentiment", lambda: {})
+    monkeypatch.setattr(fc, "fetch_sector_flows", lambda: {})
+    # P7（2026-08-19）：资金面利率/期权 PCR 同样不触网（空数据 → 无新增异动）
+    monkeypatch.setattr(fc, "fetch_liquidity", lambda: {})
+    monkeypatch.setattr(fc, "fetch_option_pcr", lambda: {})
+    import signal_backtest as sb  # noqa: E402
+    monkeypatch.setattr(sb, "compute_winrate", lambda days=30: {"n": 0})
+
     pushed = []
     monkeypatch.setattr(fc, "do_push", lambda title, content: (pushed.append({"title": title, "content": content}) or {"code": 200}))
     return pushed
@@ -68,10 +84,17 @@ def test_run_once_full_flow(tmp_path, monkeypatch):
 
 def test_run_once_direction_change_pushes(tmp_path, monkeypatch):
     pushed = _mock_data(monkeypatch, tmp_path)
-    # 覆盖 fx：日元急升 -2% → 风险 risk_off + 汇率卖向 → 方向偏空（与预置"中性"不同 → 触发方向信号）
+    # 覆盖 fx：日元急升 -2% → 风险 risk_off + 汇率卖向；覆盖宽度：极端普跌 91.6%。
+    # P3 后方向合成为 6 维多数表决（|均值|≥0.5 = 半数维度同向）：
+    # 汇率-1 + 风险-1 + 宽度-1 → 3/5 票 → 偏空（与预置"中性"不同 → 触发方向信号）。
+    # 单两票（如仅日元急升）不再翻方向——单因子异动仍即时走"量化因子异动"告警。
     monkeypatch.setattr(fc, "fetch_fx", lambda: {
         "fx_susdjpy": {"name": "美元/日元", "price": 156.0, "change_pct": -2.0},
         "fx_susdcny": {"name": "美元/人民币", "price": 6.74, "change_pct": -0.01},
+    })
+    monkeypatch.setattr(fc, "fetch_market_breadth", lambda: {
+        "adv": 428, "dec": 4885, "flat": 22, "down_pct": 91.6,
+        "limit_up": 36, "limit_down": 118, "big_down": 2189,
     })
     fc._save_state({"last_direction": "中性", "basis_history": {}, "risk_state": "neutral"})
     fc.run_once(push=True)
@@ -87,3 +110,38 @@ def test_run_once_no_push_dry_state_unchanged(tmp_path, monkeypatch):
     _mock_data(monkeypatch, tmp_path)
     fc.run_once(push=False)
     assert not (tmp_path / "factor_state.json").exists()  # 状态未被写
+
+
+def test_run_once_records_direction_history(tmp_path, monkeypatch):
+    """P4-6：push 模式每轮落盘 direction_history（当日一条，多轮覆盖）+ factor_ic 状态"""
+    from datetime import datetime
+    _mock_data(monkeypatch, tmp_path)
+    fc._save_state({"last_direction": "中性", "basis_history": {}, "risk_state": "neutral"})
+    fc.run_once(push=True)
+
+    state = fc._load_state()
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert today in state["direction_history"]
+    rec = state["direction_history"][today]
+    assert rec["dir"] in ("偏多", "偏空", "中性")
+    assert isinstance(rec["factors"], dict) and rec["factors"]   # 各维度分落盘
+    assert "factor_ic" in state                                  # IC 状态（空历史 → {"n":0}）
+    assert state["factor_ic"].get("n") == 0
+
+    # 同日第二轮：覆盖当日条目，不产生重复日期
+    fc.run_once(push=True)
+    state2 = fc._load_state()
+    days = [d for d in state2["direction_history"]]
+    assert days.count(today) == 1
+
+
+def test_direction_history_pruned_to_120(tmp_path, monkeypatch):
+    """P4-6：direction_history 超 120 个交易日时裁掉最旧（防 Gist 状态膨胀）"""
+    _mock_data(monkeypatch, tmp_path)
+    old = {f"2025-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}": {"dir": "中性", "score": 0, "factors": {}}
+           for i in range(130)}
+    fc._save_state({"last_direction": "中性", "basis_history": {}, "risk_state": "neutral",
+                    "direction_history": old})
+    fc.run_once(push=True)
+    dhist = fc._load_state()["direction_history"]
+    assert len(dhist) == 120   # 131（130 旧 + 今日新）→ 裁 11 最旧 → 120

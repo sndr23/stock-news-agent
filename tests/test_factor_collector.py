@@ -179,11 +179,13 @@ def test_calc_basis_direction():
 
 def test_direction_analysis_bullish():
     from factor_collector import _direction_analysis
-    # 贴水收敛(中性加仓) + 风险中性 + 放量突破 + 汇率平稳 → 偏多
+    # 贴水收敛(中性加仓) + 风险中性 + 放量突破 + 普涨宽度 → 偏多
+    # P3 后 6 维多数表决：+1票需过半（3/6），单靠对冲+量价两票被中性维度稀释为 0.33
     tech = _base_tech(breakout=True, vol_ratio5=1.6)
     fx = {"fx_susdjpy": {"name": "美元/日元", "price": 159.0, "change_pct": -0.3}}
     history = {"IC": [-1.4, -1.2, -1.0], "IM": [-1.5, -1.3, -1.1]}
-    a = _direction_analysis(tech, {}, fx, "neutral", history)
+    a = _direction_analysis(tech, {}, fx, "neutral", history,
+                            breadth={"down_pct": 15.0})
     assert a["direction"] == "偏多"
     assert a["score"] > 0
 

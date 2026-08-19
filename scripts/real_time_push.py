@@ -113,6 +113,7 @@ from src.tools.keyword_tables import (                      # 共享关键词表
     HIGH_SIGNAL_KEYWORDS,
     OVERSEAS_TECH_KEYWORDS,
     OVERSEAS_SOURCE_MARKERS,
+    TECH_SECTOR_WORDS_WIDE,     # 2026-08-19: 国内降级判定宽词表（原本地 _TECH_SECTOR_WORDS 收编）
     has_signal_keyword,        # 2026-08-06: 词边界感知的信号词匹配（ST/IPO 防误命中）
     find_signal_keywords,      # 返回命中的信号词列表（事件指纹 sig 路径用）
     find_signal_fp_keywords,   # 2026-08-07: 指纹专用信号词（排除宽泛市场词，防跨事件指纹合并）
@@ -1389,25 +1390,42 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 对每条输入严格输出一个 JSON 数组元素，字段：
 {"idx": 输入的idx原样回显, "title": "原标题", "push": true/false, "score": 0到10的整数, "direction": "bullish|mildly_bullish|neutral|mixed|mildly_bearish|bearish",
  "scope": "market|sector|stock", "sectors": ["板块名"], "entities": ["事件主体公司/机构规范简称，1-3个，无则空数组"], "is_leader_stock": true/false,
- "reason": "一句话理由"}
+ "env_note": "与当前量化环境的关系标注", "reason": "一句话理由"}
 direction 必须区分强度：只有影响显著且方向明确才用 bullish/bearish（强档）；
 小幅波动用 mildly_bullish/mildly_bearish；方向不明用 neutral/mixed。
 is_leader_stock: 仅当该资讯主体是行业龙头个股（市值/地位第一梯队）时为 true，否则 false。
 entities: 事件的当事公司/机构/人物规范简称（如"恩智浦""安霸""美联储"），用于跨源同事件去重，必须与标题所述主体一致。
+env_note: 仅当用户消息开头给出【当前量化环境】时输出——资讯方向与量化环境同向标"共振: ..."（一句话）；
+反向标"背离: ..."并提示谨慎（如"背离: 利好消息但风险收缩期，量化资金在降仓，谨慎对待"）；
+环境缺失或该资讯与量化资金环境无关时输出空字符串。env_note 只描述事件与量化环境的关系，
+不得包含任何买卖建议。
+related_recent: 输入行可能带 related_recent 字段（近48h同主体的已推事件及方向）——这是叙事链上下文：
+同主体出现反向事件（叙事反转，如连续利好后突发利空）属信号增强，可在事实清楚时上调 score；
+同向事件为叙事延续，本条 direction 仍按本条自身事实独立判定，不要因为先前事件方向而改变本条方向。
 注意: 输出必须是合法 JSON，字符串内的双引号必须转义为 \"（或改用「」）；idx 必须原样回显。
 不要输出任何 JSON 以外的文字。"""
 
 
-def _build_llm_user_prompt(items: list) -> str:
+def _build_llm_user_prompt(items: list, env_context: str = "", pushed_events: list = None) -> str:
+    """构造用户 prompt（P2-2：env_context 非空时头部注入量化环境，供共振/背离标注）
+
+    P6-3（2026-08-19）：条目存在近 48h 同主体已推事件时注入 related_recent 字段
+    （叙事链上下文，多数条目无匹配不注入，prompt 增量可控）。
+    """
     lines = []
     for n in items:
-        lines.append(json.dumps({
+        row = {
             "idx": n.get("_judge_idx"),
             "title": str(n.get("title", ""))[:80],
             "content": str(n.get("content", "") or "")[:200],
             "published_at": str(n.get("published_at", "")),
-        }, ensure_ascii=False))
-    return "请逐条审核以下资讯（不要遗漏任何一条，idx 原样回显）:\n[\n" + ",\n".join(lines) + "\n]"
+        }
+        related = _related_recent_note(n, pushed_events or [])
+        if related:
+            row["related_recent"] = related
+        lines.append(json.dumps(row, ensure_ascii=False))
+    header = f"【当前量化环境】{env_context}\n\n" if env_context else ""
+    return header + "请逐条审核以下资讯（不要遗漏任何一条，idx 原样回显）:\n[\n" + ",\n".join(lines) + "\n]"
 
 
 def _rescue_judge_object(obj_text: str) -> dict | None:
@@ -1523,11 +1541,13 @@ def _hang_judge(news: dict) -> dict:
         "sectors": [],
         "entities": [],
         "is_leader_stock": False,
+        "env_note": "",
         "reason": "LLM未判定，挂起下轮重试",
     }
 
 
-def _llm_judge(items: list, deadline: float = 0) -> list:
+def _llm_judge(items: list, deadline: float = 0, env_context: str = "",
+               pushed_events: list = None) -> list:
     """批量 LLM 判定，返回与 items 一一对应的判定 dict 列表
 
     Args:
@@ -1537,6 +1557,11 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
                   多批(最多5批)×90s×2次重试最坏 900s，突破 GitHub Actions
                   timeout-minutes:10 导致任务被强杀（已推送未保存状态→重复推送）。
                   现在批次循环入口检查熔断，逼近 deadline 立即挂起剩余批次。
+        env_context: 量化环境上下文（P2-2，_llm_env_context 生成）。
+                  非空时注入用户 prompt 头部，LLM 输出 env_note 共振/背离标注；
+                  空串时不注入（快照缺失/过期，向后兼容）。
+        pushed_events: 已推事件（P6-3 叙事链，条目命中同主体近48h事件时
+                  注入 related_recent 字段，None/空不注入）。
 
     对齐策略: 给每条注入 _judge_idx 并要求 LLM 回显 idx，按 idx 精确合并
     （标题匹配仅作兜底）。标题精确匹配不可靠——LLM 会改写/截断标题，
@@ -1566,7 +1591,7 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
         for offset, n in enumerate(batch):
             n["_judge_idx"] = start + offset
         try:
-            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch), timeout=60, max_retries=1, deadline=deadline)
+            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch, env_context, pushed_events), timeout=60, max_retries=1, deadline=deadline)
             entries = _parse_llm_array(raw)
             # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
             by_idx = {}
@@ -1605,6 +1630,7 @@ def _llm_judge(items: list, deadline: float = 0) -> list:
                     "entities": [str(x).strip() for x in _as_list(e.get("entities"))
                                  if isinstance(x, (str, int, float)) and str(x).strip()],
                     "is_leader_stock": _as_bool(e.get("is_leader_stock", False), False),
+                    "env_note": str(e.get("env_note", "") or "").strip()[:80],
                     "reason": str(e.get("reason", "") or "").strip(),
                 }
             logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成（回显{len(entries)}条）")
@@ -1703,28 +1729,18 @@ _HARD_EVENT_WORDS = (
 # 不构成硬事件佐证（如"有望中标""拟收购""订单验证窗口"）。
 _FORWARD_MODIFIERS = ("有望", "预期", "预计", "或", "计划", "拟", "验证", "窗口", "开启", "迎")
 
-# 科技板块宽词（降级判定用，偏宽：宁可漏降级不可误伤非科技）。
-# _is_domestic_tech/_is_overseas_tech 依赖 OVERSEAS_TECH_KEYWORDS，缺"液冷/散热/数据中心"
-# 等词（实测 sectors=['液冷'] 返回 False），此处补全。
-_TECH_SECTOR_WORDS = (
-    "半导体", "芯片", "集成电路", "算力", "AI", "人工智能", "英伟达", "存储",
-    "光模块", "CPO", "PCB", "MLCC", "液冷", "散热", "服务器", "数据中心",
-    "通信", "光通信", "消费电子", "机器人", "电子", "软件", "互联网", "科技",
-    "GPU", "CPU", "晶圆", "封测", "先进封装", "智能驾驶", "卫星", "量子", "数据要素",
-)
-
 
 def _is_tech_by_sectors(sectors) -> bool:
-    """板块是否科技类（降级判定专用宽词表）"""
+    """板块是否科技类（降级判定专用宽词表 TECH_SECTOR_WORDS_WIDE，单一数据源）"""
     secs = " ".join(str(s) for s in (sectors or []))
-    return any(kw in secs for kw in _TECH_SECTOR_WORDS)
+    return any(kw in secs for kw in TECH_SECTOR_WORDS_WIDE)
 
 
-def _load_factor_risk_state() -> str:
-    """读取 factor_collector 的风险状态：云端从 Gist 的 factor_state.json 读，本地读文件
+def _load_factor_state() -> dict:
+    """读取 factor_collector 的完整因子状态：云端从 Gist 的 factor_state.json 读，本地读文件
 
-    缺失/解析失败/非预期值 → neutral（不影响现有推送）。云端未跑 factor_collector
-    时读不到 → 联动自动失效，保证向后兼容。
+    缺失/解析失败 → {}（联动与市场环境行均为增强功能，失败不影响资讯主流程）。
+    云端未跑 factor_collector 时读不到 → 返回空 dict，保证向后兼容。
     """
     gist_token = os.getenv("GIST_TOKEN", "").strip()
     gist_id = os.getenv("GIST_ID", "").strip()
@@ -1740,18 +1756,205 @@ def _load_factor_risk_state() -> str:
             files = resp.json().get("files") or {}
             fobj = files.get("factor_state.json")
             if fobj is not None:
-                data = json.loads(fobj.get("content") or "{}")
-                rs = data.get("risk_state", "neutral")
-                return rs if rs in ("risk_off", "neutral") else "neutral"
+                return json.loads(fobj.get("content") or "{}")
         except Exception as e:
             # 联动是增强功能，读取失败降级本地，不影响资讯主流程
-            logger.debug(f"Gist 风险状态读取失败，降级本地: {e}")
+            logger.debug(f"Gist 因子状态读取失败，降级本地: {e}")
     try:
-        data = json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
-        rs = data.get("risk_state", "neutral")
-        return rs if rs in ("risk_off", "neutral") else "neutral"
+        return json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return "neutral"
+        return {}
+
+
+def _load_factor_risk_state() -> str:
+    """读取 factor_collector 的风险状态（_load_factor_state 的便捷封装）
+
+    缺失/解析失败/非预期值 → neutral（不影响现有推送）。云端未跑 factor_collector
+    时读不到 → 联动自动失效，保证向后兼容。
+    """
+    rs = _load_factor_state().get("risk_state", "neutral")
+    return rs if rs in ("risk_off", "neutral") else "neutral"
+
+
+# 市场环境行快照过期阈值（小时）：factor_collector 盘中 15 分钟/盘后 60 分钟一轮，
+# 48h 覆盖周末（周五收盘快照在周末推送时仍有参考价值，超 48h 视为过期省略）。
+_FACTOR_ENV_MAX_AGE_HOURS = 48
+
+
+def _factor_env_line(snapshot: dict, now: datetime = None) -> str:
+    """把因子快照压成单行"市场环境"（附在资讯推送卡片，P0-1 融合展示）
+
+    格式示例：**市场环境**(08-19 14:30): ⚠️风险收缩期 | IC -0.52% IM -0.83% | 美元/日元 +0.83% | 上证 -0.50%
+
+    快照缺失/字段空/超过 48h 过期 → 返回 ""（推送退化为原格式，不带该行）。
+    """
+    if not isinstance(snapshot, dict) or not snapshot:
+        return ""
+    ts = str(snapshot.get("ts", "") or "")
+    try:
+        snap_time = datetime.strptime(ts, "%Y-%m-%d %H:%M").replace(tzinfo=BJT)
+    except ValueError:
+        return ""
+    now = now or datetime.now(BJT)
+    if snap_time > now:
+        return ""
+    if (now - snap_time).total_seconds() > _FACTOR_ENV_MAX_AGE_HOURS * 3600:
+        return ""
+
+    parts = []
+    if snapshot.get("risk_state") == "risk_off":
+        parts.append("⚠️风险收缩期")
+    basis = snapshot.get("basis") or {}
+    basis_parts = []
+    for code in ("IC", "IM"):
+        b = basis.get(code) or {}
+        pct = b.get("basis_pct")
+        if isinstance(pct, (int, float)):
+            basis_parts.append(f"{code} {pct:+.2f}%")
+    if basis_parts:
+        parts.append("贴水 " + " ".join(basis_parts))
+    fx = snapshot.get("fx") or {}
+    jpy = fx.get("美元/日元") or {}
+    if isinstance(jpy.get("change_pct"), (int, float)):
+        parts.append(f"美元/日元 {jpy['change_pct']:+.2f}%")
+    indexes = snapshot.get("indexes") or {}
+    sh = indexes.get("上证指数") or {}
+    if isinstance(sh.get("change_pct"), (int, float)):
+        arrow = "▲" if sh["change_pct"] >= 0 else "▼"
+        parts.append(f"上证 {arrow}{sh['change_pct']:+.2f}%")
+    # P1-3（2026-08-19）：两市主力净流入（快照无 flows 键时省略，旧快照兼容）
+    flows = snapshot.get("flows") or {}
+    mn = flows.get("main_net_yi")
+    if isinstance(mn, (int, float)) and mn != 0:
+        parts.append(f"主力{'净流入' if mn > 0 else '净流出'}{abs(mn):.0f}亿")
+    # P3（2026-08-19）：隔夜外盘（AI硬件链先行指标）+ 高波状态 + 极端宽度
+    gq = snapshot.get("global") or {}
+    for g_name in ("纳斯达克100", "英伟达"):
+        g = gq.get(g_name) or {}
+        if isinstance(g.get("change_pct"), (int, float)):
+            flag = "⚠️" if abs(g["change_pct"]) >= 2.0 else ""
+            parts.append(f"{flag}隔夜{g_name.replace('纳斯达克100', '纳指')}{g['change_pct']:+.2f}%")
+    for _, v in (snapshot.get("vol") or {}).items():
+        if isinstance(v, dict) and v.get("regime") == "高波":
+            parts.append("⚠️高波")
+            break
+    breadth = snapshot.get("breadth") or {}
+    dp = breadth.get("down_pct")
+    if isinstance(dp, (int, float)) and dp >= 80:
+        parts.append(f"⚠️普跌{dp:.0f}%")
+    # P4（2026-08-19）：涨停情绪档位（仅极端档上环境行，保持单行紧凑）
+    mood = (snapshot.get("sentiment") or {}).get("mood")
+    if mood == "亢奋":
+        parts.append("🔥情绪亢奋")
+    elif mood == "冰点":
+        parts.append("❄️情绪冰点")
+    # P7（2026-08-19）：资金面收紧 / 期权恐慌（仅极端值上环境行；GC007≥3%、PCR≥1.5）
+    liq = snapshot.get("liquidity") or {}
+    gc = liq.get("gc007") or {}
+    if isinstance(gc.get("price"), (int, float)) and gc["price"] >= 3.0:
+        parts.append(f"⚠️GC007 {gc['price']:.2f}%")
+    opt = snapshot.get("option") or {}
+    if isinstance(opt.get("pcr"), (int, float)) and opt["pcr"] >= 1.5:
+        parts.append(f"⚠️期权恐慌 PCR {opt['pcr']:.2f}")
+    if not parts:
+        return ""
+    return f"**市场环境**({ts}): " + " | ".join(parts)
+
+
+def _llm_env_context(snapshot: dict, now: datetime = None) -> str:
+    """因子快照 → LLM 判定环境上下文（P2-2 共振/背离标注）
+
+    与 _factor_env_line 同一过期规则（>48h 失效）；失效/缺失 → ""，
+    LLM 判定退化为无环境模式（向后兼容：云端 factor_collector 未跑/快照过期不受影响）。
+    例："（08-19 15:00）风险收缩期（量化资金防守/降杠杆）；IC贴水-0.92%、IM贴水-0.65%
+    （中性策略对冲成本）；美元/日元-0.43%；上证指数-2.40%；两市主力净流出1940亿"
+    """
+    if not isinstance(snapshot, dict) or not snapshot:
+        return ""
+    ts = str(snapshot.get("ts", "") or "")
+    try:
+        snap_time = datetime.strptime(ts, "%Y-%m-%d %H:%M").replace(tzinfo=BJT)
+    except ValueError:
+        return ""
+    now = now or datetime.now(BJT)
+    if snap_time > now:
+        return ""
+    if (now - snap_time).total_seconds() > _FACTOR_ENV_MAX_AGE_HOURS * 3600:
+        return ""
+    parts = []
+    if snapshot.get("risk_state") == "risk_off":
+        parts.append("风险收缩期（量化资金防守/降杠杆）")
+    basis = snapshot.get("basis") or {}
+    basis_parts = []
+    for code in ("IC", "IM"):
+        b = basis.get(code) or {}
+        pct = b.get("basis_pct")
+        if isinstance(pct, (int, float)):
+            basis_parts.append(f"{code}贴水{pct:+.2f}%")
+    if basis_parts:
+        parts.append("、".join(basis_parts) + "（中性策略对冲成本）")
+    fx = snapshot.get("fx") or {}
+    jpy = fx.get("美元/日元") or {}
+    if isinstance(jpy.get("change_pct"), (int, float)):
+        parts.append(f"美元/日元{jpy['change_pct']:+.2f}%")
+    indexes = snapshot.get("indexes") or {}
+    for ix_name in ("上证指数", "创业板指"):
+        ix = indexes.get(ix_name) or {}
+        if isinstance(ix.get("change_pct"), (int, float)):
+            parts.append(f"{ix_name}{ix['change_pct']:+.2f}%")
+    flows = snapshot.get("flows") or {}
+    mn = flows.get("main_net_yi")
+    if isinstance(mn, (int, float)) and mn != 0:
+        parts.append(f"两市主力净{'流入' if mn > 0 else '流出'}{abs(mn):.0f}亿")
+    # P3（2026-08-19）：外盘/波动率/宽度——LLM 判定共振/背离的增量上下文
+    gq = snapshot.get("global") or {}
+    g_parts = []
+    for g_name in ("纳斯达克100", "英伟达", "恒生科技指数"):
+        g = gq.get(g_name) or {}
+        if isinstance(g.get("change_pct"), (int, float)):
+            g_parts.append(f"{g_name}{g['change_pct']:+.2f}%")
+    if g_parts:
+        parts.append("隔夜" + "、".join(g_parts) + "（AI硬件链/科技股先行指标）")
+    vol_parts = []
+    for v_name, v in (snapshot.get("vol") or {}).items():
+        if isinstance(v, dict) and v.get("regime") == "高波":
+            vol_parts.append(f"{v_name}高波（20日波动率{v.get('vol20', 0):.1f}%）")
+    if vol_parts:
+        parts.append("；".join(vol_parts) + "（机构降杠杆环境）")
+    breadth = snapshot.get("breadth") or {}
+    dp = breadth.get("down_pct")
+    if isinstance(dp, (int, float)) and dp >= 80:
+        ld = breadth.get("limit_down", 0)
+        parts.append(f"极端普跌（{dp:.0f}%个股下跌，跌停{ld}家）")
+    # P4（2026-08-19）：涨停情绪 + 行业资金流——LLM 判定短线情绪类事件的增量上下文
+    sentiment = snapshot.get("sentiment") or {}
+    if sentiment.get("mood") and sentiment.get("zt"):
+        parts.append(f"涨停情绪{sentiment['mood']}"
+                     f"（涨停{sentiment.get('zt', 0)}家，连板高度{sentiment.get('max_lbc', 0)}，"
+                     f"炸板率{sentiment.get('zbr', 0):.0f}%）")
+    sf = snapshot.get("sector_flows") or {}
+    in_parts = [f"{n}{v:+.1f}亿" for n, v in (sf.get("inflow") or [])[:3]]
+    out_parts = [f"{n}{v:+.1f}亿" for n, v in (sf.get("outflow") or [])[:3]]
+    if in_parts:
+        parts.append("主力净流入行业：" + "、".join(in_parts))
+    if out_parts:
+        parts.append("主力净流出行业：" + "、".join(out_parts))
+    # P7（2026-08-19）：资金面利率 + 期权情绪——LLM 判定流动性敏感型事件
+    # （货币政策/杠杆资金/利率类）与情绪敏感型事件的增量上下文
+    liq = snapshot.get("liquidity") or {}
+    gc = liq.get("gc007") or {}
+    if isinstance(gc.get("price"), (int, float)):
+        tight = gc["price"] >= 3.0
+        parts.append(f"GC007资金面利率{gc['price']:.2f}%"
+                     + ("（资金面收紧，杠杆资金承压）" if tight else "（资金面平稳）"))
+    opt = snapshot.get("option") or {}
+    if isinstance(opt.get("pcr"), (int, float)):
+        pcr = opt["pcr"]
+        mood = "恐慌对冲占优" if pcr >= 1.3 else ("看涨占优" if pcr <= 0.55 else "中性")
+        parts.append(f"期权PCR{pcr:.2f}（机构情绪{mood}）")
+    if not parts:
+        return ""
+    return f"（{ts}）" + "；".join(parts)
 
 
 def _risk_off_downgrade(news: dict, judge: dict) -> bool:
@@ -1860,8 +2063,81 @@ _DIR_LABEL = {
 }
 _SCOPE_LABEL = {"market": "全市场", "sector": "板块", "stock": "个股"}
 
+# P6（2026-08-19）跨事件叙事链：方向分组口径
+_BULL_GROUP = {"bullish", "mildly_bullish"}
+_BEAR_GROUP = {"bearish", "mildly_bearish"}
 
-def format_push_alert(news: dict, judge: dict) -> str:
+
+def _opposite_events_note(sig: dict, cur_dir: str, pushed_events: list, hours: int = 48) -> str:
+    """跨事件矛盾检测（P6-2）：近 N 小时同主体反向已推事件
+
+    叙事链的"矛盾"环节——今日利空事件 vs 48h 前同主体利多事件，推送时双向可见，
+    用户看到完整叙事而非孤立判定（LLM 单条独立判定的补强）。返回附注文本，
+    无匹配/方向中性返回 ""。
+    """
+    d = str(cur_dir or "")
+    if d in _BULL_GROUP:
+        opp, opp_label = _BEAR_GROUP, "利空"
+    elif d in _BEAR_GROUP:
+        opp, opp_label = _BULL_GROUP, "利多"
+    else:
+        return ""
+    ents = {_normalize_entity(e) for e in _as_list(sig.get("stocks"))} | \
+           {_normalize_entity(e) for e in _as_list(sig.get("entities"))}
+    if not ents:
+        return ""
+    now_ts = time.time()
+    hits = []
+    for pe in pushed_events:
+        if str(pe.get("dir") or "") not in opp:
+            continue
+        try:
+            ts = datetime.strptime(str(pe.get("t") or ""), "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if now_ts - ts > hours * 3600:
+            continue
+        pents = {_normalize_entity(e) for e in _as_list(pe.get("stocks"))} | \
+                {_normalize_entity(e) for e in _as_list(pe.get("entities"))}
+        if ents & pents:
+            hits.append(f"{str(pe.get('title_norm') or '')[:40]}（{opp_label}）")
+            if len(hits) >= 2:
+                break
+    if not hits:
+        return ""
+    return f"近{hours}h同主体反向已推事件：" + "、".join(hits)
+
+
+def _related_recent_note(n: dict, pushed_events: list, hours: int = 48) -> list:
+    """该条资讯的近 N 小时同主体已推事件（P6-3 叙事链：LLM 判定的增量上下文）
+
+    判定时 items 尚无 _sig（签名依赖判定结果生成），按已推事件的主体词
+    在标题+正文中的子串匹配。返回 ["标题（方向）", ...]（≤3 条），无匹配返回 []。
+    """
+    if not pushed_events:
+        return []
+    text = f"{n.get('title', '')} {n.get('content', '')}"
+    now_ts = time.time()
+    out = []
+    for pe in pushed_events:
+        kws = [str(e) for e in (_as_list(pe.get("stocks")) + _as_list(pe.get("entities")))
+               if str(e).strip()]
+        if not any(k in text for k in kws):
+            continue
+        try:
+            ts = datetime.strptime(str(pe.get("t") or ""), "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if now_ts - ts > hours * 3600:
+            continue
+        label = _DIR_LABEL.get(str(pe.get("dir") or ""), "中性")
+        out.append(f"{str(pe.get('title_norm') or '')[:36]}（{label}）")
+        if len(out) >= 3:
+            break
+    return out
+
+
+def format_push_alert(news: dict, judge: dict, factor_env: str = "", opposite_note: str = "") -> str:
     """格式化单条快讯为 markdown 文本（红涨绿跌）
 
     注: 企业微信 markdown 不支持 <font color> 内联 HTML，
@@ -1870,6 +2146,14 @@ def format_push_alert(news: dict, judge: dict) -> str:
 
     正文处理: 资讯原文 content 截断 300 字符附在推送里（避免只推标题+理由
     让用户看不到资讯内容），企业微信 4096 字节限制内有充足余量。
+
+    factor_env（P0-1 2026-08-19 融合展示）: 由 _factor_env_line 生成的单行
+    因子快照（"市场环境: ...IC贴水/日元/上证..."），空串时不附该行，
+    向后兼容（factor_collector 未跑/快照过期 → 推送退化为原格式）。
+    env_note（P2-2 2026-08-19）: judge 的共振/背离标注（LLM 结合量化环境
+    生成，如"背离: 利好但风险收缩期，谨慎对待"），空串不展示。
+    opposite_note（P6-2 2026-08-19）: 跨事件矛盾附注（近48h同主体反向已推
+    事件），空串不展示——叙事链的"矛盾"环节，双向可见。
     """
     title = str(news.get("title", "") or "")[:200]
     direction = judge.get("direction", "neutral")
@@ -1883,6 +2167,7 @@ def format_push_alert(news: dict, judge: dict) -> str:
     sectors = _as_list(judge.get("sectors"))
     sector_str = "、".join(str(s) for s in sectors[:4]) if sectors else "—"
     reason = str(judge.get("reason", "") or "").strip()[:100]
+    env_note = str(judge.get("env_note", "") or "").strip()[:60]
     source = str(news.get("source", "") or "多源资讯")
     pub = str(news.get("published_at", "") or "")
     content_text = str(news.get("content", "") or "").strip()
@@ -1890,6 +2175,12 @@ def format_push_alert(news: dict, judge: dict) -> str:
     lines = [f"{emoji}【{label}】{title}", ""]
     meta = [f"**范围**: {scope_label}", f"**影响分**: {score}", f"**板块**: {sector_str}"]
     lines.append(" | ".join(meta))
+    if env_note:
+        lines.append(f"**环境**: {env_note}")
+    if factor_env:
+        lines.append(factor_env)
+    if opposite_note:
+        lines.append(f"**⚠️ {opposite_note}")
     lines.append(f"**来源**: {source} {pub}")
     if content_text:
         body = content_text[:300]
@@ -2058,8 +2349,16 @@ def run_once(dry_run: bool = False) -> dict:
     # 4. LLM 严格判定（全部候选必须经 LLM 判定，无规则降级路径）
     # 总超时熔断（2026-08-06）：本轮 LLM 判定最多 300s，超过则剩余批次挂起下轮重试。
     # 防止多批×重试叠加突破 GitHub Actions timeout-minutes:10（此前最坏 900s）。
+    # P2-2（2026-08-19）：LLM 判定注入量化环境上下文（风险状态/贴水/汇率/主力资金），
+    # LLM 输出 env_note 共振/背离标注；factor_state 提前至此加载一次，
+    # 下方 5c 的风险收缩期联动与市场环境行复用同一份（一次 Gist 读取三用）。
+    factor_state = _load_factor_state()
+    env_context = _llm_env_context(factor_state.get("snapshot") or {})
+    # P6-3：已推事件提前加载（原 5c 处初始化上移）——LLM 叙事链上下文 + 5c 推送复用
+    pushed_events = state.setdefault("pushed_events", [])
     _llm_deadline = time.monotonic() + 300
-    judges = _llm_judge(candidates, deadline=_llm_deadline)
+    judges = _llm_judge(candidates, deadline=_llm_deadline, env_context=env_context,
+                        pushed_events=pushed_events)
     if not judges:
         # 防御：_llm_judge 异常返回空 → 全部挂起下轮重试（不推、不落指纹）
         judges = [_hang_judge(n) for n in candidates]
@@ -2110,10 +2409,15 @@ def run_once(dry_run: bool = False) -> dict:
                 skipped += 1
 
     # 5c. 逐代表：LLM未判定挂起 → 强档方向门槛 → 阈值过滤 → 跨轮同事件拦截 → 推送
-    pushed_events = state.setdefault("pushed_events", [])
+    # pushed_events 已在 LLM 判定前初始化（P6-3 上移）
     # 风险收缩期联动（2026-08-14 第二阶段）：factor_collector 写入的 risk_state，
-    # risk_off 时对无硬事件佐证的科技利好降级不推（每轮加载一次）
-    risk_state = _load_factor_risk_state()
+    # risk_off 时对无硬事件佐证的科技利好降级不推。
+    # P0-1（2026-08-19）：同一份 factor_state（已在第 4 步加载）取 snapshot 生成
+    # "市场环境"行附在每条推送卡片上，一次 Gist 读取三用。
+    risk_state = factor_state.get("risk_state")
+    if risk_state not in ("risk_off", "neutral"):
+        risk_state = "neutral"
+    factor_env = _factor_env_line(factor_state.get("snapshot") or {})
     for n, j in reps:
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
@@ -2202,7 +2506,10 @@ def run_once(dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
-        content = format_push_alert(n, j)
+        # P6-2：跨事件矛盾附注（近48h同主体反向已推事件）——叙事链"矛盾"环节
+        opposite_note = _opposite_events_note(n["_sig"], str(j.get("direction") or ""),
+                                              pushed_events)
+        content = format_push_alert(n, j, factor_env=factor_env, opposite_note=opposite_note)
         if dry_run:
             logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
             # Windows 控制台默认 GBK 无法打印 emoji，先切 UTF-8 容错
@@ -2212,7 +2519,8 @@ def run_once(dry_run: bool = False) -> dict:
                 pass
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-            pushed_events.append({**n["_sig"], "t": now})
+            # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比
+            pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now})
             pushed += 1
         else:
             # 推送标题直接用新闻原文标题（避免显示"重要资讯"占位符）
@@ -2221,7 +2529,7 @@ def run_once(dry_run: bool = False) -> dict:
             if result.get("code") == 200 or result.get("errcode") == 0:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-                pushed_events.append({**n["_sig"], "t": now})
+                pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now})
                 pushed += 1
             else:
                 # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
@@ -2270,6 +2578,335 @@ def run_once(dry_run: bool = False) -> dict:
     return stats
 
 
+# ============================================================
+# P0-2/P0-3 盘前简报 + 盘后复盘（融合展示，2026-08-19）
+# ============================================================
+# 隔夜窗口：昨日收盘 15:00（BJT）之后发布的资讯都算"隔夜/盘前要闻"
+_OVERNIGHT_SINCE_HOUR = 15
+# 盘前简报要闻条数上限（信息密度优先，超出的按预筛分截断）
+BRIEF_TOP_N = 5
+
+_PUB_TIME_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                     "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+                     "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"]
+
+
+def _parse_pub_time(text: str):
+    """解析 published_at 为 naive BJT datetime；失败返回 None（调用方保留该条不误删）"""
+    text = str(text or "").strip()
+    for fmt in _PUB_TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _snapshot_block(factor_state: dict, title: str) -> list:
+    """把 factor_collector 的紧凑快照格式化为 markdown 块（盘前/盘后共用）"""
+    snap = factor_state.get("snapshot") or {}
+    lines = [f"### {title}", ""]
+    if not snap:
+        lines.append("- 因子快照缺失（factor_collector 未运行或首次部署），仅资讯维度")
+        return lines
+    ts = str(snap.get("ts", "") or "")
+    risk = str(snap.get("risk_state", "") or "")
+    risk_txt = "⚠️ 风险收缩期" if risk == "risk_off" else "中性"
+    lines.append(f"- 风险状态: {risk_txt}（更新 {ts}）")
+    for name in ("上证指数", "创业板指"):
+        idx = (snap.get("indexes") or {}).get(name) or {}
+        if idx:
+            arrow = "▲" if idx.get("change_pct", 0) >= 0 else "▼"
+            lines.append(f"- {name}: {arrow} {idx.get('change_pct', 0):+.2f}%"
+                         f"（{idx.get('price', 0):.2f}，{idx.get('trend', '')}）")
+    basis = snap.get("basis") or {}
+    if basis:
+        parts = []
+        for code in ("IF", "IC", "IM", "IH"):
+            b = basis.get(code)
+            if isinstance(b, dict) and isinstance(b.get("basis_pct"), (int, float)):
+                tag = "贴水" if b["basis_pct"] < 0 else "升水"
+                parts.append(f"{code} {tag}{abs(b['basis_pct']):.2f}%"
+                             f"(年化{b.get('annual_pct', 0):+.1f}%)")
+        if parts:
+            lines.append("- 股指期货: " + "｜".join(parts))
+    fx = snap.get("fx") or {}
+    fx_parts = []
+    for label in ("美元/日元", "美元/在岸人民币"):
+        f = fx.get(label) or {}
+        if isinstance(f.get("change_pct"), (int, float)):
+            fx_parts.append(f"{label} {f['price']:.4f}({f['change_pct']:+.2f}%)")
+    if fx_parts:
+        lines.append("- 汇率: " + "｜".join(fx_parts))
+    # P3（2026-08-19）：隔夜外盘 / 宽度 / 波动率 / 风格
+    gq = snap.get("global") or {}
+    g_parts = []
+    for g_name in ("纳斯达克100", "标普500", "英伟达", "恒生科技指数"):
+        g = gq.get(g_name) or {}
+        if isinstance(g.get("change_pct"), (int, float)):
+            arrow = "▲" if g["change_pct"] >= 0 else "▼"
+            warn = "⚠️" if abs(g["change_pct"]) >= 2.0 else ""
+            g_parts.append(f"{g_name}{warn}{arrow}{g['change_pct']:+.2f}%")
+    if g_parts:
+        lines.append("- 隔夜外盘: " + "｜".join(g_parts))
+    breadth = snap.get("breadth") or {}
+    if breadth.get("down_pct") is not None:
+        lines.append(f"- 市场宽度: 涨{breadth.get('adv', 0)}/跌{breadth.get('dec', 0)}"
+                     f"（{breadth.get('down_pct', 0):.0f}%下跌）"
+                     f"｜涨停{breadth.get('limit_up', 0)}/跌停{breadth.get('limit_down', 0)}"
+                     f"｜跌超5% {breadth.get('big_down', 0)}")
+    vol = snap.get("vol") or {}
+    vol_parts = []
+    for v_name, v in vol.items():
+        if isinstance(v, dict):
+            vol_parts.append(f"{v_name} {v.get('vol20', 0):.1f}%"
+                             f"({v.get('pctile', 0):.0f}分位{'高波' if v.get('regime') == '高波' else v.get('regime', '')})")
+    if vol_parts:
+        lines.append("- 波动率: " + "｜".join(vol_parts))
+    style = snap.get("style") or {}
+    if style.get("trend"):
+        lines.append(f"- 风格轮动: {style.get('trend')}"
+                     f"（50/1000比价20日{style.get('chg20', 0):+.1f}%）")
+    # P4（2026-08-19）：涨停情绪 + 行业资金流
+    sentiment = snap.get("sentiment") or {}
+    if sentiment.get("zt"):
+        mood = sentiment.get("mood", "")
+        flag = "🔥" if mood == "亢奋" else ("❄️" if mood == "冰点" else "")
+        lines.append(f"- 涨停情绪: {flag}{mood}｜涨停{sentiment.get('zt', 0)}"
+                     f"（连板高度{sentiment.get('max_lbc', 0)}）"
+                     f"｜炸板率{sentiment.get('zbr', 0):.0f}%")
+    sf = snap.get("sector_flows") or {}
+    in_s = "、".join(f"{n} {v:+.1f}亿" for n, v in (sf.get("inflow") or [])[:3])
+    out_s = "、".join(f"{n} {v:+.1f}亿" for n, v in (sf.get("outflow") or [])[:3])
+    if in_s or out_s:
+        lines.append(f"- 行业资金: 流入 {in_s or '—'} ｜ 流出 {out_s or '—'}")
+    # P7（2026-08-19）：资金面利率 + 期权情绪（影子因子，简报常规展示）
+    liq = snap.get("liquidity") or {}
+    gc = liq.get("gc007") or {}
+    if isinstance(gc.get("price"), (int, float)):
+        tight = gc["price"] >= 3.0
+        flag = "⚠️" if tight else ""
+        gc1 = liq.get("gc001") or {}
+        gc1_s = (f"｜GC001 {gc1['price']:.2f}%"
+                 if isinstance(gc1.get("price"), (int, float)) else "")
+        lines.append(f"- 资金面利率: {flag}GC007 {gc['price']:.2f}%{gc1_s}"
+                     + ("（资金面收紧）" if tight else "（平稳）"))
+    opt = snap.get("option") or {}
+    if isinstance(opt.get("pcr"), (int, float)):
+        pcr = opt["pcr"]
+        flag = "⚠️" if pcr >= 1.5 else ""
+        mood = ("恐慌对冲占优" if pcr >= 1.3 else
+                "看涨情绪占优" if pcr <= 0.55 else "情绪中性")
+        lines.append(f"- 期权情绪: {flag}PCR {pcr:.2f}（{mood}）"
+                     f"｜认购 {opt.get('call_vol', 0)} / 认沽 {opt.get('put_vol', 0)} 张")
+    # P5-2：盘中弱翻转提示（未达强信号门槛不单独推，简报兜底可见）
+    weak = factor_state.get("weak_direction") or {}
+    if weak.get("dir") and weak.get("dir") != factor_state.get("last_direction"):
+        lines.append(f"- 盘中弱信号: {weak.get('dir')}（{weak.get('score', 0):+.2f}，"
+                     f"未达强信号门槛，仅供参考）")
+    # P5-3：数据健康度（源成功率）
+    src = snap.get("sources") or {}
+    if src.get("total"):
+        ratio = src.get("ok", 0) / src["total"]
+        flag = "⚠️" if ratio < 0.7 else ""
+        lines.append(f"- 数据健康度: {flag}{src.get('ok', 0)}/{src['total']} 源正常")
+    last_dir = str(factor_state.get("last_direction", "") or "")
+    if last_dir:
+        # P4-6：IC 加权已启用时标注（含样本数），人工决策时知悉合成口径
+        ic = factor_state.get("factor_ic") or {}
+        ic_tag = ""
+        if ic.get("weights"):
+            n = ic.get("n")
+            ic_tag = f"（IC加权，n={n}）" if isinstance(n, int) else "（IC加权）"
+        lines.append(f"- 量化综合方向: {last_dir}{ic_tag}")
+    return lines
+
+
+def _push_config_from_env() -> dict:
+    """从环境变量构建推送配置（与 run_once 同口径）"""
+    return {
+        "pushplus_token": os.getenv("PUSHPLUS_TOKEN", "").strip() or None,
+        "wecom_webhook": os.getenv("WECOM_WEBHOOK", "").strip() or None,
+    }
+
+
+def run_morning_brief(dry_run: bool = False) -> dict:
+    """盘前简报（08:45 触发）：隔夜要闻 Top5 + 因子环境 + 自选关注
+
+    只读设计：不调用 LLM、不写状态（不落 seen/pushed_events）——
+    隔夜资讯仍由常规 30 分钟轮询正常判定推送，简报只是提前聚合预览。
+    """
+    now = datetime.now(BJT)
+    factor_state = _load_factor_state()
+
+    lines = [f"## 📋 盘前简报 {now.strftime('%Y-%m-%d %H:%M')}", ""]
+
+    # 1. 隔夜要闻 Top5（预筛分排序，带规则方向提示；无 LLM 判定，人工把关）
+    lines.append("### 隔夜要闻（按重要度 Top5）")
+    lines.append("")
+    try:
+        news_list = list(get_stock_news.func())
+    except Exception as e:
+        logger.error(f"盘前简报新闻抓取失败: {e}")
+        news_list = []
+    try:
+        signals = list(get_market_signals.func())
+    except Exception:
+        signals = []
+    news_list = dedup_news_3layer(news_list) + signals
+
+    since = (now - timedelta(days=1)).replace(hour=_OVERNIGHT_SINCE_HOUR, minute=0,
+                                              second=0, microsecond=0)
+    overnight = []
+    for n in news_list:
+        pt = _parse_pub_time(n.get("published_at"))
+        if pt is not None and pt < since.replace(tzinfo=None):
+            continue
+        score, hit = _prefilter(n)
+        overnight.append((score, bool(hit), n))
+    overnight.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    if overnight:
+        # 信号类（龙虎榜/业绩预告，交易所结构化数据）预筛分恒定 0.75，
+        # 会挤占隔夜宏观/事件要闻席位——简报是"事件综述"，信号最多占 2 席
+        signal_slots = 2
+        shown = 0
+        for score, hit, n in overnight:
+            title = str(n.get("title", "") or "")
+            is_signal = title.startswith("龙虎榜:") or title.startswith("业绩预告:")
+            if is_signal:
+                if signal_slots <= 0:
+                    continue
+                signal_slots -= 1
+            if shown >= BRIEF_TOP_N:
+                break
+            shown += 1
+            source = str(n.get("source", "") or "")
+            direction = predict_direction_by_rules(title[:60], str(n.get("content", "") or ""))
+            emoji = _DIR_EMOJI.get(direction, "⚪")
+            star = "⚡" if hit else ""
+            lines.append(f"{shown}. {emoji} {title[:60]}（{source}，重要度{score:.2f}）{star}")
+    else:
+        lines.append("- 隔夜无重要资讯")
+    lines.append("")
+
+    # 2. 因子环境（来自 factor_collector 最近一轮快照）
+    lines.extend(_snapshot_block(factor_state, "因子环境"))
+    lines.append("")
+
+    # 3. 自选关注（P1-2：附最近一轮快照行情——08:45 盘前为昨日收盘口径）
+    watchlist = _load_leader_watchlist()
+    if watchlist:
+        lines.append("### 自选关注（最近快照）")
+        lines.append("")
+        stocks_snap = (factor_state.get("snapshot") or {}).get("stocks") or {}
+        for name in sorted(watchlist):
+            s = stocks_snap.get(name) or {}
+            if isinstance(s.get("change_pct"), (int, float)) and s.get("price"):
+                arrow = "▲" if s["change_pct"] >= 0 else "▼"
+                lines.append(f"- {name} {s['price']} {arrow}{s['change_pct']:+.2f}%")
+            else:
+                lines.append(f"- {name}")
+        lines.append("")
+
+    content = "\n".join(lines).rstrip() + "\n"
+    stats = {"overnight_candidates": len(overnight), "pushed": 0}
+
+    if dry_run:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        print("\n===== 盘前简报预览 =====\n" + content + "\n========================")
+        return stats
+    push_config = _push_config_from_env()
+    if not push_config["pushplus_token"] and not push_config["wecom_webhook"]:
+        raise RuntimeError("盘前简报推送失败: 未配置 PUSHPLUS_TOKEN 或 WECOM_WEBHOOK")
+    result = _send_alert_item(push_config, f"盘前简报 {now.strftime('%m-%d %H:%M')}", content)
+    if result.get("code") == 200 or result.get("errcode") == 0:
+        stats["pushed"] = 1
+        logger.info("盘前简报推送成功")
+    else:
+        logger.error(f"盘前简报推送失败: {result}")
+    return stats
+
+
+def run_evening_review(dry_run: bool = False) -> dict:
+    """盘后复盘（15:10 触发）：当日已推事件回顾 + 推送统计 + 因子环境
+
+    只读设计：读 state 不写 state（当日数据由常规轮询维护，复盘仅聚合展示）。
+    """
+    now = datetime.now(BJT)
+    today = now.strftime("%Y-%m-%d")
+    state = load_state()
+    factor_state = _load_factor_state()
+
+    lines = [f"## 📊 盘后复盘 {today}", ""]
+
+    # 1. 当日已推事件（seen: pushed=True 且时间为今日；标题为原文截断）
+    todays = []
+    for fp, rec in (state.get("seen") or {}).items():
+        if not isinstance(rec, dict) or not rec.get("pushed"):
+            continue
+        if str(rec.get("t", "")).startswith(today):
+            todays.append(rec)
+    todays.sort(key=lambda r: str(r.get("t", "")))
+    lines.append(f"### 今日已推事件（{len(todays)} 条）")
+    lines.append("")
+    if todays:
+        for rec in todays:
+            t = str(rec.get("t", ""))[11:16]
+            title = str(rec.get("title", ""))[:60]
+            lines.append(f"- {t} {title}")
+    else:
+        lines.append("- 今日无推送（平静日或系统未运行）")
+    lines.append("")
+
+    # 2. 推送方向统计（pushed_events 当日条目，P0-3 起带 dir 字段）
+    today_events = [pe for pe in (state.get("pushed_events") or [])
+                    if str(pe.get("t", "")).startswith(today)]
+    bull = sum(1 for pe in today_events if pe.get("dir") == "bullish")
+    bear = sum(1 for pe in today_events if pe.get("dir") == "bearish")
+    if today_events:
+        lines.append(f"### 方向分布")
+        lines.append("")
+        lines.append(f"- 利好 {bull} 条｜利空 {bear} 条｜未标注 {len(today_events) - bull - bear} 条")
+        # 板块热度 Top3
+        sector_count = {}
+        for pe in today_events:
+            for s in _as_list(pe.get("sectors")):
+                if str(s).strip():
+                    sector_count[str(s).strip()] = sector_count.get(str(s).strip(), 0) + 1
+        top_sectors = sorted(sector_count.items(), key=lambda x: x[1], reverse=True)[:3]
+        if top_sectors:
+            lines.append("- 板块热度: " + "、".join(f"{s}({c})" for s, c in top_sectors))
+        lines.append("")
+
+    # 3. 因子环境
+    lines.extend(_snapshot_block(factor_state, "收盘因子环境"))
+    lines.append("")
+
+    content = "\n".join(lines).rstrip() + "\n"
+    stats = {"pushed_events": len(todays), "pushed": 0}
+
+    if dry_run:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        print("\n===== 盘后复盘预览 =====\n" + content + "\n========================")
+        return stats
+    push_config = _push_config_from_env()
+    if not push_config["pushplus_token"] and not push_config["wecom_webhook"]:
+        raise RuntimeError("盘后复盘推送失败: 未配置 PUSHPLUS_TOKEN 或 WECOM_WEBHOOK")
+    result = _send_alert_item(push_config, f"盘后复盘 {today}", content)
+    if result.get("code") == 200 or result.get("errcode") == 0:
+        stats["pushed"] = 1
+        logger.info("盘后复盘推送成功")
+    else:
+        logger.error(f"盘后复盘推送失败: {result}")
+    return stats
+
+
 def _is_trading_day() -> bool:
     """A股交易日判断（RT_ALWAYS_ON=0 时启用）"""
     try:
@@ -2284,6 +2921,8 @@ def main():
     parser = argparse.ArgumentParser(description="实时重要资讯推送")
     parser.add_argument("--loop", action="store_true", help="常驻循环模式（本地守护进程）")
     parser.add_argument("--dry-run", action="store_true", help="只诊断不推送不保存状态")
+    parser.add_argument("--brief", choices=["morning", "evening"],
+                        help="盘前简报(morning, 08:45)/盘后复盘(evening, 15:10)，融合因子快照（P0-2/P0-3）")
     args = parser.parse_args()
 
     # 2026-08-13 P2 修复：删除重复 basicConfig——src.config 已配置 root logger
@@ -2293,6 +2932,14 @@ def main():
     always_on = os.getenv("RT_ALWAYS_ON", "1").strip() == "1"
     if not always_on and not _is_trading_day():
         logger.info("今日非A股交易日（RT_ALWAYS_ON=0），跳过")
+        return
+
+    if args.brief:
+        # 盘前简报/盘后复盘：独立入口，只读不写状态（不影响常规轮询去重）
+        if args.brief == "morning":
+            run_morning_brief(dry_run=args.dry_run)
+        else:
+            run_evening_review(dry_run=args.dry_run)
         return
 
     if args.loop:
