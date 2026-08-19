@@ -231,6 +231,8 @@ def _mock_base(monkeypatch, tmp_path):
     # P7（2026-08-19）：资金面/期权同样不触网（空数据 → 影子维度 0 分，不进合成）
     monkeypatch.setattr(fc, "fetch_liquidity", lambda: {})
     monkeypatch.setattr(fc, "fetch_option_pcr", lambda: {})
+    # P8（2026-08-19）：分钟K线不触网（空数据 → 分钟影子因子 0 分）
+    monkeypatch.setattr(fc, "fetch_minute_kline", lambda *a, **kw: [])
     import signal_backtest as sb  # noqa: E402
     monkeypatch.setattr(sb, "compute_winrate", lambda days=30: {"n": 0})
     monkeypatch.setattr(sb, "compute_factor_ic",
@@ -276,9 +278,9 @@ class TestConfidenceTiering:
         assert state["last_direction"] == "偏多"       # 方向仍更新
         assert state["weak_direction"]["dir"] == "偏多"
         assert 0.5 <= abs(state["weak_direction"]["score"]) < fc.STRONG_DIR_THRESHOLD
-        # 快照含数据健康度（mock 环境 6/13 源成功：行情/期货/汇率/K线/波动率/宽度；
-        # P7 后源总数 11→13，新增资金面利率/期权PCR）
-        assert state["snapshot"]["sources"]["total"] == 13
+        # 快照含数据健康度（mock 环境 6/14 源成功：行情/期货/汇率/K线/波动率/宽度；
+        # P7 后源总数 11→13（资金面利率/期权PCR），P8 后 13→14（分钟K线））
+        assert state["snapshot"]["sources"]["total"] == 14
         assert state["snapshot"]["sources"]["ok"] == 6
 
     def test_weak_then_strong_escalates(self, tmp_path, monkeypatch):
@@ -345,11 +347,12 @@ class TestDataHealth:
     def test_run_once_records_sources(self, tmp_path, monkeypatch):
         """run_once 统计数据源健康度并写入 snapshot.sources"""
         pushed = _mock_base(monkeypatch, tmp_path)
-        # mock 后成功源：指数行情/股指期货/汇率/指数K线/波动率(65条K线) = 5；失败源 8 个
+        # mock 后成功源：指数行情/股指期货/汇率/指数K线/波动率(65条K线) = 5；失败源 9 个
         fc._save_state({"last_direction": "中性", "basis_history": {}, "risk_state": "neutral"})
         fc.run_once(push=True)
         snap = fc._load_state()["snapshot"]
-        assert snap["sources"]["total"] == 13
+        # P8 后源总数 13→14（分钟K线）
+        assert snap["sources"]["total"] == 14
         assert snap["sources"]["ok"] == 5
 
     def test_build_snapshot_sources_key(self):

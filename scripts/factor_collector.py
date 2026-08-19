@@ -695,6 +695,36 @@ def fetch_option_pcr(max_pages: int = 12) -> dict:
             "put_vol": put_v, "contracts": contracts, "total": total}
 
 
+def fetch_minute_kline(symbol: str = "sh000001", period: str = "m5",
+                       count: int = 48) -> list:
+    """分钟级 K 线（P8 2026-08-19）：腾讯 ifzq mkline，盘中因子的数据底座
+
+    数据源 https://ifzq.gtimg.cn/appstock/app/kline/mkline（与指数行情同域族，
+    实测本地/云端均可用）。字段顺序 [时间YYYYMMDDHHmm, 开, 收, 高, 低, 量, {}]。
+    默认 m5×48 根 = 当日全量 4 小时交易时段；返回升序 [{time,open,close,high,low,volume}]，
+    失败返回 []（分钟因子缺省 0 分，不影响主流程）。
+    """
+    text = _http_get(
+        f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={symbol},{period},,{count}")
+    if not text:
+        return []
+    try:
+        data = json.loads(text).get("data") or {}
+        rows = (data.get(symbol) or {}).get(period) or []
+    except ValueError:
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, list) or len(r) < 6:
+            continue
+        try:
+            out.append({"time": str(r[0]), "open": float(r[1]), "close": float(r[2]),
+                        "high": float(r[3]), "low": float(r[4]), "volume": float(r[5])})
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 # ============================================================
 # 因子计算层
 # ============================================================
@@ -860,6 +890,104 @@ def calc_style_rotation() -> dict:
     else:
         trend = "风格均衡"
     return {"ratio": round(cur, 4), "chg5": round(chg5, 2), "chg20": round(chg20, 2), "trend": trend}
+
+
+# ============================================================
+# P8（2026-08-19）因子池扩展：日线衍生因子 + 分钟级因子（均为影子维度）
+# 复用已拉的 65/260 日 K 线与当日 m5 分钟线，零/单次额外请求；
+# 全部只记录进 direction_history 供 compute_factor_ic 回测，
+# IC 达标后逐个升级正式维度（机构级因子上线流程，与 P7 同口径）。
+# ============================================================
+MOM_WINDOW = 20               # 动量窗口（交易日）
+REV_WINDOW = 5                # 短期反转窗口
+REV_OVERSOLD = -5.0           # 5日跌幅 ≤-5% → 超跌反弹倾向 +1
+REV_OVERBOUGHT = 8.0          # 5日涨幅 ≥+8% → 超买回落倾向 -1
+VOLRATIO_CONFIRM = 1.2        # 量比确认阈值（近5日均量 / 前20日均量）
+MA_FAST, MA_SLOW = 5, 20      # 均线结构快慢线
+
+
+def calc_daily_derived_factors(klines: list) -> dict:
+    """日线衍生影子因子（P8）：动量/反转/均线/量价/跳空，复用上证日K
+
+    打分口径（+1 利好倾向 / -1 利空倾向 / 0 中性）：
+    - 动量: 近20日累计收益正负（趋势延续倾向）
+    - 反转: 5日超跌 +1 / 超买 -1（均值回归倾向，与动量反向时互抵由回测裁决）
+    - 均线: 收盘>MA20 且 MA5>MA20 = +1（多头结构）；收盘<MA20 且 MA5<MA20 = -1
+    - 量价: 近5日均量/前20日均量 ≥1.2 时的涨跌方向（放量确认）
+    - 跳空: 今日开盘 vs 昨收缺口方向（高开+1/低开-1，日内情绪起点）
+    数据不足（<25 根）返回空 dict，各维度记 0 分。
+    """
+    if len(klines) < 25:
+        return {}
+    closes = [k["close"] for k in klines]
+    vols = [k.get("volume") or 0 for k in klines]
+    out = {}
+    # 动量（20日）
+    mom = (closes[-1] / closes[-MOM_WINDOW] - 1) * 100
+    out["momentum_20d"] = 1.0 if mom > 0 else (-1.0 if mom < 0 else 0.0)
+    out["_momentum_desc"] = f"近{MOM_WINDOW}日 {mom:+.1f}%"
+    # 反转（5日）
+    rev = (closes[-1] / closes[-REV_WINDOW] - 1) * 100
+    if rev <= REV_OVERSOLD:
+        out["reversal_5d"] = 1.0
+    elif rev >= REV_OVERBOUGHT:
+        out["reversal_5d"] = -1.0
+    else:
+        out["reversal_5d"] = 0.0
+    out["_reversal_desc"] = f"近{REV_WINDOW}日 {rev:+.1f}%"
+    # 均线结构
+    ma_fast = sum(closes[-MA_FAST:]) / MA_FAST
+    ma_slow = sum(closes[-MA_SLOW:]) / MA_SLOW
+    if closes[-1] > ma_slow and ma_fast > ma_slow:
+        out["ma_structure"] = 1.0
+    elif closes[-1] < ma_slow and ma_fast < ma_slow:
+        out["ma_structure"] = -1.0
+    else:
+        out["ma_structure"] = 0.0
+    out["_ma_desc"] = (f"收盘{closes[-1]:.0f} vs MA{MA_SLOW} {ma_slow:.0f}"
+                       f"（MA{MA_FAST} {ma_fast:.0f}）")
+    # 量价配合
+    vol5 = sum(vols[-5:]) / 5
+    vol20 = sum(vols[-20:]) / 20
+    ratio = vol5 / vol20 if vol20 else 0
+    chg1 = closes[-1] - closes[-2]
+    if ratio >= VOLRATIO_CONFIRM and chg1 != 0:
+        out["volume_price"] = 1.0 if chg1 > 0 else -1.0
+    else:
+        out["volume_price"] = 0.0
+    out["_vp_desc"] = f"量比{ratio:.2f} 昨{'涨' if chg1 > 0 else '跌'}"
+    # 跳空缺口（今日开盘 vs 昨收）
+    gap = (klines[-1]["open"] / closes[-2] - 1) * 100
+    out["gap_today"] = 1.0 if gap > 0.05 else (-1.0 if gap < -0.05 else 0.0)
+    out["_gap_desc"] = f"今日开盘缺口 {gap:+.2f}%"
+    return out
+
+
+def calc_minute_factors(minute_klines: list) -> dict:
+    """分钟级影子因子（P8）：盘中动量 / 短线动能，m5 分钟线驱动
+
+    打分口径：
+    - 盘中动量: 当日全时段 m5 收盘价线性回归斜率（开盘→现在的整体趋势方向）
+    - 短线动能: 最近 6 根 m5（30分钟）净方向（盘中实时有效，盘后即尾盘结论）
+    斜率用首尾差/首值归一（简化口径，方向信息与最小二乘一致且零依赖）。
+    数据不足（<6 根）返回空 dict。
+    """
+    if len(minute_klines) < 6:
+        return {}
+    closes = [k["close"] for k in minute_klines]
+    out = {}
+    # 盘中动量：全时段首尾方向（归一化）
+    span = closes[-1] - closes[0]
+    base = closes[0] or 1
+    intraday = (span / base) * 100
+    out["intraday_momentum"] = 1.0 if intraday > 0.1 else (-1.0 if intraday < -0.1 else 0.0)
+    out["_intraday_desc"] = f"开盘至今 {intraday:+.2f}%（{len(closes)}根m5）"
+    # 短线动能：最近 30 分钟净方向
+    short = closes[-1] - closes[-6]
+    short_pct = (short / (closes[-6] or 1)) * 100
+    out["short_term_energy"] = 1.0 if short_pct > 0.05 else (-1.0 if short_pct < -0.05 else 0.0)
+    out["_short_desc"] = f"近30分钟 {short_pct:+.2f}%"
+    return out
 
 
 # ============================================================
@@ -1247,7 +1375,8 @@ def _calc_basis_direction(history: dict) -> dict:
 
 def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, history: dict,
                         vol: dict = None, breadth: dict = None, weights: dict = None,
-                        liquidity: dict = None, option: dict = None) -> dict:
+                        liquidity: dict = None, option: dict = None,
+                        daily_factors: dict = None, minute_factors: dict = None) -> dict:
     """多因子合成量化方向信号
 
     六个维度各打分（+1 利好 / -1 利空 / 0 中性）：
@@ -1370,7 +1499,27 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
         else:
             opt_part = f"PCR {pcr:.2f}（情绪中性）"
     shadow_dims.append(("期权情绪", opt_score, opt_part))
+    # P8 影子维度（因子池扩展，2026-08-19）：日线衍生 5 维 + 分钟级 2 维。
+    # 全部与 P7 同口径：打分记录进 direction_history 供 IC 回测，不参与综合分。
+    p8_dims = [
+        ("动量(20日)", daily_factors or {}, "momentum_20d", "_momentum_desc", "动量数据不足"),
+        ("反转(5日)", daily_factors or {}, "reversal_5d", "_reversal_desc", "反转数据不足"),
+        ("均线结构", daily_factors or {}, "ma_structure", "_ma_desc", "均线数据不足"),
+        ("量价配合", daily_factors or {}, "volume_price", "_vp_desc", "量价数据不足"),
+        ("跳空缺口", daily_factors or {}, "gap_today", "_gap_desc", "缺口数据不足"),
+        ("盘中动量", minute_factors or {}, "intraday_momentum", "_intraday_desc", "分钟数据不足"),
+        ("短线动能", minute_factors or {}, "short_term_energy", "_short_desc", "分钟数据不足"),
+    ]
+    for name, src, key, desc_key, miss_desc in p8_dims:
+        s = src.get(key)
+        if isinstance(s, (int, float)):
+            shadow_dims.append((name, float(s), str(src.get(desc_key) or miss_desc)))
+        else:
+            shadow_dims.append((name, 0.0, miss_desc))
     shadow_names = {name for name, s, _ in shadow_dims if s != 0}
+    # shadow: 非零影子（门控/权重排除判定用）；shadow_all: 全量影子名（含零分，
+    # 展示层隐藏零分影子用——两集合语义不同不可混用）
+    shadow_all = {name for name, _, _ in shadow_dims}
 
     # P5-1：非线性门控——状态调节权重（显式规则，强归因：说明哪个门控放大了哪些维度）
     gates = []  # [(说明, 受影响维度名集合, 倍数)]
@@ -1409,7 +1558,7 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
         "factors": dims + shadow_dims, "basis_dir": basis_dir, "risk_state": risk_state,
         "weighted": bool(weights), "weights": weights or {},
         "gates": [desc for desc, _, _ in gates], "eff_weights": eff_w,
-        "shadow": shadow_names,
+        "shadow": shadow_names, "shadow_all": shadow_all,
     }
 
 
@@ -1922,9 +2071,16 @@ def format_direction_signal(analysis: dict, last_dir: str = "", winrate: dict = 
         "因子明细：",
     ]
     # P5-1：生效权重（含门控倍数）优先于 IC 基线权重展示——共振归因
+    # P8：影子维度仅展示非零（有信号的）——因子池扩到 15 维后，零分影子逐行
+    # 展示会让卡片膨胀到 17 行；零分维度对决策无增量信息（分值仍全量进
+    # direction_history 供 IC 回测，展示与记录解耦）。
     eff_w = analysis.get("eff_weights") or {}
     shadow = analysis.get("shadow") or set()
+    # 全量影子名（含零分）——零分影子隐藏判定；兼容无 shadow_all 的旧快照
+    shadow_all = analysis.get("shadow_all") or shadow
     for name, s, desc in analysis.get("factors", []):
+        if name in shadow_all and s == 0:
+            continue
         if s > 0:
             mark = "▲ 利好"
         elif s < 0:
@@ -2014,6 +2170,11 @@ def run_once(push: bool) -> dict:
     # 不参与方向合成，IC 回测达标后升级正式维度）
     liquidity = fetch_liquidity()
     option = fetch_option_pcr()
+    # P8（2026-08-19）：因子池扩展——日线衍生因子（复用上证日K零请求）+
+    # 分钟级因子（m5×48 当日全量，腾讯 ifzq 源）。均为影子维度。
+    daily_factors = calc_daily_derived_factors(sh_kline)
+    minute = fetch_minute_kline(INDEXES["上证指数"].get("tencent") or "sh000001", "m5", 48)
+    minute_factors = calc_minute_factors(minute)
 
     # P5-3（2026-08-19）：数据健康度——各源成功与否（空结果=源失败/无数据）。
     # 机构级清洗的标志：不只拿数据，还知道自己在用什么、缺了什么；
@@ -2025,6 +2186,7 @@ def run_once(push: bool) -> dict:
         "波动率": any(isinstance(v, dict) and v.get("available") for v in vol.values()),
         "风格轮动": bool(style), "涨停情绪": bool(sentiment), "行业资金流": bool(sector_flows),
         "资金面利率": bool(liquidity), "期权PCR": bool(option),
+        "分钟K线": bool(minute),
     }
     health = {"ok": sum(sources_ok.values()), "total": len(sources_ok)}
     health["ratio"] = round(health["ok"] / health["total"], 2) if health["total"] else 0.0
@@ -2119,7 +2281,9 @@ def run_once(push: bool) -> dict:
         analysis = _direction_analysis(tech, basis, fx, risk_state, new_history,
                                        vol=vol, breadth=breadth,
                                        weights=(factor_ic or {}).get("weights") or {},
-                                       liquidity=liquidity, option=option)
+                                       liquidity=liquidity, option=option,
+                                       daily_factors=daily_factors,
+                                       minute_factors=minute_factors)
         if factor_ic.get("weights"):
             analysis["ic_n"] = factor_ic.get("n")
         # P4-6：方向历史落盘（每交易日一条，当日盘中多轮覆盖取最新），供后续 IC 回测；

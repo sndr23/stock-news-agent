@@ -227,9 +227,11 @@ class TestDirectionAnalysisSixDims:
     def test_six_dims_present(self):
         a = self._run()
         names = [d[0] for d in a["factors"]]
-        # P7 影子维度（流动性/期权情绪）恒定追加在 6 主维度之后
+        # P7 影子（流动性/期权情绪）+ P8 影子（日线衍生 5 + 分钟 2）恒定追加在 6 主维度后
         assert names == ["对冲", "风险", "量价", "汇率", "波动率", "宽度",
-                         "流动性", "期权情绪"]
+                         "流动性", "期权情绪",
+                         "动量(20日)", "反转(5日)", "均线结构", "量价配合", "跳空缺口",
+                         "盘中动量", "短线动能"]
         assert a["shadow"] == set()  # 无数据时影子维度全 0 分不标注
 
     def test_high_vol_votes_bearish(self):
