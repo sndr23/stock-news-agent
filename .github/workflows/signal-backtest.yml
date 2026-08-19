@@ -1,0 +1,68 @@
+# filepath: .github/workflows/signal-backtest.yml
+name: 信号质量回测报告
+
+# P2-3（2026-08-19）：信号有效性回测 + 质量报告。
+#   已推事件（pushed_events，含 LLM 方向标注）vs 后 1/3/5 日实际行情 → 方向一致率。
+#   用途：验证"利好买、利空卖"推送口径的实际有效性，一致率持续 <50% 时收紧阈值。
+#
+# 频率：每周六 09:30（UTC 周六 01:30）—— 后5日收益需要完整交易日，
+#   周末运行样本最全；报告对延迟不敏感，用 GitHub 自带 cron 即可。
+#   周内也可 workflow_dispatch 手动触发。
+on:
+  schedule:
+    - cron: "30 1 * * 6"   # 北京时间 周六 09:30
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "回测窗口天数"
+        required: false
+        default: "60"
+        type: string
+
+concurrency:
+  group: signal-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # 回测需读 Gist 中的 pushed_events（云端容器无本地状态）+ 推送报告摘要
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 执行回测并推送报告
+        run: python scripts/signal_backtest.py --push --days ${{ github.event.inputs.days || '60' }}
+
+      - name: 上传报告与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-backtest-${{ github.run_id }}
+          path: |
+            logs/signal_quality_report.md
+            logs/
+          retention-days: 30
+          if-no-files-found: ignore
