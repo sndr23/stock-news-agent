@@ -480,6 +480,21 @@ class TestBacktest:
         assert "利多组" in report
         assert "明细" in report
 
+    def test_report_cold_start_note(self, monkeypatch):
+        """0 可评估样本时报告头部标注冷启动，防误读为回测结论"""
+        monkeypatch.setattr(sb, "_resolve_symbol", lambda name, cache: "")
+        monkeypatch.setattr(sb, "_fetch_kline", lambda symbol, lmt=120: _klines([1, 2, 3]))
+        # 全部事件无 dir → evaluated=0
+        events = [{"dir": "", "scope": "market", "stocks": [],
+                   "title_norm": "无方向", "sectors": [], "t": "2026-08-01 10:00:00"}]
+        summary = sb.backtest(events, days=30)
+        assert summary["evaluated"] == 0
+        report = sb.build_report(summary)
+        assert "样本冷启动中" in report
+        # 有可评估样本时不出现该标注
+        summary2 = sb.backtest(self._events(), days=30)
+        assert "样本冷启动中" not in sb.build_report(summary2)
+
 
 class TestResolveSymbol:
     def test_exact_name_match(self, monkeypatch):

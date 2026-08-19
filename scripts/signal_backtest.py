@@ -397,6 +397,14 @@ def build_report(summary: dict) -> str:
                  f"可评估 {s['evaluated']} 条（跳过 {sum(s['skipped'].values())} 条）")
     if s["skipped"]:
         lines.append("跳过原因: " + "、".join(f"{k} {v}" for k, v in s["skipped"].items()))
+    # 0 可评估时明确标注冷启动，防止"无数据"被误读为"回测通过/不通过"。
+    # dir 字段 2026-08-19 才上线（P0-3），此前历史事件无方向标注；
+    # 冷启动期需按强档推送节奏积累，约 2-4 周后分组比率才有统计意义。
+    if s["evaluated"] == 0:
+        lines.append("")
+        lines.append("> ⏳ **样本冷启动中**: 暂无可评估样本，一致率结论待积累。"
+                     "dir 字段为 2026-08-19 上线，历史已推事件无方向标注；"
+                     "上线后的新推送会自动带 dir 标注进入回测。")
     lines.append("")
     lines.append("## 总体一致率（推送方向 vs 后 N 日行情）")
     lines.append("")
