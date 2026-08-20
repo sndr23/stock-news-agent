@@ -65,6 +65,113 @@ _DIR_GROUP = {"bullish": "利多", "mildly_bullish": "利多",
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+# P11（2026-08-21）因子注册表——QLib 因子注册机制的轻量落地。
+# 集中描述每个方向因子维度的元数据，供 compute_layer_ic 分层单调性检验
+# 与后续因子池管理共用。当前系统为时序择时（离散 -1/0/+1 打分，非截面连续值），
+# 故不搬 Alphalens 的截面分组 API，只借鉴其"分档→单调性→多空差"检验思路。
+# 上线路径：因子先落 direction_history 供 IC 累积，达标后移入 dims 正式参与合成。
+FACTOR_REGISTRY = {
+    "对冲": {"kind": "hedge", "levels": (-1, 0, 1),
+             "note": "IC/IM 贴水：收敛=利好多头，走扩=利空"},
+    "风险": {"kind": "risk", "levels": (-1, 0),
+             "note": "risk_state：neutral=0，risk_off=-1（风险收缩利空）"},
+    "量价": {"kind": "price", "levels": (-1, 0, 1),
+             "note": "上证/创业板放量突破=+1，破位=-1"},
+    "汇率": {"kind": "macro", "levels": (-1, 0, 1),
+             "note": "美元/日元单日波动≥1.5%：日元急升(汇率跌)=-1，急贬=+1"},
+    "波动率": {"kind": "risk", "levels": (-1, 0),
+              "note": "任一核心指数高波=-1（机构降杠杆），正常/低波=0"},
+    "宽度": {"kind": "breadth", "levels": (-1, 0, 1),
+             "note": "极端普跌(≥80%个股跌)=-1，普涨(≤20%跌)=+1，其余=0"},
+    "流动性": {"kind": "shadow", "levels": (0, 1), "is_shadow": True,
+               "note": "GC007 资金面：平稳=0（P7 影子，达标升级）"},
+    "期权情绪": {"kind": "shadow", "levels": (0, 1), "is_shadow": True,
+                "note": "PCR 强度（P7 影子，达标升级）"},
+}
+
+
+def compute_layer_ic(direction_history: dict, index_closes: list = None) -> dict:
+    """分层 IC 单调性检验（P11，Alphalens 方法的时序择时落地）
+
+    目标：暴露"整体 IC 方向对、但分层强度失灵"的非线性因子。
+    因子分数落在离散档位（如 -1/0/+1），按档位聚合事件后 N 日收益均值，
+    检验"因子档位越高 → 收益是否越好"的单调性（Spearman），并算多空差。
+
+    输入/口径与 compute_factor_ic 完全一致（share 同一 K 线/方向历史），
+    调用方复用已拉取指数 K 线零额外请求，缺省现场拉取。
+    返回 {"n": 配对天数, "layers": {维度: 明细}, "updated"}；样本 < MIN_IC_DAYS
+    返回 {"n": n}（样本不足不下结论，与 IC 口径一致）。
+    """
+    if not direction_history:
+        return {"n": 0}
+    if index_closes is None:
+        index_closes = _fetch_kline(MARKET_INDEX["symbol"], 160)
+    if not index_closes:
+        return {"n": 0}
+    ret = {}
+    for i in range(len(index_closes) - 1):
+        c0, c1 = index_closes[i]["close"], index_closes[i + 1]["close"]
+        if c0:
+            ret[index_closes[i]["date"]] = (c1 / c0 - 1) * 100
+    # 维度 → {档位: [次日收益%]}；n 为参与配对的天数
+    buckets = {}
+    n = 0
+    for day in sorted(direction_history):
+        r = ret.get(day)
+        if r is None:
+            continue
+        rec = direction_history[day] or {}
+        facs = rec.get("factors") or {}
+        n += 1
+        for dim, s in facs.items():
+            if isinstance(s, (int, float)):
+                bucket = buckets.setdefault(dim, {})
+                bucket.setdefault(float(s), []).append(r)
+    if n < MIN_IC_DAYS:
+        return {"n": n}
+    layers = {}
+    for dim, by_level in sorted(buckets.items()):
+        levels = sorted(by_level)
+        if len(levels) < 2:
+            continue  # 仅单一档位无法检验单调性
+        means = [(lv, sum(v) / len(v)) for lv, v in by_level.items()]
+        xs = [m[0] for m in means]
+        ys = [m[1] for m in means]
+        mono = round(_spearman(xs, ys), 3)
+        farmost = by_level[levels[-1]]  # 最高档
+        lowmost = by_level[levels[0]]   # 最低档
+        ls = sum(farmost) / len(farmost)
+        lo = sum(lowmost) / len(lowmost)
+        layers[dim] = {
+            "levels": {str(lv): {"n": len(v), "mean_ret": round(sum(v) / len(v), 3)}
+                       for lv, v in by_level.items()},
+            "monotonic": mono,
+            "spread": round(ls - lo, 3),        # 多空差：最高档收益 − 最低档收益
+            "high_low": round(ls, 3),            # 最高档绝对收益（>0 = 高层有正收益）
+            "verdict": _layer_verdict(mono, len(by_level), ls - lo),
+        }
+    return {"n": n, "layers": layers, "updated": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+def _layer_verdict(mono: float, n_levels: int, spread: float = 0.0) -> str:
+    """分层单调性判定：多档+强单调→有效；2 档时 Spearman 易被对称抵消，
+    改由多空差(spread)补充分辨——spread 显著为正且高层收益为正即弱有效。
+    """
+    if n_levels >= 3:
+        if mono >= 0.5:
+            return "有效"
+        if mono >= 0.3:
+            return "弱有效"
+        if mono <= -0.3:
+            return "反向外推（放大即反向）"
+        return "无单调"
+    # 双档：Spearman 仅 2 点代表性弱，用 spread 方向裁决
+    if spread > 0.5:
+        return "弱有效"
+    if spread < -0.5:
+        return "反向外推（放大即反向）"
+    return "无单调"
+
 
 # ============================================================
 # 数据源
@@ -112,7 +219,6 @@ def _fetch_kline(symbol: str, lmt: int = 120) -> list:
     text = _http_get(
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
         params=params,
-        headers={"Referer": "http://finance.sina.com.cn", **_HEADERS},
     )
     if not text:
         return []
