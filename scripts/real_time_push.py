@@ -1781,10 +1781,49 @@ def _load_factor_risk_state() -> str:
 _FACTOR_ENV_MAX_AGE_HOURS = 48
 
 
+# P10（2026-08-20）风险档位判定阈值：中性状态下的警戒信号组合
+_WARN_MAIN_OUTFLOW_YI = 500   # 主力净流出警戒（亿元）
+_WARN_GC007 = 3.0            # 资金面利率警戒（%）
+_WARN_PCR = 1.5              # 期权恐慌警戒
+
+# 指数显示简称（环境行紧凑用）
+_INDEX_SHORT = {"上证指数": "上证", "创业板指": "创业板"}
+
+
+def _market_risk_grade(snapshot: dict) -> str:
+    """风险档位（三档，始终显示）：🔴风险收缩 / 🟡警戒 / 🟢中性
+
+    P10（2026-08-20）：此前 risk_state 仅 risk_off 时显示"⚠️风险收缩期"、
+    neutral 静默——用户看到一堆数字却不知综合是安全还是危险。
+    现拆三档：risk_off=收缩；neutral 但命中任一警戒信号（高波/极端普跌/
+    主力大额流出/资金面收紧/期权恐慌）=警戒；否则=中性。
+    """
+    if snapshot.get("risk_state") == "risk_off":
+        return "🔴风险收缩"
+    if any(isinstance(v, dict) and v.get("regime") == "高波"
+           for v in (snapshot.get("vol") or {}).values()):
+        return "🟡警戒"
+    dp = (snapshot.get("breadth") or {}).get("down_pct")
+    if isinstance(dp, (int, float)) and dp >= 80:
+        return "🟡警戒"
+    mn = (snapshot.get("flows") or {}).get("main_net_yi")
+    if isinstance(mn, (int, float)) and mn <= -_WARN_MAIN_OUTFLOW_YI:
+        return "🟡警戒"
+    gc = ((snapshot.get("liquidity") or {}).get("gc007") or {}).get("price")
+    if isinstance(gc, (int, float)) and gc >= _WARN_GC007:
+        return "🟡警戒"
+    pcr = (snapshot.get("option") or {}).get("pcr")
+    if isinstance(pcr, (int, float)) and pcr >= _WARN_PCR:
+        return "🟡警戒"
+    return "🟢中性"
+
+
 def _factor_env_line(snapshot: dict, now: datetime = None) -> str:
     """把因子快照压成单行"市场环境"（附在资讯推送卡片，P0-1 融合展示）
 
-    格式示例：**市场环境**(08-19 14:30): ⚠️风险收缩期 | IC -0.52% IM -0.83% | 美元/日元 +0.83% | 上证 -0.50%
+    P10（2026-08-20）重构：①风险档位三档始终显示（🔴收缩/🟡警戒/🟢中性）
+    ②补创业板指（与上证并列）③情绪档位/GC007/期权PCR 始终显示（极端值加⚠）
+    ④市场宽度始终显示（跌X%）——此前仅极端/风险态才显示，用户无法判断常态。
 
     快照缺失/字段空/超过 48h 过期 → 返回 ""（推送退化为原格式，不带该行）。
     """
@@ -1802,8 +1841,6 @@ def _factor_env_line(snapshot: dict, now: datetime = None) -> str:
         return ""
 
     parts = []
-    if snapshot.get("risk_state") == "risk_off":
-        parts.append("⚠️风险收缩期")
     basis = snapshot.get("basis") or {}
     basis_parts = []
     for code in ("IC", "IM"):
@@ -1818,47 +1855,53 @@ def _factor_env_line(snapshot: dict, now: datetime = None) -> str:
     if isinstance(jpy.get("change_pct"), (int, float)):
         parts.append(f"美元/日元 {jpy['change_pct']:+.2f}%")
     indexes = snapshot.get("indexes") or {}
-    sh = indexes.get("上证指数") or {}
-    if isinstance(sh.get("change_pct"), (int, float)):
-        arrow = "▲" if sh["change_pct"] >= 0 else "▼"
-        parts.append(f"上证 {arrow}{sh['change_pct']:+.2f}%")
+    idx_parts = []
+    for ix_name in ("上证指数", "创业板指"):
+        ix = indexes.get(ix_name) or {}
+        if isinstance(ix.get("change_pct"), (int, float)):
+            arrow = "▲" if ix["change_pct"] >= 0 else "▼"
+            idx_parts.append(f"{_INDEX_SHORT[ix_name]}{arrow}{ix['change_pct']:+.2f}%")
+    if idx_parts:
+        parts.append(" ".join(idx_parts))
     # P1-3（2026-08-19）：两市主力净流入（快照无 flows 键时省略，旧快照兼容）
     flows = snapshot.get("flows") or {}
     mn = flows.get("main_net_yi")
     if isinstance(mn, (int, float)) and mn != 0:
         parts.append(f"主力{'净流入' if mn > 0 else '净流出'}{abs(mn):.0f}亿")
-    # P3（2026-08-19）：隔夜外盘（AI硬件链先行指标）+ 高波状态 + 极端宽度
+    # P3（2026-08-19）：隔夜外盘（AI硬件链先行指标）
     gq = snapshot.get("global") or {}
     for g_name in ("纳斯达克100", "英伟达"):
         g = gq.get(g_name) or {}
         if isinstance(g.get("change_pct"), (int, float)):
             flag = "⚠️" if abs(g["change_pct"]) >= 2.0 else ""
             parts.append(f"{flag}隔夜{g_name.replace('纳斯达克100', '纳指')}{g['change_pct']:+.2f}%")
-    for _, v in (snapshot.get("vol") or {}).items():
-        if isinstance(v, dict) and v.get("regime") == "高波":
-            parts.append("⚠️高波")
-            break
-    breadth = snapshot.get("breadth") or {}
-    dp = breadth.get("down_pct")
-    if isinstance(dp, (int, float)) and dp >= 80:
-        parts.append(f"⚠️普跌{dp:.0f}%")
-    # P4（2026-08-19）：涨停情绪档位（仅极端档上环境行，保持单行紧凑）
+    # 市场宽度（P10 始终显示：跌X%）
+    dp = (snapshot.get("breadth") or {}).get("down_pct")
+    if isinstance(dp, (int, float)):
+        flag = "⚠️" if dp >= 80 else ""
+        parts.append(f"{flag}跌{dp:.0f}%")
+    # 涨停情绪档位（P10 始终显示，亢奋/冰点加 emoji）
     mood = (snapshot.get("sentiment") or {}).get("mood")
-    if mood == "亢奋":
-        parts.append("🔥情绪亢奋")
-    elif mood == "冰点":
-        parts.append("❄️情绪冰点")
-    # P7（2026-08-19）：资金面收紧 / 期权恐慌（仅极端值上环境行；GC007≥3%、PCR≥1.5）
-    liq = snapshot.get("liquidity") or {}
-    gc = liq.get("gc007") or {}
-    if isinstance(gc.get("price"), (int, float)) and gc["price"] >= 3.0:
-        parts.append(f"⚠️GC007 {gc['price']:.2f}%")
-    opt = snapshot.get("option") or {}
-    if isinstance(opt.get("pcr"), (int, float)) and opt["pcr"] >= 1.5:
-        parts.append(f"⚠️期权恐慌 PCR {opt['pcr']:.2f}")
+    if mood:
+        emoji = "🔥" if mood == "亢奋" else ("❄️" if mood == "冰点" else "")
+        parts.append(f"{emoji}情绪{mood}")
+    # 资金面利率 GC007（P10 始终显示，≥3% 加⚠）
+    gc = ((snapshot.get("liquidity") or {}).get("gc007") or {})
+    if isinstance(gc.get("price"), (int, float)):
+        tight = gc["price"] >= _WARN_GC007
+        parts.append(f"{'⚠️' if tight else ''}GC007 {gc['price']:.2f}%")
+    # 期权情绪 PCR（P10 始终显示，≥1.5 加⚠）
+    pcr = (snapshot.get("option") or {}).get("pcr")
+    if isinstance(pcr, (int, float)):
+        pcr_mood = "恐慌" if pcr >= 1.3 else ("看涨" if pcr <= 0.55 else "中性")
+        parts.append(f"{'⚠️' if pcr >= _WARN_PCR else ''}PCR {pcr:.2f}({pcr_mood})")
+    # 高波状态（仅命中时显示）
+    if any(isinstance(v, dict) and v.get("regime") == "高波"
+           for v in (snapshot.get("vol") or {}).values()):
+        parts.append("⚠️高波")
     if not parts:
         return ""
-    return f"**市场环境**({ts}): " + " | ".join(parts)
+    return f"**市场环境**({ts}): {_market_risk_grade(snapshot)} | " + " | ".join(parts)
 
 
 def _llm_env_context(snapshot: dict, now: datetime = None) -> str:

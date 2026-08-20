@@ -307,14 +307,14 @@ class TestPushDisplayIntegration:
         assert "隔夜纳指-1.68%" in line
         assert "⚠️隔夜英伟达-2.34%" in line
         assert "⚠️高波" in line
-        assert "⚠️普跌92%" in line
+        assert "⚠️跌92%" in line  # P10：宽度统一为"跌X%"
 
     def test_factor_env_line_without_new_keys(self):
         snap = _sample_snapshot()
         for k in ("global", "breadth", "vol"):
             snap.pop(k)
         line = rtp._factor_env_line(snap)
-        assert "纳指" not in line and "高波" not in line and "普跌" not in line
+        assert "纳指" not in line and "高波" not in line and "跌" not in line
 
     def test_llm_env_context_new_dims(self):
         ctx = rtp._llm_env_context(_sample_snapshot())

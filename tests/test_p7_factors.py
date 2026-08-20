@@ -299,15 +299,16 @@ class TestRealtimePushDisplay:
     def test_env_line_pcr_extreme(self):
         line = rtp._factor_env_line(_snap_with({
             "option": {"pcr": 1.55, "call_vol": 100, "put_vol": 155}}))
-        assert "⚠️期权恐慌 PCR 1.55" in line
+        assert "⚠️PCR 1.55(恐慌)" in line  # P10：PCR 始终显示 + 情绪标注
 
-    def test_env_line_calm_values_omitted(self):
+    def test_env_line_calm_values_shown(self):
+        """P10：平静的 GC007/PCR 也始终显示（不带⚠），风险档位为中性"""
         line = rtp._factor_env_line(_snap_with({
             "liquidity": {"gc007": {"price": 1.425, "change_pct": 1.0}},
             "option": {"pcr": 0.85}}))
-        assert "GC007" not in line
-        assert "PCR" not in line
-        assert line == ""  # 无其他内容时环境行整体省略
+        assert "GC007 1.43%" in line
+        assert "PCR 0.85(中性)" in line
+        assert "🟢中性" in line
 
     def test_llm_env_context_liquidity_and_option(self):
         ctx = rtp._llm_env_context(_snap_with({

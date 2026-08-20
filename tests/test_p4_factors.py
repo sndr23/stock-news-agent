@@ -299,11 +299,11 @@ class TestRealtimePushP4Display:
         line = rtp._factor_env_line(snap)
         assert "❄️情绪冰点" in line
 
-    def test_env_line_normal_mood_omitted(self):
-        snap = _sample_snapshot()  # mood=低迷，非极端档不上环境行
+    def test_env_line_normal_mood_shown(self):
+        snap = _sample_snapshot()  # mood=低迷
         line = rtp._factor_env_line(snap)
-        assert "情绪" not in line
-        assert "市场环境" in line  # 其余因子照常
+        assert "情绪低迷" in line  # P10：情绪档位始终显示
+        assert "市场环境" in line
 
     def test_llm_context_sentiment_and_sector_flows(self):
         ctx = rtp._llm_env_context(_sample_snapshot())

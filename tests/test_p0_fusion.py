@@ -88,16 +88,52 @@ class TestFactorEnvLine:
     def test_full_snapshot(self):
         line = rtp._factor_env_line(_sample_snapshot())
         assert "市场环境" in line
-        assert "⚠️风险收缩期" in line
+        assert "🔴风险收缩" in line
         assert "IC -0.52%" in line and "IM -0.83%" in line
         assert "美元/日元 +0.83%" in line
-        assert "上证 ▼-0.50%" in line
+        assert "上证▼-0.50%" in line
+        assert "创业板▲+0.45%" in line  # P10：创业板指并列显示
 
-    def test_neutral_risk_omits_warning(self):
+    def test_neutral_risk_shows_grade(self):
+        """P10：neutral 也显示风险档位（🟢中性），不再静默"""
         snap = _sample_snapshot()
         snap["risk_state"] = "neutral"
         line = rtp._factor_env_line(snap)
+        assert "🟢中性" in line
         assert "风险收缩" not in line
+
+    def test_alert_grade_on_warning_signals(self):
+        """P10：neutral 但命中警戒信号（主力大额流出）→ 🟡警戒"""
+        snap = _sample_snapshot()
+        snap["risk_state"] = "neutral"
+        snap["flows"] = {"main_net_yi": -600}
+        line = rtp._factor_env_line(snap)
+        assert "🟡警戒" in line
+
+    def test_alert_grade_on_high_vol(self):
+        """P10：高波 → 🟡警戒"""
+        snap = _sample_snapshot()
+        snap["risk_state"] = "neutral"
+        snap["vol"] = {"上证指数": {"regime": "高波", "vol20": 25.0}}
+        line = rtp._factor_env_line(snap)
+        assert "🟡警戒" in line
+        assert "⚠️高波" in line
+
+    def test_p10_always_show_factors(self):
+        """P10：情绪/GC007/PCR/宽度 始终显示（不再仅极端值触发）"""
+        snap = _sample_snapshot()
+        snap["risk_state"] = "neutral"
+        snap["flows"] = {"main_net_yi": -78}
+        snap["breadth"] = {"down_pct": 45.0}
+        snap["sentiment"] = {"mood": "中性"}
+        snap["liquidity"] = {"gc007": {"price": 1.85}}
+        snap["option"] = {"pcr": 0.9}
+        line = rtp._factor_env_line(snap)
+        assert "跌45%" in line
+        assert "情绪中性" in line
+        assert "GC007 1.85%" in line
+        assert "PCR 0.90(中性)" in line
+        assert "主力净流出78亿" in line
 
     def test_missing_or_empty_returns_empty(self):
         assert rtp._factor_env_line(None) == ""
