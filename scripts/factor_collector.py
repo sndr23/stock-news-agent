@@ -168,11 +168,41 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 }
 
+# P9（2026-08-20）UA 轮换池：借鉴 stock-sdk（github.com/chengzuopeng/stock-sdk）
+# userAgentPool 的治理思路——固定 UA 的脚本化请求易被数据源识别为爬虫
+# （2026-08-14 东财 push2his 反爬 RemoteDisconnected 实证的根因之一），
+# 轮换浏览器 UA 降低单来源识别风险。仅 Node 端有效同理，此处仅 Python 端使用。
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+]
+_ua_index = [0]
 
-def _http_get(url: str, params: dict = None, headers: dict = None, encoding: str = None) -> str:
-    """GET 并返回文本；异常统一返回空串（上层判空）"""
+
+def _get_ua() -> str:
+    """轮换取 UA（round-robin；单进程内轮换，跨轮次随机性由请求频率稀释）"""
+    ua = _UA_POOL[_ua_index[0] % len(_UA_POOL)]
+    _ua_index[0] += 1
+    return ua
+
+
+def _http_get(url: str, params: dict = None, headers: dict = None, encoding: str = None,
+              rotate_ua: bool = True) -> str:
+    """GET 并返回文本；异常统一返回空串（上层判空）
+
+    rotate_ua（P9）：默认 True，每请求轮换浏览器 UA（防固定 UA 被数据源
+    识别为脚本）；传 False 保留调用方指定 UA（如新浪系需 Referer 时）。
+    """
     try:
-        r = requests.get(url, params=params, headers=headers or _HEADERS, timeout=10)
+        hdrs = dict(headers or _HEADERS)
+        if rotate_ua:
+            hdrs["User-Agent"] = _get_ua()
+        r = requests.get(url, params=params, headers=hdrs, timeout=10)
         if encoding:
             r.encoding = encoding
         return r.text or ""
@@ -278,15 +308,121 @@ def _fetch_kline_tencent(symbol: str, lmt: int) -> list:
     return out
 
 
+def _em_secid(symbol: str) -> str:
+    """sina/腾讯格式 symbol → 东财 secid（P9）
+
+    规则（与 stock-sdk toEastmoneySecid 的 CN 映射一致）：沪市前缀 1.、深市 0.。
+    入参如 sh000001 / sz399006 / sh600183 / sz300308；无法识别返回 ""。
+    """
+    s = str(symbol or "").strip().lower()
+    if s.startswith("sh"):
+        return f"1.{s[2:]}"
+    if s.startswith("sz"):
+        return f"0.{s[2:]}"
+    return ""
+
+
+# 东财 push2his 多主机池（P9）：主域 + 数字前缀 CDN 域。
+# 单个主机被限流/熔断时轮换下一台（stock-sdk fallback 机制同思路）。
+_EM_KLINE_HOSTS = [
+    "https://push2his.eastmoney.com",
+    "https://7.push2his.eastmoney.com",
+    "https://33.push2his.eastmoney.com",
+    "https://63.push2his.eastmoney.com",
+    "https://91.push2his.eastmoney.com",
+]
+# 东财公开接口的 ut 参数（各公开项目通用，非私有凭据）
+_EM_KLINE_UT = "7eea3edcaed734bea9cbfc24409ed989"
+
+
+def _fetch_kline_em(symbol: str, lmt: int, adjust: int = 0) -> list:
+    """东财指数/个股日K（P9 新增第三冗余源）→ 统一 {date, open, close, high, low, volume}
+
+    2026-08-14 实测裸请求被反爬（RemoteDisconnected），本函数按 stock-sdk 治理
+    思路：UA 轮换 + 多主机 fallback + 重试。fields2 取 f51-f56 即可（量/额）。
+    volume 单位=手，×100 转"股"与新浪口径一致（同腾讯降级函数）。
+    fqt: 0=不复权 1=前复权 2=后复权（因子计算用不复权，与新浪口径一致；
+    回测如需复权数据可传 fqt=1/2）。
+
+    注意：东财 kline/get 的 lmt 参数不生效（beg/end 全量模式下忽略），
+    实测 beg=0&end=20500000 返回全量（上证 8708 根 ≈ 1MB+，云端多指数会浪费
+    流量与 IO）。故 beg 用「今日往前推 3×lmt 天」近似窗口（日K约 1.4 交易日/自然日，
+    3 倍留足节假日/停牌冗余），请求后本地截取尾部 lmt 根保证准确。
+
+    Returns:
+        [{date, open, close, high, low, volume}] 升序；全部失败返回 []
+    """
+    secid = _em_secid(symbol)
+    if not secid:
+        logger.warning(f"东财K线: 无法识别 symbol={symbol}")
+        return []
+    today = datetime.now().strftime("%Y%m%d")
+    beg_d = (datetime.now() - timedelta(days=max(lmt * 3, 60))).strftime("%Y%m%d")
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56",
+        "ut": _EM_KLINE_UT,
+        "klt": "101",           # 日K
+        "fqt": str(adjust),     # 复权
+        "secid": secid,
+        "beg": beg_d,
+        "end": today,
+        "lmt": str(lmt),        # 上游忽略，本地截取兜底
+    }
+    last_err = ""
+    for host in _EM_KLINE_HOSTS:
+        text = _http_get(f"{host}/api/qt/stock/kline/get", params=params)
+        if not text:
+            last_err = "empty"
+            logger.debug(f"东财K线 {symbol} 主机 {host} 失败，换下一台")
+            continue
+        try:
+            data = json.loads(text)
+            klines = (data.get("data") or {}).get("klines") or []
+        except (ValueError, AttributeError):
+            last_err = "parse"
+            logger.debug(f"东财K线 {symbol} 主机 {host} 解析失败，换下一台")
+            continue
+        if not klines:
+            last_err = "empty-k"
+            continue
+        out = []
+        for line in klines:
+            parts = str(line).split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                out.append({
+                    "date": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "high": float(parts[3]),
+                    "low": float(parts[4]),
+                    "volume": float(parts[5]) * 100,  # 手 → 股
+                })
+            except (ValueError, TypeError):
+                continue
+        if out:
+            return out[-lmt:]  # 本地截取尾部 N 根（上游忽略 lmt）
+        last_err = "no-rows"
+    logger.warning(f"东财K线全部主机失败 {symbol} (lmt={lmt}, err={last_err})")
+    return []
+
+
 def fetch_index_kline(symbol: str, lmt: int = 65) -> list:
     """指数日K → [{date, open, close, high, low, volume}]，升序（volume 单位=股）
 
-    新浪优先，失败降级腾讯（2026-08-14 P1：消除单点依赖，东财已反爬不可用）。
+    三冗余降级链（P9 2026-08-20）：新浪优先 → 腾讯 → 东财（新增）。
+    2026-08-14 东财裸请求被反爬，现按 stock-sdk 治理思路（UA 轮换 + 多主机
+    fallback）解锁作为第三冗余，消除新浪/腾讯双点依赖。
     """
     out = _fetch_kline_sina(symbol, lmt)
     if not out:
         logger.warning(f"新浪K线失败，降级腾讯: {symbol}")
         out = _fetch_kline_tencent(symbol, lmt)
+    if not out:
+        logger.warning(f"腾讯K线失败，降级东财: {symbol}")
+        out = _fetch_kline_em(symbol, lmt)
     return out
 
 
@@ -697,15 +833,21 @@ def fetch_option_pcr(max_pages: int = 12) -> dict:
 
 def fetch_minute_kline(symbol: str = "sh000001", period: str = "m5",
                        count: int = 48) -> list:
-    """分钟级 K 线（P8 2026-08-19）：腾讯 ifzq mkline，盘中因子的数据底座
+    """分钟级 K 线（P8 2026-08-19 / P9 加固）：腾讯 ifzq mkline，盘中因子的数据底座
 
     数据源 https://ifzq.gtimg.cn/appstock/app/kline/mkline（与指数行情同域族，
     实测本地/云端均可用）。字段顺序 [时间YYYYMMDDHHmm, 开, 收, 高, 低, 量, {}]。
     默认 m5×48 根 = 当日全量 4 小时交易时段；返回升序 [{time,open,close,high,low,volume}]，
     失败返回 []（分钟因子缺省 0 分，不影响主流程）。
+
+    P9（2026-08-20）：实测该接口对短时间连续请求有瞬时限流（空响应），
+    空结果时 1s 后重试一次再放弃——盘中 15 分钟轮询叠加手动/测试调用时更稳。
     """
-    text = _http_get(
-        f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={symbol},{period},,{count}")
+    url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={symbol},{period},,{count}"
+    text = _http_get(url)
+    if not text:
+        time.sleep(1)  # 腾讯 ifzq 瞬时限流兜底
+        text = _http_get(url)
     if not text:
         return []
     try:
