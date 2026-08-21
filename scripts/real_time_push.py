@@ -2244,16 +2244,40 @@ def format_push_alert(news: dict, judge: dict, factor_env: str = "", opposite_no
 
 
 def _send_alert_item(push_config: dict, title: str, content: str) -> dict:
-    """统一推送入口：按配置选择后端发送单条快讯
+    """统一推送入口：按配置选择后端发送单条快讯，主后端失败时跨后端故障转移
 
     后端优先级: PushPlus > 企业微信群机器人
     成功判定: PushPlus code==200; 企业微信 errcode==0
+    主后端失败且配置了备用后端时，自动转移到备用后端补齐（避免单后端故障丢推）。
     """
+    backends = []
     if push_config.get("pushplus_token"):
-        return push_via_pushplus(push_config["pushplus_token"], title, content)
+        backends.append(("pushplus", lambda: push_via_pushplus(
+            push_config["pushplus_token"], title, content)))
     if push_config.get("wecom_webhook"):
-        return push_via_wecom(push_config["wecom_webhook"], title, content)
-    return {"code": 400, "msg": "未配置任何推送后端"}
+        backends.append(("wecom", lambda: push_via_wecom(
+            push_config["wecom_webhook"], title, content)))
+    if not backends:
+        return {"code": 400, "msg": "未配置任何推送后端"}
+
+    last = None
+    for name, fn in backends:
+        try:
+            result = fn()
+        except Exception as e:
+            result = None
+            logger.error(f"推送后端 {name} 异常: {e}")
+        if result is None:
+            result = {"code": -1, "errcode": -1, "msg": f"{name} 返回空/异常结果"}
+        is_ok = (name == "pushplus" and result.get("code") == 200) or \
+                (name == "wecom" and result.get("errcode") == 0)
+        if is_ok:
+            if last is not None:
+                logger.info(f"推送故障转移成功: 主端失败后经 {name} 补齐")
+            return result
+        last = result
+        logger.warning(f"推送后端 {name} 失败，尝试故障转移: {result}")
+    return last
 
 
 # ============================================================
@@ -2453,6 +2477,11 @@ def run_once(dry_run: bool = False) -> dict:
         reps.append(best)
         for n, _j in g["items"]:
             if n is not best[0]:
+                # 挂起条目（LLM 未判定，judged=False）不落 seen：若在此写
+                # seen[pushed=False] 会违背"未判定不落指纹、下轮重试"核心策略——
+                # 该源的这条资讯将永久不再被尝试判定/推送。
+                if not _j.get("judged", True):
+                    continue
                 seen[n["_fp"]] = {"t": now, "pushed": False,
                                   "title": str(n.get("title", ""))[:52] + "[同事件合并]"}
                 skipped += 1

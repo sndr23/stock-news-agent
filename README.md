@@ -5,7 +5,8 @@
 ## 快速开始
 
 - **完整部署教程（7 步，约 10 分钟）**：见 [docs/实时推送使用说明.md](docs/实时推送使用说明.md)
-- **当前唯一生产入口**：`python scripts/real_time_push.py`（单次）/ `--loop`（本地常驻）/ `--dry-run`（诊断）
+- **实时资讯推送入口**：`python scripts/real_time_push.py`（单次）/ `--loop`（本地常驻）/ `--dry-run`（诊断）
+- **其余生产入口**（量化因子采集 / 信号回测 / 中信持仓日报）：见下表模块「状态」列
 - **云端调度**：cron-job.org 每 30 分钟触发 GitHub Actions（`.github/workflows/realtime-push.yml`）
 
 ## 架构
@@ -31,6 +32,9 @@
 | `src/tools/keyword_tables.py` | 共享关键词表（单一事实来源）+ 英文缩写词边界匹配 | ✅ |
 | `src/tools/push.py` | PushPlus/企业微信/WxPusher 三后端 + 重试 | ✅ |
 | `src/llm_client.py` | LLM 调用与 JSON 容错解析（共享客户端） | ✅ 2026-08-06 抽取 |
+| `scripts/factor_collector.py` | 量化因子采集/方向合成/异动推送（P0–P12，含 IC 验证） | ✅ 生产（realtime-factor） |
+| `scripts/signal_backtest.py` | 已推事件信号质量回测（后 1/3/5 日一致性 + 分层 IC） | ✅ 生产（signal-backtest） |
+| `scripts/push_citic_futures_pos.py` | 中信期货 IF/IH/IC/IM 净持仓日报（全合约聚合口径，Gist 去重） | ✅ 生产（citic-pos-push） |
 | `src/agent/` | LangGraph 批处理管线（历史汇总报告引擎） | ⚠️ DEPRECATED，无生产入口 |
 | `daily-review/` | 每日技术面复盘报告（本地生成 HTML） | ⚠️ 独立辅助功能，不入库 |
 
@@ -47,10 +51,14 @@
 ## 测试
 
 ```bash
-python -m pytest tests/ -q -m "unit"   # 300+ 纯单元测试（mock，无网络，约 6s）
+python -m pytest tests/ -q -m "unit"   # 750+ 纯单元测试（mock，无网络，约 16s）
 ```
 
 CI 已接入测试门禁（`-m unit`），防止重构/依赖升级回归。
+
+## 依赖
+
+生产运行时**零 `langgraph`/`langchain` 依赖**（2026-08-21 移除——LLM 调用为纯 `httpx`，仅历史批处理包 `src/agent/` 曾引用 langgraph，现已无生产入口）。版本约束见 `requirements.txt` / `requirements-cloud.txt`。
 
 ## 环境变量
 
@@ -61,3 +69,4 @@ CI 已接入测试门禁（`-m unit`），防止重构/依赖升级回归。
 - [docs/项目深度分析报告.md](docs/项目深度分析报告.md)（2026-08-03 首轮）
 - [docs/项目深度分析报告_20260806.md](docs/项目深度分析报告_20260806.md)（2026-08-06 二轮 + 复核修正）
 - [docs/推送方向误判排查报告.md](docs/推送方向误判排查报告.md)
+- [docs/项目深度分析报告_20260821.md](docs/项目深度分析报告_20260821.md)（2026-08-21 三轮深度审查 + 逐条修复）
