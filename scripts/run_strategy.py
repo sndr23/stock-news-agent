@@ -49,6 +49,7 @@ from src.strategy import synthesize as ssyn
 from src.strategy import risk as srisk
 from src.strategy import optimizer as sopt
 from src.strategy import backtest as sbt
+from src.strategy import news_link as nlink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("run_strategy")
@@ -107,13 +108,22 @@ def factor_report(processed: dict, fwd: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("因子").sort_values("IC_IR", ascending=False)
 
 
-def _risk_overlay(panel) -> dict:
-    """仓位建议叠加层：v1=MA20趋势；预留中信净持仓/基差接口。"""
+def _risk_overlay(panel, macro: dict = None) -> dict:
+    """仓位建议叠加层：v1=MA20趋势 + L3 宏观 overlay（因子流基差/资金流/风险状态）。"""
     idx = panel.index_close["close"]
     ma20 = idx.rolling(20).mean()
     above = bool(idx.iloc[-1] > ma20.iloc[-1]) if len(idx) > 20 else True
-    return {"exposure": 1.0 if above else 0.8,
-            "reason": "基准收盘 > MA20，满仓建议" if above else "基准收盘 < MA20，建议降至8成",
+    base = 1.0 if above else 0.8
+    if macro and "exposure" in macro:
+        expo = macro["exposure"]  # 基准 * 宏观系数
+    else:
+        expo = base
+    reasons = []
+    if macro and macro.get("reasons"):
+        reasons = macro["reasons"]
+    reasons.append("基准收盘 > MA20" if above else "基准收盘 < MA20")
+    return {"exposure": round(float(expo), 3),
+            "reason": "；".join(reasons),
             "ma20": round(float(ma20.iloc[-1]), 1) if len(ma20) else None}
 
 
@@ -123,7 +133,8 @@ def fmt_pct(x, digits=1) -> str:
 
 def build_rebalance_report(target: pd.Series, prev_holdings: dict,
                            names: dict, overlay: dict, ic_tbl: pd.DataFrame,
-                           top_tail: pd.DataFrame, latest_date) -> str:
+                           top_tail: pd.DataFrame, latest_date,
+                           holding_news: dict = None) -> str:
     lines = []
     lines.append(f"## 多因子策略日报 {latest_date}")
     lines.append("")
@@ -162,6 +173,21 @@ def build_rebalance_report(target: pd.Series, prev_holdings: dict,
     for code, w in tgt.sort_values(ascending=False).head(10).items():
         lines.append(f"- {names.get(code, code)}({code}) {w:.1%}")
     lines.append("")
+    # L1 协同：织入当日与持仓股相关的已推资讯（浅耦合，只展示）
+    if holding_news:
+        shown = 0
+        lines.append("**持仓股当日相关资讯**")
+        for code, hits in holding_news.items():
+            if code not in target.index:
+                continue
+            for e in hits:
+                if shown >= 12:
+                    break
+                lines.append(f"- {nlink.format_event_line(e)}")
+                shown += 1
+            if shown >= 12:
+                break
+        lines.append("")
     w_last = top_tail
     if w_last is not None and len(w_last):
         lines.append("**当期因子权重**：" + "、".join(
@@ -204,6 +230,8 @@ def main():
     ap.add_argument("--refresh-meta", action="store_true", help="强刷成分/行业缓存")
     ap.add_argument("--codes", type=str, default=None,
                     help="自定义股票池（逗号分隔，默认沪深300全成分；用于研究/冒烟）")
+    ap.add_argument("--link", action="store_true",
+                    help="启用资讯<->策略三层协同层（L1织入/L2事件修正/L3宏观overlay；默认关）")
     args = ap.parse_args()
 
     if args.refresh_meta:
@@ -227,7 +255,24 @@ def main():
         names = {}
     latest = panel.close.index.max()
     ic_tbl = factor_report(processed, fwd)
-    overlay = _risk_overlay(panel)
+
+    # ---- 三层协同（浅耦合，失败全部降级不阻断主链）----
+    macro = None
+    holding_news = {}
+    link_active = args.link
+    if link_active:
+        try:
+            _st = nlink.load_realtime_state()
+            macro = nlink.macro_exposure(nlink.load_factor_state(),
+                                         base_exposure=1.0)
+            events = nlink.recent_pushed_events(_st, hours=48.0)
+            holding_news = nlink.related_news_for_holdings(events, names, names)
+            logger.info("协同层已加载：相关资讯 %d 组，宏观 overlay=%s",
+                        len(holding_news), macro.get("factor"))
+        except Exception as e:
+            logger.warning("协同层加载失败，降级为纯策略: %s", type(e).__name__)
+
+    overlay = _risk_overlay(panel, macro=macro)
 
     state = load_state()
     prev_holdings = state.get("holdings", {})
@@ -238,6 +283,23 @@ def main():
     style = {k: processed[k] for k in STYLE_FOR_RISK}
     model = srisk.estimate(rets, frames["industry"], style, window=250)
     alpha_today = composite.loc[latest].dropna()
+
+    # L2 协同：个股级强方向事件对当日 alpha 温度修正（仅当协同层激活且有事件）
+    if link_active and alpha_today.notna().any():
+        try:
+            _sigma = float(alpha_today.std())
+            events = nlink.recent_pushed_events(
+                nlink.load_realtime_state(), hours=48.0)
+            corr = nlink.event_alpha_correction(
+                events, list(alpha_today.index), names, alpha_sigma=_sigma,
+                strong_only=True)
+            if corr:
+                alpha_today = pd.Series(
+                    nlink.apply_alpha_correction(alpha_today.to_dict(), corr))
+                logger.info("L2 事件修正应用 %d 只", len(corr))
+        except Exception as e:
+            logger.warning("L2 事件修正失败，忽略: %s", type(e).__name__)
+
     ind_row = frames["industry"].loc[latest]
     target = sopt.optimize_mv(alpha_today, model.cov(list(alpha_today.index)),
                               ind_row, w_prev if len(w_prev) else None)
@@ -245,7 +307,8 @@ def main():
 
     w_last = weights_hist.loc[latest] if latest in weights_hist.index else None
     report = build_rebalance_report(target, prev_holdings, names, overlay,
-                                    ic_tbl, w_last, latest.date())
+                                    ic_tbl, w_last, latest.date(),
+                                    holding_news=holding_news)
 
     bt_summary = ""
     if args.backtest:
@@ -269,10 +332,24 @@ def main():
     if args.push:
         ok = push_report(report + bt_summary, f"多因子策略日报 {latest.date()}")
         if ok:
-            save_state({"date": str(latest.date()), "holdings": {c: round(float(w), 5)
-                                                                for c, w in target.items()},
+            holdings = {c: round(float(w), 5) for c, w in target.items()}
+            save_state({"date": str(latest.date()), "holdings": holdings,
                         "exposure": overlay["exposure"]})
             logger.info("已推送并保存持仓状态")
+            # L2 反向：持仓股回写 watchlist.json，资讯流对持仓股优先放行
+            if link_active and holdings:
+                try:
+                    wl = {}
+                    if nlink.WATCHLIST_PATH.exists():
+                        import json as _json
+                        wl = _json.loads(nlink.WATCHLIST_PATH.read_text(encoding="utf-8"))
+                    merged = nlink.merge_watchlist_holdings(wl, holdings, names)
+                    nlink.WATCHLIST_PATH.write_text(
+                        _json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+                    logger.info("持仓股已并入 watchlist.json（新增 %d 条）",
+                                len(merged["stocks"]) - len(wl.get("stocks", [])))
+                except Exception as e:
+                    logger.warning("watchlist 回写失败，忽略: %s", type(e).__name__)
     logger.info("完成")
 
 

@@ -57,9 +57,23 @@
 ```
 
 - **无 look-ahead**：全部因子窗口 ≤t；回测有"信号冻结扰动未来价"专项测试
-- **入口**：`python scripts/run_strategy.py --dry-run`（打印）/ `--push`（推送+写持仓状态）/ `--backtest` / `--codes`（自定义池）
-- **云端**：`strategy-daily.yml` 每日 18:00（北京），actions/cache 缓存日线增量拉取
+- **入口**：`python scripts/run_strategy.py --dry-run`（打印）/ `--push`（推送+写持仓状态）/ `--backtest` / `--codes`（自定义池）/
+  `--link`（启用资讯↔策略三层协同，见下）
+- **云端**：`strategy-daily.yml` 每日 18:00（北京），actions/cache 缓存日线增量拉取，已启用 `--link`
 - **已知局限**（v1 诚实声明）：成分用当期快照存在幸存者偏差；行业用东财板块非申万；基准行业权重用等权近似
+
+### 资讯↔策略 三层协同（news_link.py，2026-08-21）
+
+资讯流（real_time_push/factor_collector）与策略层浅耦合联动，`--link` 启用后逐层降级、不阻断主链：
+
+| 层 | 方向 | 机制 | 故障降级 |
+|---|---|---|---|
+| L1 报告织入 | 资讯 → 策略 | 读近48h已推事件，匹配持仓股相关资讯织入日报"持仓股当日相关资讯"板块 | 无匹配则不渲染 |
+| L2 事件→alpha | 资讯 → 策略 | 个股级强方向事件对当日 alpha 做温度修正（强多头±1.0σ，仅利多利空）；并把持仓股回写 watchlist.json，让资讯流对持仓股优先放行 | 读失败忽略，无强事件不修正 |
+| L3 宏观 overlay | 因子 → 策略 | 聚合 factor_state 快照：IC/IF 深度贴水、两市主力大幅净流出、risk_off 时下调目标仓位系数 | 读失败回退 MA20 基准 |
+
+- **只读 Gist 状态、永不写 Gist**，避免与资讯流单写端冲突
+- 方向口径复用资讯流 LLM 的 6 档 direction；匹配按代码/名称/去后缀名宽容召回
 
 ## 关键设计
 
