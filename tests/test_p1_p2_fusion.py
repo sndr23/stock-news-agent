@@ -360,12 +360,13 @@ class TestLlmJudgeEnvNote:
 
 
 class TestFormatPushAlertEnvNote:
-    def test_env_note_line_shown(self):
+    def test_env_note_no_longer_shown(self):
+        # 2026-08-22 用户决定：资讯推送不再展示"环境"行（择时报告已覆盖量化环境判断）
         news = {"title": "测试标题", "content": "内容", "source": "测试", "published_at": ""}
         judge = {"direction": "bullish", "score": 8, "scope": "sector",
                  "sectors": ["AI算力"], "reason": "重大", "env_note": "背离: 利好但风险收缩期"}
         out = rtp.format_push_alert(news, judge)
-        assert "**环境**: 背离: 利好但风险收缩期" in out
+        assert "**环境**" not in out
 
     def test_empty_env_note_omitted(self):
         news = {"title": "测试标题", "content": "内容", "source": "测试", "published_at": ""}

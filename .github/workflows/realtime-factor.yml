@@ -1,6 +1,9 @@
 # filepath: .github/workflows/realtime-factor.yml
-name: 量化因子采集推送
+name: 量化因子采集（仅采集，不推送）
 
+# 2026-08-22 停推：盘中不再推送因子异动到微信（用户决定完全停推）。
+# 保留采集：factor_state.json 快照（贴水/资金/情绪/risk_state）是创业板择时系统
+# run_chinext_timing.py 修正层的数据源，必须持续更新，否则择时修正层降级为 0。
 # 触发方式（与实时重大资讯推送一致，外部定时服务 + 手动，不用 GitHub 自带 cron）:
 #   1. cron-job.org 按分时段策略 POST 到 Actions API 触发 workflow_dispatch
 #      URL: https://api.github.com/repos/{owner}/{repo}/actions/workflows/realtime-factor.yml/dispatches
@@ -52,8 +55,8 @@ jobs:
       - name: 运行单元测试门禁
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
 
-      - name: 执行因子采集
-        run: python scripts/factor_collector.py --push
+      - name: 执行因子采集（仅采集写快照，不推送）
+        run: python scripts/factor_collector.py --dry-run
 
       - name: 上传日志（调试用）
         if: always()
