@@ -1,0 +1,71 @@
+# filepath: .github/workflows/citic-pos-push.yml
+name: 中信期货持仓日报
+
+# 每天收盘后推送中信期货在股指期货（IF/IH/IC/IM）上的净持仓变化。
+# 定时 17:00（北京时间）触发；若中金所持仓排名数据未公布（脚本退出码 2），
+# 自动每 10 分钟重试，直至数据就绪（最晚约 17:40）。
+# 与 market-brief.yml 同理：非事件驱动、对分钟级延迟不敏感，直接用 GitHub 自带 cron。
+# 周一至周五触发；周末/节假日由脚本 _is_trading_day + Gist 去重兜底跳过。
+on:
+  schedule:
+    - cron: "0 9 * * 1-5"   # 北京时间 17:00 持仓日报
+  workflow_dispatch:
+
+concurrency:
+  group: citic-pos-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    # 重试最多 4 次 × (脚本运行 + 10 分钟间隔)，预留足够余量
+    timeout-minutes: 50
+
+    env:
+      # 推送后端 + 状态持久化（Gist 跨轮次去重）
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      # 数据未就绪（退出码 2）时每 10 分钟重试，最多 4 次；其他错误直接失败
+      - name: 执行持仓日报推送
+        run: |
+          for i in 1 2 3 4; do
+            python scripts/push_citic_futures_pos.py && exit 0
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              echo "第 ${i} 次：持仓排名数据未就绪，10 分钟后重试"
+              sleep 600
+            else
+              exit "$code"
+            fi
+          done
+          echo "重试 4 次后数据仍未就绪，放弃本次推送"
+          exit 2
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citic-pos-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
