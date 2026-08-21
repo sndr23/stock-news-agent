@@ -275,11 +275,12 @@ class TestDirectionAnalysisSixDims:
     def test_six_dims_present(self):
         a = self._run()
         names = [d[0] for d in a["factors"]]
-        # P7 影子（流动性/期权情绪）+ P8 影子（日线衍生 5 + 分钟 2）恒定追加在 6 主维度后
+        # P7 影子（流动性/期权情绪）+ P8 影子（日线衍生 5 + 分钟 2）+ P12 影子（韩指）
+        # 恒定追加在 6 主维度后（P12：韩指行情源独立，挂了恒记 0 分供 IC 累积）
         assert names == ["对冲", "风险", "量价", "汇率", "波动率", "宽度",
                          "流动性", "期权情绪",
                          "动量(20日)", "反转(5日)", "均线结构", "量价配合", "跳空缺口",
-                         "盘中动量", "短线动能"]
+                         "盘中动量", "短线动能", "韩指"]
         assert a["shadow"] == set()  # 无数据时影子维度全 0 分不标注
 
     def test_high_vol_votes_bearish(self):
@@ -302,6 +303,61 @@ class TestDirectionAnalysisSixDims:
         a = self._run(breadth={"down_pct": 50.0})
         bd = next(d for d in a["factors"] if d[0] == "宽度")
         assert bd[1] == 0.0
+
+
+# ============================================================
+# P12 韩指影子维度（影子 → IC 累积 → 达标升级正式维度路径的第一步）
+# ============================================================
+
+class TestKospiShadowDim:
+    def _run(self, global_quotes=None):
+        return fc._direction_analysis({}, {}, {}, "neutral", {},
+                                      global_quotes=global_quotes)
+
+    def test_kospi_drop_scores_negative_without_score_change(self):
+        """韩指大跌 ≥2% → 影子维度 -1，不改变综合分/方向/生效权重"""
+        base = self._run()
+        drop = self._run({"韩国KOSPI": {"price": 6700.0, "change_pct": -3.2}})
+        assert drop["score"] == base["score"]
+        assert drop["direction"] == base["direction"]
+        fac = {n: s for n, s, _ in drop["factors"]}
+        assert fac["韩指"] == -1.0
+        assert "韩指" in drop["shadow"]
+        assert "韩指" in drop["shadow_all"]
+        assert "韩指" not in drop["eff_weights"]  # 影子不进生效权重
+
+    def test_kospi_rise_scores_positive(self):
+        """韩指大涨 ≥2% → 影子维度 +1（存储链先行偏多）"""
+        rise = self._run({"韩国KOSPI": {"price": 7050.0, "change_pct": 2.5}})
+        fac = {n: s for n, s, _ in rise["factors"]}
+        assert fac["韩指"] == 1.0
+        assert "韩指" in rise["shadow"]
+
+    def test_kospi_calm_scores_zero(self):
+        """韩指常态（<2%）→ 0 分不标注（阈值与环境行同口径）"""
+        calm = self._run({"韩国KOSPI": {"price": 6912.95, "change_pct": 0.88}})
+        fac = {n: s for n, s, _ in calm["factors"]}
+        assert fac["韩指"] == 0.0
+        assert "韩指" not in calm["shadow"]
+        assert "韩指" in calm["shadow_all"]
+
+    def test_kospi_missing_records_zero(self):
+        """行情源挂/无韩指键 → 恒记 0 分（序列完整供 IC 回测）"""
+        for gq in (None, {}, {"英伟达": {"price": 219.74, "change_pct": -2.34}}):
+            a = self._run(gq)
+            fac = {n: s for n, s, _ in a["factors"]}
+            assert fac["韩指"] == 0.0
+            assert "韩指" in a["shadow_all"]
+
+    def test_kospi_card_display(self):
+        """非零韩指进方向信号卡片（影子标注）；零分隐藏（展示与记录解耦）"""
+        drop = self._run({"韩国KOSPI": {"price": 6700.0, "change_pct": -3.2}})
+        text = fc.format_direction_signal(drop, "中性")
+        assert "韩指" in text
+        assert "影子·未参与合成" in text
+        calm = self._run()
+        text_calm = fc.format_direction_signal(calm, "中性")
+        assert "韩指" not in text_calm
 
 
 # ============================================================

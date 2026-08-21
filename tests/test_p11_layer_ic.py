@@ -34,6 +34,7 @@ class TestFactorRegistry:
     def test_shadow_marked(self):
         assert sb.FACTOR_REGISTRY["流动性"]["is_shadow"] is True
         assert sb.FACTOR_REGISTRY["期权情绪"]["is_shadow"] is True
+        assert sb.FACTOR_REGISTRY["韩指"]["is_shadow"] is True  # P12 影子，达标升级
         assert sb.FACTOR_REGISTRY["对冲"].get("is_shadow") is not True
 
     def test_all_register_entries_have_metadata(self):

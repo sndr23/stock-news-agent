@@ -141,6 +141,9 @@ TH_GC007_SPIKE_ALERT = 50  # GC007 日涨幅 ≥50% 且 ≥2% → 告警（warni
 TH_PCR_PANIC = 1.3         # PCR ≥1.3 → 恐慌对冲占优（影子维度利空）
 TH_PCR_GREED = 0.55        # PCR ≤0.55 → 看涨情绪占优（影子维度利好）
 TH_PCR_ALERT = 1.5         # PCR ≥1.5 → 告警（info，情绪极端不切 risk_off）
+# P12 影子维度（2026-08-21）：韩指 KOSPI（存储链先行，14:30 BJT 收盘早于 A 股）。
+# 阈值与环境行展示同口径（|涨跌|≥2% 才有意义），常态 0 分不稀释 IC 样本外的信号
+TH_KOSPI_PCT = 2.0         # |韩KOSPI 涨跌| ≥2% → 影子维度 ±1（先行偏多/偏空）
 
 # 量化资金状态变化推送（2026-08-14 用户需求："追踪万亿级量化资金走势"）：
 # 盘中每轮检测"量化资金状态"（基差对冲方向 + 风险状态），发生变化才推送"量化资金动态"
@@ -1554,7 +1557,8 @@ def _calc_basis_direction(history: dict) -> dict:
 def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, history: dict,
                         vol: dict = None, breadth: dict = None, weights: dict = None,
                         liquidity: dict = None, option: dict = None,
-                        daily_factors: dict = None, minute_factors: dict = None) -> dict:
+                        daily_factors: dict = None, minute_factors: dict = None,
+                        global_quotes: dict = None) -> dict:
     """多因子合成量化方向信号
 
     六个维度各打分（+1 利好 / -1 利空 / 0 中性）：
@@ -1578,6 +1582,8 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
     先以"影子维度"记录与展示（进 factors/direction_history 供 compute_factor_ic 回测），
     不参与综合分与门控——避免未经验证的新维度稀释已验证的 6 维话语权
     （如 -5/6=-0.83 强信号会被稀释成 -5/8=-0.63 弱信号）；IC 达标后可升级为正式维度。
+    P12 影子维度（2026-08-21）：韩指 KOSPI（存储链先行，±2% 同环境行口径），
+    与 P7/P8 同流程：打分记录进 direction_history 供 IC 累积，不参与综合分。
     返回值含 gates（生效门控说明）与 eff_weights（生效权重，含门控倍数）、
     shadow（影子维度名集合，展示层据此标注）。
     """
@@ -1694,6 +1700,18 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
             shadow_dims.append((name, float(s), str(src.get(desc_key) or miss_desc)))
         else:
             shadow_dims.append((name, 0.0, miss_desc))
+    # P12 影子维度：韩指 KOSPI（存储链先行，14:30 BJT 收盘早于 A 股，盘中实时信号；
+    # |涨跌|≥2% 与环境行同口径，恒定记录供 IC 累积）
+    kospi = (global_quotes or {}).get("韩国KOSPI") or {}
+    kc = kospi.get("change_pct")
+    if isinstance(kc, (int, float)) and abs(kc) >= TH_KOSPI_PCT:
+        if kc > 0:
+            ko_score, ko_part = 1.0, f"韩KOSPI {kc:+.2f}%（存储链先行大涨）"
+        else:
+            ko_score, ko_part = -1.0, f"韩KOSPI {kc:+.2f}%（存储链先行大跌）"
+    else:
+        ko_score, ko_part = 0.0, "韩指平稳"
+    shadow_dims.append(("韩指", ko_score, ko_part))
     shadow_names = {name for name, s, _ in shadow_dims if s != 0}
     # shadow: 非零影子（门控/权重排除判定用）；shadow_all: 全量影子名（含零分，
     # 展示层隐藏零分影子用——两集合语义不同不可混用）
@@ -2461,7 +2479,8 @@ def run_once(push: bool) -> dict:
                                        weights=(factor_ic or {}).get("weights") or {},
                                        liquidity=liquidity, option=option,
                                        daily_factors=daily_factors,
-                                       minute_factors=minute_factors)
+                                       minute_factors=minute_factors,
+                                       global_quotes=global_quotes)
         if factor_ic.get("weights"):
             analysis["ic_n"] = factor_ic.get("n")
         # P4-6：方向历史落盘（每交易日一条，当日盘中多轮覆盖取最新），供后续 IC 回测；

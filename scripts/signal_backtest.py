@@ -87,6 +87,8 @@ FACTOR_REGISTRY = {
                "note": "GC007 资金面：平稳=0（P7 影子，达标升级）"},
     "期权情绪": {"kind": "shadow", "levels": (0, 1), "is_shadow": True,
                 "note": "PCR 强度（P7 影子，达标升级）"},
+    "韩指": {"kind": "global", "levels": (-1, 0, 1), "is_shadow": True,
+             "note": "韩KOSPI ±2% 先行信号（P12 影子，达标升级）"},
 }
 
 

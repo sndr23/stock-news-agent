@@ -175,7 +175,7 @@ class TestShadowIntegration:
         assert ext["score"] == base["score"]
         assert ext["direction"] == base["direction"]
         names = [n for n, _, _ in ext["factors"]]
-        assert len(names) == len(base["factors"]) == 14  # 5主+2P7影子+7P8影子
+        assert len(names) == len(base["factors"]) == 15  # 5主+2P7影子+7P8影子+1P12影子
         for expect in ("动量(20日)", "反转(5日)", "均线结构", "量价配合", "跳空缺口",
                        "盘中动量", "短线动能"):
             assert expect in names
