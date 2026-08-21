@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "0 9 * * 1-5"   # 北京时间 17:00 持仓日报
   workflow_dispatch:
+    inputs:
+      force:
+        description: "强制推送（忽略去重，用于重新测试格式）"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: citic-pos-push
@@ -48,8 +54,12 @@ jobs:
       # 数据未就绪（退出码 2）时每 10 分钟重试，最多 4 次；其他错误直接失败
       - name: 执行持仓日报推送
         run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
           for i in 1 2 3 4; do
-            python scripts/push_citic_futures_pos.py && exit 0
+            python scripts/push_citic_futures_pos.py $FORCE_FLAG && exit 0
             code=$?
             if [ "$code" -eq 2 ]; then
               echo "第 ${i} 次：持仓排名数据未就绪，10 分钟后重试"

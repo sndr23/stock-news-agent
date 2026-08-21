@@ -202,31 +202,60 @@ def _save_state(state: dict) -> None:
 # ============================================================
 # 消息格式化
 # ============================================================
+# A股惯例：红涨绿跌。净加多单=利好红，净加空单=利空绿
+_RED = "#e23a3a"
+_GREEN = "#2e7d32"
+
+
+def _color_val(v: int, bold: bool = False) -> str:
+    """带红涨绿跌配色的数值（正=净加多单红，负=净加空单绿）"""
+    if v >= 0:
+        color, arrow = _RED, "▲"
+    else:
+        color, arrow = _GREEN, "▼"
+    inner = f"{arrow} {v:+d}"
+    if bold:
+        inner = f"<b>{inner}</b>"
+    return f'<font color="{color}">{inner}</font>'
+
+
 def format_message(d: date, daily: dict, recent: list) -> str:
     total = sum(c["net_var"] for c in daily.values())
     direction = "净加空单" if total < 0 else "净加多单"
+    name_map = {"IF": "IF 沪深300", "IH": "IH 上证50", "IC": "IC 中证500", "IM": "IM 中证1000"}
     lines = [
-        "📊 中信期货股指期货持仓日报",
-        f"📅 {d.strftime('%Y-%m-%d')}（全合约口径）",
+        "📊 **中信期货股指期货持仓日报**",
         "",
-        "今日净持仓变化（手）：",
+        f"📅 **{d.strftime('%Y-%m-%d')}**（全合约口径）",
+        "",
+        "---",
+        "",
+        "**今日净持仓变化（手）**",
+        "",
+        "| 品种 | 净增减 |",
+        "| :--- | ---: |",
     ]
-    name_map = {"IF": "IF沪深300", "IH": "IH上证50", "IC": "IC中证500", "IM": "IM中证1000"}
     for p in PRODUCTS:
         if p in daily:
-            c = daily[p]
-            lines.append(f"{name_map[p]}: {c['net_var']:+d}")
+            lines.append(f"| {name_map[p]} | {_color_val(daily[p]['net_var'])} |")
     lines += [
-        "━━━━━━━━━━━━",
-        f"合计: {total:+d} 手（{direction}）",
         "",
-        "近5日净增减（手）：",
+        f"**合计：{_color_val(total, bold=True)}（{direction}）**",
+        "",
+        "---",
+        "",
+        "**近5日净增减（手）**",
+        "",
+        "| 日期 | 净增减 |",
+        "| :--- | ---: |",
     ]
     for r in recent:
-        lines.append(f"{r['day']}: {r['total']:+d}")
+        lines.append(f"| {r['day']} | {_color_val(r['total'])} |")
     lines += [
         "",
-        "数据来源：中金所成交持仓排名",
+        "---",
+        "",
+        "*数据来源：中金所成交持仓排名*",
     ]
     return "\n".join(lines)
 
