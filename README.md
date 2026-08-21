@@ -35,8 +35,31 @@
 | `scripts/factor_collector.py` | 量化因子采集/方向合成/异动推送（P0–P12，含 IC 验证） | ✅ 生产（realtime-factor） |
 | `scripts/signal_backtest.py` | 已推事件信号质量回测（后 1/3/5 日一致性 + 分层 IC） | ✅ 生产（signal-backtest） |
 | `scripts/push_citic_futures_pos.py` | 中信期货 IF/IH/IC/IM 净持仓日报（全合约聚合口径，Gist 去重） | ✅ 生产（citic-pos-push） |
+| `src/strategy/` | **多因子策略层**（数据/因子/评价/合成/风险/优化/回测七层，见下节） | ✅ 2026-08-21 新增（strategy-daily） |
+| `scripts/run_strategy.py` | 策略层每日入口：全流程 → 目标持仓 → 调仓建议推送（不下单） | ✅ 生产（strategy-daily） |
 | `src/agent/` | LangGraph 批处理管线（历史汇总报告引擎） | ⚠️ DEPRECATED，无生产入口 |
 | `daily-review/` | 每日技术面复盘报告（本地生成 HTML） | ⚠️ 独立辅助功能，不入库 |
+
+## 策略层（src/strategy/，2026-08-21）
+
+机构式多因子选股框架（**只出调仓建议，不含自动下单**），日频、沪深300 基准：
+
+```
+数据(data.py: 成分/日线/行业 三级降级+增量缓存)
+  → 因子(factors.py: 8个量价截面因子 rev5/mom60_5/low_vol/low_turn/size/liq/ppcorr/idio_vol)
+  → 预处理(preprocess.py: MAD去极值→标准化→行业+市值中性化)
+  → 评价(evaluate.py: RankIC/IR/t值/分层收益/相关矩阵)
+  → 合成(synthesize.py: 滚动IC加权，符号自适应+低IC过滤)
+  → 风险(risk.py: 简化Barra 行业+风格暴露，LW收缩协方差)
+  → 优化(optimizer.py: SLSQP均值方差 个股≤3%/行业偏离≤3%/换手≤30%，排序法降级)
+  → 回测(backtest.py: 成本模型25bp/夏普/回撤/IR/分年)
+  → 调仓建议(run_strategy.py: 目标持仓diff → 微信推送; MA20仓位叠加)
+```
+
+- **无 look-ahead**：全部因子窗口 ≤t；回测有"信号冻结扰动未来价"专项测试
+- **入口**：`python scripts/run_strategy.py --dry-run`（打印）/ `--push`（推送+写持仓状态）/ `--backtest` / `--codes`（自定义池）
+- **云端**：`strategy-daily.yml` 每日 18:00（北京），actions/cache 缓存日线增量拉取
+- **已知局限**（v1 诚实声明）：成分用当期快照存在幸存者偏差；行业用东财板块非申万；基准行业权重用等权近似
 
 ## 关键设计
 
@@ -51,7 +74,7 @@
 ## 测试
 
 ```bash
-python -m pytest tests/ -q -m "unit"   # 750+ 纯单元测试（mock，无网络，约 16s）
+python -m pytest tests/ -q -m "unit"   # 760+ 纯单元测试（mock，无网络，约 40s）
 ```
 
 CI 已接入测试门禁（`-m unit`），防止重构/依赖升级回归。

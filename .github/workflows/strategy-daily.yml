@@ -1,0 +1,63 @@
+# filepath: .github/workflows/strategy-daily.yml
+name: 多因子策略日报
+
+# 每日收盘后运行策略层全流程：数据(增量缓存) → 因子 → 合成 → 优化 → 调仓建议推送。
+# 定时 18:00（北京时间）：东财日线/换手率 17:30 前后齐备，且避开 17:00 持仓日报高峰。
+# 注意：云端 data/strategy_cache 不持久化，每日全量拉取 300 只×3年（首日 ~15-20 分钟），
+#      后续若需提速可挂 actions/cache 缓存 data/strategy_cache 目录。
+# 周一至周五触发；周末/节假日由脚本 is_trading_day_now 兜底跳过。
+on:
+  schedule:
+    - cron: "0 10 * * 1-5"   # 北京时间 18:00 策略日报
+  workflow_dispatch:
+
+concurrency:
+  group: strategy-daily
+  cancel-in-progress: false
+
+jobs:
+  strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 恢复策略数据缓存
+        uses: actions/cache@v4
+        with:
+          path: data/strategy_cache
+          key: strategy-cache-${{ github.run_id }}
+          restore-keys: |
+            strategy-cache-
+
+      - name: 执行策略日报推送
+        run: python scripts/run_strategy.py --push --backtest
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-daily-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
