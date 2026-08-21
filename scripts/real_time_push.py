@@ -1875,6 +1875,11 @@ def _factor_env_line(snapshot: dict, now: datetime = None) -> str:
         if isinstance(g.get("change_pct"), (int, float)):
             flag = "⚠️" if abs(g["change_pct"]) >= 2.0 else ""
             parts.append(f"{flag}隔夜{g_name.replace('纳斯达克100', '纳指')}{g['change_pct']:+.2f}%")
+    # P12（2026-08-21）：韩指 KOSPI（存储链先行；14:30 BJT 收盘早于 A 股，盘中为
+    # 实时信号故不带"隔夜"前缀）；P10 常态不显示口径——|涨跌|≥2% 才上环境行
+    g = gq.get("韩国KOSPI") or {}
+    if isinstance(g.get("change_pct"), (int, float)) and abs(g["change_pct"]) >= 2.0:
+        parts.append(f"⚠️韩KOSPI{g['change_pct']:+.2f}%")
     # 市场宽度（P10 始终显示：跌X%）
     dp = (snapshot.get("breadth") or {}).get("down_pct")
     if isinstance(dp, (int, float)):
@@ -1950,9 +1955,10 @@ def _llm_env_context(snapshot: dict, now: datetime = None) -> str:
     if isinstance(mn, (int, float)) and mn != 0:
         parts.append(f"两市主力净{'流入' if mn > 0 else '流出'}{abs(mn):.0f}亿")
     # P3（2026-08-19）：外盘/波动率/宽度——LLM 判定共振/背离的增量上下文
+    # P12：加韩国KOSPI（存储链先行，三星/SK海力士与 A 股半导体同频）
     gq = snapshot.get("global") or {}
     g_parts = []
-    for g_name in ("纳斯达克100", "英伟达", "恒生科技指数"):
+    for g_name in ("纳斯达克100", "英伟达", "恒生科技指数", "韩国KOSPI"):
         g = gq.get(g_name) or {}
         if isinstance(g.get("change_pct"), (int, float)):
             g_parts.append(f"{g_name}{g['change_pct']:+.2f}%")

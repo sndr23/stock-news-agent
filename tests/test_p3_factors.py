@@ -73,6 +73,47 @@ class TestFetchGlobalQuotes:
         monkeypatch.setattr(fc, "_http_get", lambda *a, **k: "")
         assert fc.fetch_global_quotes() == {}
 
+    def test_em_supplement_kospi(self, monkeypatch):
+        """P12：腾讯主源挂 → 东财补充源独立返回韩指（×100 整数缩放）"""
+        em_json = '{"data": {"diff": [{"f12": "KS11", "f14": "韩国KOSPI", "f2": 691295, "f3": 88}]}}'
+
+        def fake_get(url, params=None, headers=None, encoding=None, rotate_ua=True):
+            return em_json if "eastmoney" in url else ""
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        out = fc.fetch_global_quotes()
+        assert out == {"韩国KOSPI": {"price": 6912.95, "change_pct": 0.88}}
+
+    def test_em_supplement_neg_pct(self, monkeypatch):
+        """P12：负涨跌缩放与降档字段（f3=-320 → -3.20%）"""
+        em_json = '{"data": {"diff": [{"f12": "KS11", "f14": "韩国KOSPI", "f2": 670000, "f3": -320}]}}'
+
+        def fake_get(url, params=None, headers=None, encoding=None, rotate_ua=True):
+            return em_json if "eastmoney" in url else ""
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        out = fc.fetch_global_quotes()
+        assert out["韩国KOSPI"] == {"price": 6700.0, "change_pct": -3.2}
+
+    def test_em_supplement_bad_payload_no_crash(self, monkeypatch):
+        """P12：东财返回非 JSON → 静默降级，腾讯主源结果不受影响"""
+        def fake_get(url, params=None, headers=None, encoding=None, rotate_ua=True):
+            if "eastmoney" in url:
+                return "not-json"
+            parts = ["1", "纳斯达克100", "IDX", "29490.96", "29785.67"] + [""] * 27 + ["-1.68"]
+            parts += [""] * 5
+            return 'v_usNDX="' + "~".join(parts) + '";'
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        out = fc.fetch_global_quotes()
+        assert out == {"纳斯达克100": {"price": 29490.96, "change_pct": -1.68}}
+
+    def test_em_supplement_dash_fields_skipped(self, monkeypatch):
+        """P12：东财停牌态返回 '-' 字符串 → 跳过该条不产出"""
+        em_json = '{"data": {"diff": [{"f12": "KS11", "f14": "韩国KOSPI", "f2": "-", "f3": "-"}]}}'
+
+        def fake_get(url, params=None, headers=None, encoding=None, rotate_ua=True):
+            return em_json if "eastmoney" in url else ""
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        assert fc.fetch_global_quotes() == {}
+
 
 class TestDetectGlobalAnomalies:
     def test_big_drop_warning(self):
@@ -90,6 +131,13 @@ class TestDetectGlobalAnomalies:
 
     def test_below_threshold_no_signal(self):
         assert fc.detect_global_anomalies({"标普500": {"price": 7691.0, "change_pct": -0.69}}) == []
+
+    def test_kospi_warning(self):
+        """P12：韩指大跌 ≥3% → warning 级（联动 risk_off → 风险维度参与方向合成）"""
+        sigs = fc.detect_global_anomalies({"韩国KOSPI": {"price": 6700.0, "change_pct": -3.2}})
+        assert len(sigs) == 1
+        assert sigs[0]["level"] == "warning"
+        assert sigs[0]["direction"] == "bearish"
 
     def test_empty_input(self):
         assert fc.detect_global_anomalies({}) == []
@@ -315,6 +363,21 @@ class TestPushDisplayIntegration:
             snap.pop(k)
         line = rtp._factor_env_line(snap)
         assert "纳指" not in line and "高波" not in line and "跌" not in line
+
+    def test_factor_env_line_kospi_extreme_shown(self):
+        """P12：韩指 |涨跌|≥2% → 上环境行（⚠️，无"隔夜"前缀）"""
+        snap = _sample_snapshot()
+        snap["global"]["韩国KOSPI"] = {"price": 6700.0, "change_pct": -3.2}
+        line = rtp._factor_env_line(snap)
+        assert "⚠️韩KOSPI-3.20%" in line
+        assert "隔夜韩KOSPI" not in line
+
+    def test_factor_env_line_kospi_normal_hidden(self):
+        """P12：韩指常态（<2%）→ 不上环境行（P10 常态不显示口径）"""
+        snap = _sample_snapshot()
+        snap["global"]["韩国KOSPI"] = {"price": 6912.95, "change_pct": 0.88}
+        line = rtp._factor_env_line(snap)
+        assert "KOSPI" not in line
 
     def test_llm_env_context_new_dims(self):
         ctx = rtp._llm_env_context(_sample_snapshot())

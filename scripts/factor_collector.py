@@ -108,6 +108,12 @@ GLOBAL_QUOTES = {
     "恒生科技指数": "hkHSTECH",
 }
 TH_GLOBAL_PCT = 2.0        # 隔夜外盘 |涨跌| ≥2% → 异动告警（≥3% 升级 warning）
+# P12（2026-08-21）：腾讯无韩指代码 → 东财 ulist 补充源。
+# 韩国KOSPI（三星/SK海力士存储链）与自选股 AI 硬件链同频；北京时间 14:30 收盘
+# 早于 A 股，盘中读数为实时先行信号（f2/f3 为 ×100 整数，新浪 int_kospi 已失效）。
+GLOBAL_QUOTES_EM = {
+    "韩国KOSPI": "100.KS11",
+}
 # P3-2 市场宽度：判断普涨普跌 vs 结构市（指数跌而普跌=真实风险，大权重拉指数=假强势）
 TH_LIMIT_DOWN = 100        # 跌停家数 ≥100 → 情绪冰点告警
 TH_BREADTH_DOWN_PCT = 80   # 下跌家数占比 ≥80% → 极端普跌告警
@@ -594,7 +600,7 @@ def fetch_market_flows() -> dict:
 
 
 def fetch_global_quotes() -> dict:
-    """隔夜外盘（P3-1）：腾讯美股/港股指数 → {名称: {price, change_pct}}
+    """隔夜外盘（P3-1）：腾讯美股/港股指数 + 东财补充（P12 韩指）→ {名称: {price, change_pct}}
 
     与 A 股行情同一接口（qt.gtimg.cn），字段位相同（名称[1]/现价[3]/涨跌%[32]）。
     A 股交易时段读到的即隔夜收盘值（美股 4:00 收、恒生 16:00 收），
@@ -603,23 +609,53 @@ def fetch_global_quotes() -> dict:
     out = {}
     codes = ",".join(GLOBAL_QUOTES.values())
     text = _http_get(f"http://qt.gtimg.cn/q={codes}", encoding="gbk")
+    if text:
+        rev = {v.lower(): k for k, v in GLOBAL_QUOTES.items()}
+        for line in text.split(";"):
+            line = line.strip()
+            if "=" not in line:
+                continue
+            var, _, payload = line.partition("=")
+            payload = payload.strip().strip('"')
+            parts = payload.split("~")
+            name = rev.get(var.replace("v_", "").lower())
+            if not name or len(parts) < 33:
+                continue
+            try:
+                out[name] = {"price": float(parts[3]), "change_pct": float(parts[32])}
+            except (ValueError, IndexError):
+                continue
+    # P12：东财补充源（腾讯缺失的全球指数，如韩指）；主源空/挂同样兜底，失败不影响主源
+    out.update(_fetch_global_quotes_em())
+    return out
+
+
+def _fetch_global_quotes_em() -> dict:
+    """东财全球指数补充（P12）→ {名称: {price, change_pct}}
+
+    f2(价)/f3(涨跌%) 为 ×100 整数（实证 SPX 764116 ↔ 腾讯 7641.16 一致）；
+    停牌/缺字段时东财返回 "-" 字符串，isinstance 过滤跳过。
+    """
+    if not GLOBAL_QUOTES_EM:
+        return {}
+    text = _http_get("https://push2.eastmoney.com/api/qt/ulist.np/get", params={
+        "secids": ",".join(GLOBAL_QUOTES_EM.values()),
+        "fields": "f2,f3,f12,f14", "ut": _EM_KLINE_UT})
     if not text:
-        return out
-    rev = {v.lower(): k for k, v in GLOBAL_QUOTES.items()}
-    for line in text.split(";"):
-        line = line.strip()
-        if "=" not in line:
+        return {}
+    try:
+        diff = ((json.loads(text).get("data") or {}).get("diff")) or []
+    except ValueError:
+        return {}
+    # f12 为裸代码（无 "100." 市场前缀），取 secid 后段反查名称
+    rev = {v.split(".")[-1]: k for k, v in GLOBAL_QUOTES_EM.items()}
+    out = {}
+    for d in diff:
+        name = rev.get(str(d.get("f12") or ""))
+        f2, f3 = d.get("f2"), d.get("f3")
+        if not name or not isinstance(f2, (int, float)) or not isinstance(f3, (int, float)):
             continue
-        var, _, payload = line.partition("=")
-        payload = payload.strip().strip('"')
-        parts = payload.split("~")
-        name = rev.get(var.replace("v_", "").lower())
-        if not name or len(parts) < 33:
-            continue
-        try:
-            out[name] = {"price": float(parts[3]), "change_pct": float(parts[32])}
-        except (ValueError, IndexError):
-            continue
+        out[name] = {"price": f2 / 100, "change_pct": f3 / 100}
     return out
 
 
