@@ -1,8 +1,5 @@
 # 云端运行依赖（GitHub Actions 用，去掉 web 相关）
 # 版本约束同上 requirements.txt：防 breaking change 突然击穿云端生产
-langgraph~=1.2.0
-langchain-core~=1.4.0
-langchain-openai~=1.3.0
 python-dotenv>=1.0.0,<2.0.0
 pydantic~=2.12.0
 httpx~=0.28.0

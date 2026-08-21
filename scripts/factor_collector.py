@@ -1599,8 +1599,10 @@ def _direction_analysis(tech: dict, basis: dict, fx: dict, risk_state: str, hist
         elif d == "走扩":
             hedge_scores.append(-1); hedge_parts.append(f"{code}贴水走扩")
     if hedge_scores:
+        hedge_desc = ("中性策略加仓/平对冲" if sum(hedge_scores) > 0
+                      else ("中性策略减仓/加对冲" if sum(hedge_scores) < 0 else "对冲方向不明"))
         dims.append(("对冲", sum(hedge_scores) / len(hedge_scores),
-                     "中性策略加仓/平对冲" if sum(hedge_scores) > 0 else ("中性策略减仓/加对冲" if sum(hedge_scores) < 0 else "对冲方向不明") + "（" + "、".join(hedge_parts) + "）"))
+                     hedge_desc + "（" + "、".join(hedge_parts) + "）"))
     # ② 风险
     if risk_state == "risk_off":
         dims.append(("风险", -1.0, "风险收缩期（贴水走扩/日元急升/放量破位）"))
