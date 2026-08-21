@@ -243,6 +243,215 @@ def _load_index_daily(symbol: str = "000300", start: str = "20190101") -> pd.Dat
     return df
 
 
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                   "ALL_PROXY", "all_proxy")
+
+
+def _fetch_kline_direct(secid: str, beg: str, end: str) -> Optional[pd.DataFrame]:
+    """东财 push2his K线直连（trust_env=False 绕过 Windows 注册表残留代理）。
+    返回 DataFrame(date, close, amount)；失败返回 None。"""
+    import requests
+    s = requests.Session()
+    s.trust_env = False
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {"secid": secid, "fields1": "f1,f2,f3",
+              "fields2": "f51,f52,f53,f54,f55,f56,f57",
+              "klt": "101", "fqt": "1", "beg": beg, "end": end}
+    r = s.get(url, params=params, timeout=20,
+              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    data = (r.json().get("data") or {})
+    rows = []
+    for line in data.get("klines") or []:
+        p = str(line).split(",")
+        if len(p) >= 7:
+            try:
+                rows.append((p[0], float(p[2]), float(p[6])))  # date, close, amount
+            except ValueError:
+                continue
+    if not rows:
+        return None
+    return pd.DataFrame(rows, columns=["date", "close", "amount"])
+
+
+def _fetch_tencent_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """腾讯日K（trust_env=False 直连，本机网络环境下最稳）。分批 ≤640 根。
+    返回 date/close/amount——注意 amount 列此处实际是成交量(手)，
+    量价维度只做分位比较，量纲无关。"""
+    import requests
+    s = requests.Session()
+    s.trust_env = False
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    rows = []
+    cur = pd.Timestamp(start).strftime("%Y-%m-%d")
+    end_s = pd.Timestamp(end).strftime("%Y-%m-%d")
+    for _ in range(8):  # 640×8 根上限，防死循环
+        param = f"{code},day,{cur},{end_s},640,qfq"
+        r = s.get(url, params={"param": param}, timeout=20,
+                  headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        d = ((r.json().get("data") or {}).get(code) or {})
+        batch = d.get("qfqday") or d.get("day") or []
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < 640:
+            break
+        cur = (pd.Timestamp(batch[-1][0]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    if not rows:
+        return None
+    df = pd.DataFrame([(x[0], float(x[2]), float(x[5])) for x in rows],
+                      columns=["date", "close", "amount"])
+    df = df.drop_duplicates(subset="date").sort_values("date")
+    return df
+
+
+def _fetch_index_full_frame(symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """指数日线（close+amount），供量能维度使用。五级降级：
+    东财hist(akshare) → push2his直连 → 腾讯日K直连 → push2his(akshare) → 新浪(无amount)。
+    amount 语义：东财=成交额(元)，腾讯=成交量(手)——量价维度仅做分位比较，量纲无关。"""
+    import akshare as ak
+    pre = "sh" if symbol.startswith(("000", "950")) else "sz"
+    secid = f"{'1' if pre == 'sh' else '0'}.{symbol}"
+    df = None
+    try:
+        df = ak.index_zh_a_hist(symbol=symbol, period="daily",
+                                start_date=start, end_date=end)
+        df = df.rename(columns={"日期": "date", "收盘": "close", "成交额": "amount"})
+        df = df[["date", "close", "amount"]]
+    except Exception as e:
+        logger.info("指数full接口1失败(%s)，降级接口2(直连)", type(e).__name__)
+    if df is None or df.empty:
+        try:
+            df = _fetch_kline_direct(secid, start, end)
+        except Exception as e:
+            logger.info("指数full接口2(直连)失败(%s)，降级接口3(腾讯)", type(e).__name__)
+    if df is None or df.empty:
+        try:
+            df = _fetch_tencent_daily(f"{pre}{symbol}", start, end)
+        except Exception as e:
+            logger.info("指数full接口3(腾讯)失败(%s)，降级接口4", type(e).__name__)
+    if df is None or df.empty:
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=f"{pre}{symbol}")
+            df = df[["date", "close", "amount"]]
+        except Exception as e:
+            logger.info("指数full接口4失败(%s)，降级接口5(新浪,无amount)", type(e).__name__)
+    if df is None or df.empty:
+        try:
+            df = ak.stock_zh_index_daily(symbol=f"{pre}{symbol}")
+            df = df[["date", "close"]].copy()
+            df["amount"] = 0.0
+        except Exception as e:
+            logger.warning("指数 %s full 四个接口均失败: %s", symbol, e)
+            return None
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    return df[df.index >= pd.Timestamp(start)]
+
+
+def load_stock_sina(symbol: str = "300308", start: str = "20140101",
+                    ttl_days: int = 1) -> pd.DataFrame:
+    """个股日线（新浪 stock_zh_a_daily 直连，绕东财被挡的代理环境）。
+
+    与 load_index_sina 互补：本函数服务"创业板+旭创双确认"的个股侧数据。
+    返回 index=date, columns=[open, close, high, low, volume, amount, turnover]。
+    缓存 TTL 默认 1 天。失败返回空 DataFrame（调用方降级该维度）。
+    """
+    import akshare as ak
+    key = f"stock_sina_{symbol}"
+    cached = _cache_get(key, ttl_days=ttl_days)
+    if cached is not None and not cached.empty:
+        return cached
+    pre = "sh" if symbol.startswith(("6", "9", "5")) else "sz"
+    try:
+        df = ak.stock_zh_a_daily(symbol=f"{pre}{symbol}", adjust="qfq")
+    except Exception as e:
+        logger.warning("新浪个股 %s 获取失败(%s)，返回空", symbol, type(e).__name__)
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    df = df[df.index >= pd.Timestamp(start)]
+    _cache_set(key, df)
+    return df
+
+
+def load_index_sina(symbol: str = "399006", datalen: int = 3000,
+                    ttl_days: int = 1) -> pd.DataFrame:
+    """最终选指数日线全量源（新浪 CN_MarketData.getKLineData 直连，绕代理）。
+
+    与 load_index_daily_full（东财链，被环境代理挡时只剩缓存短历史）互补：
+    本函数一次拉全量历史（实测 3000 根/约 12 年），带 amount（量价因子需要），
+    trust_env=False 绕 Windows 残留代理。作为 v4 核心层回测与实时上下文的
+    历史数据基，优先于东财短链。返回 index=date, columns=[close, amount]。
+
+    缓存 TTL 默认 1 天：日频使用足够，增量由主流程在实时链路用
+    load_index_daily_full（东财增量）补齐后者负责；本函数保证全量深度。
+    """
+    import requests
+    pre = "sh" if symbol.startswith(("000", "950")) else "sz"
+    tsec = f"{pre}{symbol}"
+    key = f"index_sina_full_{symbol}"
+    cached = _cache_get(key, ttl_days=ttl_days)
+    if cached is not None and not cached.empty:
+        return cached
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={tsec}&scale=240&ma=no&datalen={datalen}")
+    session = requests.Session()
+    session.trust_env = False
+    headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0",
+               "Referer": "https://finance.sina.com.cn/"}
+    try:
+        r = session.get(url, headers=headers, timeout=25)
+        d = r.json()
+    except Exception as e:
+        logger.warning("新浪全量指数 %s 获取失败(%s)，回退短链", symbol, type(e).__name__)
+        return load_index_daily_full(symbol, "20190101")
+    if not isinstance(d, list) or not d:
+        logger.warning("新浪全量指数 %s 返回异常，回退短链", symbol)
+        return load_index_daily_full(symbol, "20190101")
+    df = pd.DataFrame(d)
+    df = df.rename(columns={"day": "date", "close": "close", "volume": "amount"})
+    for c in ["close", "amount", "high", "low", "open"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["close"]).drop_duplicates("date").set_index("date").sort_index()
+    keep = ["close", "amount"]
+    for c in ("high", "low"):
+        if c in df.columns:
+            keep.append(c)
+    df = df[keep]
+    if df.empty:
+        return load_index_daily_full(symbol, "20190101")
+    _cache_set(key, df)
+    return df
+
+
+def load_index_daily_full(symbol: str = "399006", start: str = "20220101") -> pd.DataFrame:
+    """指数日线（close+amount），TTL=1 天增量缓存。量能维度数据源。"""
+    end = datetime.now().strftime("%Y%m%d")
+    key = f"index_full_{symbol}"
+    cached = _cache_get(key, ttl_days=1)
+    if cached is not None and not cached.empty:
+        last = cached.index.max()
+        inc_start = (last + timedelta(days=1)).strftime("%Y%m%d")
+        if inc_start <= end:
+            inc = _fetch_index_full_frame(symbol, inc_start, end)
+            if inc is not None and not inc.empty:
+                cached = pd.concat([cached, inc])
+                cached = cached[~cached.index.duplicated(keep="last")].sort_index()
+                _cache_set(key, cached)
+        return cached[cached.index >= pd.Timestamp(start)]
+    df = _fetch_index_full_frame(symbol, start, end)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    _cache_set(key, df)
+    return df
+
+
 def load_panels(codes: List[str], start: str = "20190101",
                 progress_every: int = 50) -> PanelData:
     """加载全部个股宽表 + 基准指数。容忍个别股票失败（从截面剔除）。"""

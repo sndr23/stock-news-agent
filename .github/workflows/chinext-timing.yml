@@ -1,0 +1,65 @@
+# filepath: .github/workflows/chinext-timing.yml
+name: 创业板仓位信号
+
+# 每日 14:30（北京时间）推送创业板方向（CPO/PCB 场外基金）目标仓位建议，
+# 用户在 15:00 截单前手动执行。数据链：399006 日线(新浪全量) + 盘中实时(腾讯)
+# + factor_state 快照（贴水/资金/情绪/宽度/波动分位/risk_state）+ 缠论结构
+# + 消息推送（PushPlus / 企业微信）。状态写入 Gist 跨容器持久化 + 本地降级。
+# 周一至周五触发；重复 run 由脚本 last_date 去重兜底。
+on:
+  schedule:
+    - cron: "30 6 * * 1-5"   # 北京时间 14:30
+  workflow_dispatch:
+
+concurrency:
+  group: chinext-timing
+  cancel-in-progress: false
+
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 运行单元测试门禁
+        run: python -m pytest tests/test_chinext_timing.py tests/test_chinext_factors.py tests/test_chan_light.py -q --no-header -p no:cacheprovider
+
+      - name: 恢复数据缓存（新浪全量日线）
+        uses: actions/cache@v4
+        with:
+          path: data/strategy_cache
+          key: chinext-cache-${{ github.run_id }}
+          restore-keys: |
+            chinext-cache-
+
+      - name: 执行仓位信号推送
+        run: python scripts/run_chinext_timing.py --push --shadow
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinext-timing-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore

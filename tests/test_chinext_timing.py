@@ -1,0 +1,399 @@
+# -*- coding: utf-8 -*-
+"""创业板多因子择时核心（src/strategy/chinext_timing.py）单元测试"""
+import sys
+from pathlib import Path
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.strategy import chinext_timing as ct  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+
+# ---------------- 合成数据 ----------------
+
+def _up(n=320, r=0.002):
+    """单调上涨收盘序列。"""
+    return [100.0 * (1 + r) ** i for i in range(n)]
+
+
+def _down(n=320, r=0.002):
+    return [100.0 * (1 - r) ** i for i in range(n)]
+
+
+def _flat_amounts(n=320, base=1e9):
+    return [base] * n
+
+
+# ---------------- 核心层 ----------------
+
+def test_trend_score_uptrend_positive():
+    t = ct.trend_score(_up())
+    assert t["score"] > 0.9
+    assert t["above20"] is True
+
+
+def test_trend_score_downtrend_negative():
+    t = ct.trend_score(_down())
+    assert t["score"] < -0.9
+    assert t["above20"] is False
+
+
+def test_trend_score_short_history_returns_zero():
+    assert ct.trend_score([100.0] * 30)["score"] == 0.0
+
+
+def test_momentum_score_signs_and_intraday():
+    up = ct.momentum_score(_up(r=0.006))
+    assert up["score"] > 0.75  # 20日+12.7% 60日+43% → 接近满格
+    dn = ct.momentum_score(_down(r=0.006))
+    assert dn["score"] < -0.75
+    a = ct.momentum_score(_up(), intraday_pct=0.0)["score"]
+    b = ct.momentum_score(_up(), intraday_pct=3.0)["score"]
+    assert b > a  # 盘中上涨抬升动量
+
+
+def test_momentum_score_bounds():
+    s = ct.momentum_score(_up(r=0.05), intraday_pct=10.0)  # 极端涨幅仍封顶
+    assert s["score"] <= 1.0
+
+
+def test_volume_price_four_quadrants():
+    closes = _flat_then_move = [100.0] * 300
+    amounts = _flat_amounts(301)
+    # 放量上涨（末量2倍 + 末价+2%）
+    c2 = closes + [102.0]
+    a2 = amounts[:-1] + [amounts[-1] * 2.5]
+    assert ct.volume_price_score(c2, a2)["score"] > 0.5
+    # 放量下跌
+    c3 = closes + [98.0]
+    assert ct.volume_price_score(c3, a2)["score"] < -0.5
+    # 缩量反弹（末量0.2倍）
+    a4 = amounts[:-1] + [amounts[-1] * 0.2]
+    s = ct.volume_price_score(c2, a4)["score"]
+    assert 0 < s <= 0.3
+    # 缩量阴跌
+    assert -0.35 <= ct.volume_price_score(c3, a4)["score"] < 0
+
+
+def test_volume_price_intraday_crash_penalty():
+    closes = [100.0] * 300 + [102.0]
+    amounts = _flat_amounts(301)
+    calm = ct.volume_price_score(closes, amounts, intraday_pct=0.0)["score"]
+    crash = ct.volume_price_score(closes, amounts, intraday_pct=-3.0)["score"]
+    assert crash < calm
+
+
+def test_volume_price_no_amount_degrades():
+    closes = [100.0] * 300 + [102.0]
+    assert ct.volume_price_score(closes, [0.0] * 301)["score"] == 0.0
+
+
+def test_volatility_deep_drawdown_penalty():
+    # 造 60 日高点回撤 >12%：先涨后深跌
+    closes = [100.0 * (1.002 ** i) for i in range(280)] + \
+             [100.0 * (1.002 ** 279) * (0.85 ** (i + 1)) for i in range(15)]
+    v = ct.volatility_score(closes)
+    assert v["dd60"] < -12
+    assert v["score"] <= -0.99
+
+
+def test_volatility_no_penalty_in_calm_uptrend():
+    v = ct.volatility_score(_up())
+    assert v["score"] == 0.0
+
+
+def test_core_score_composition_and_bounds():
+    c = ct.core_score(_up(), _flat_amounts(320), intraday_pct=1.0)
+    assert c["score"] > 0.5
+    c2 = ct.core_score(_down(), _flat_amounts(320), intraday_pct=-2.0)
+    assert c2["score"] < -0.5
+    assert -1.0 <= c["score"] <= 1.0
+
+
+# ---------------- 修正层 ----------------
+
+def test_derivatives_modifier_discount_ladder():
+    assert ct.derivatives_modifier({"IC": {"annual_pct": -16.0}})["score"] == -0.15
+    assert ct.derivatives_modifier({"IC": {"annual_pct": -10.0}})["score"] == -0.10
+    assert ct.derivatives_modifier({"IC": {"annual_pct": -5.0}})["score"] == -0.05
+    assert ct.derivatives_modifier({"IC": {"annual_pct": -1.0}})["score"] == 0.0
+    assert ct.derivatives_modifier({"IC": {"annual_pct": 0.5}})["score"] == 0.05
+
+
+def test_derivatives_modifier_citic_and_clamp():
+    # 贴水-16 + 中信净-5000 → -0.25 被封到 -0.15
+    r = ct.derivatives_modifier({"IC": {"annual_pct": -16.0}}, citic_net=-5000)
+    assert r["score"] == -0.15
+    assert ct.derivatives_modifier({}, citic_net=3000)["score"] == 0.05
+    assert ct.derivatives_modifier({}, citic_net=-3000)["score"] == -0.10
+
+
+def test_derivatives_modifier_empty():
+    assert ct.derivatives_modifier({})["score"] == 0.0
+
+
+def test_flows_modifier_thresholds():
+    assert ct.flows_modifier({"main_net_yi": -150})["score"] == -0.10
+    assert ct.flows_modifier({"main_net_yi": -60})["score"] == -0.05
+    assert ct.flows_modifier({"main_net_yi": 20})["score"] == 0.0
+    assert ct.flows_modifier({"main_net_yi": 150})["score"] == 0.05
+
+
+def test_flows_modifier_sector_tech():
+    sf = {"inflow": [["电子", 30]], "outflow": []}
+    assert ct.flows_modifier({}, sf, ct.TECH_KW)["score"] == 0.03
+    sf2 = {"inflow": [], "outflow": [["半导体", 20]]}
+    assert ct.flows_modifier({}, sf2, ct.TECH_KW)["score"] == -0.03
+
+
+def test_mood_modifier_signals():
+    euphoria = ct.mood_modifier({"mood": "亢奋"}, {"down_pct": 20}, {"pcr": 0.5})
+    assert euphoria["score"] == 0.08  # 亢奋+0.05 下跌少+0.03 PCR低+0.03 → 封顶0.08
+    freeze = ct.mood_modifier({"mood": "冰点"}, {"down_pct": 80}, {"pcr": 2.0})
+    assert freeze["score"] == -0.08
+    assert ct.mood_modifier({}, {}, {})["score"] == 0.0
+
+
+def test_news_modifier_weighting():
+    evs = [
+        {"dir": "bearish", "title_norm": "光模块龙头业绩暴雷", "sectors": [], "entities": []},
+        {"dir": "bearish", "title_norm": "CPO板块遭大幅减持", "sectors": [], "entities": []},
+        {"dir": "bullish", "title_norm": "某消费公司中标", "sectors": [], "entities": []},
+    ]
+    r = ct.news_modifier(evs)
+    # (-1*1 -1*1 +1*0.2)/3 = -0.6 → -0.09
+    assert r["score"] == pytest.approx(-0.09, abs=1e-6)
+    assert r["n"] == 3
+
+
+def test_news_modifier_strong_bearish_floors():
+    evs = [{"dir": "bearish", "title_norm": f"科技利空{i}", "sectors": [], "entities": []}
+           for i in range(6)]
+    assert ct.news_modifier(evs)["score"] == -0.15  # 封底
+
+
+def test_news_modifier_empty():
+    r = ct.news_modifier([])
+    assert r["score"] == 0.0 and r["n"] == 0
+
+
+# ---------------- 硬风控 ----------------
+
+def _snap(risk="normal", pctile=None, ic=None):
+    s = {"risk_state": risk, "vol": {}, "basis": {}}
+    if pctile is not None:
+        s["vol"]["创业板指"] = {"pctile": pctile}
+    if ic is not None:
+        s["basis"]["IC"] = {"annual_pct": ic}
+        s["basis"]["IM"] = {"annual_pct": ic}
+    return s
+
+
+def test_defensive_caps_none_triggered():
+    r = ct.defensive_caps(_up(), 0.5, _snap(), None)
+    assert r["cap"] == 1.0 and r["reasons"] == []
+
+
+def test_defensive_caps_deep_drawdown():
+    closes = [100.0 * (1.002 ** i) for i in range(280)] + \
+             [100.0 * (1.002 ** 279) * (0.85 ** (i + 1)) for i in range(15)]
+    r = ct.defensive_caps(closes, 0.0, _snap(), None)
+    assert r["cap"] == 0.3
+
+
+def test_defensive_caps_vol_pctile():
+    assert ct.defensive_caps(_up(), 0.0, _snap(pctile=96), None)["cap"] == 0.6
+    assert ct.defensive_caps(_up(), 0.0, _snap(pctile=85), None)["cap"] == 1.0
+
+
+def test_defensive_caps_risk_off():
+    assert ct.defensive_caps(_up(), 0.0, _snap(risk="risk_off"), None)["cap"] == 0.3
+
+
+def test_defensive_caps_discount_plus_citic():
+    r = ct.defensive_caps(_up(), 0.0, _snap(ic=-13.0), citic_net=-3000)
+    assert r["cap"] == 0.6
+    # 只有贴水没有中信加空 → 不触发
+    assert ct.defensive_caps(_up(), 0.0, _snap(ic=-13.0), None)["cap"] == 1.0
+
+
+def test_defensive_caps_intraday_crash():
+    assert ct.defensive_caps(_up(), -3.0, _snap(), None)["cap"] == 0.3
+
+
+# ---------------- 档位状态机 ----------------
+
+def test_score_to_tier_boundaries():
+    assert ct.score_to_tier(0.40) == 1.0
+    assert ct.score_to_tier(0.39) == 0.9
+    assert ct.score_to_tier(0.05) == 0.9
+    assert ct.score_to_tier(0.00) == 0.9
+    assert ct.score_to_tier(-0.15) == 0.9
+    assert ct.score_to_tier(-0.16) == 0.6
+    assert ct.score_to_tier(-0.25) == 0.6
+    assert ct.score_to_tier(-0.30) == 0.6
+    assert ct.score_to_tier(-0.31) == 0.0
+
+
+def test_decide_downgrade_immediate():
+    prev = {"position": 1.0, "pending": None}
+    dec = ct.decide_position(-0.5, 1.0, prev)
+    assert dec["changed"] and dec["direction"] == "down" and dec["position"] == 0.0
+
+
+def test_decide_upgrade_needs_two_days():
+    prev = {"position": 0.0, "pending": None}
+    d1 = ct.decide_position(0.5, 1.0, prev)
+    assert not d1["changed"] and d1["pending"] == {"target": 1.0, "days": 1}
+    # 第2日同目标 → 确认执行（连续两日达标）
+    d2 = ct.decide_position(0.5, 1.0, d1)
+    assert d2["changed"] and d2["direction"] == "up" and d2["position"] == 1.0
+    assert d2["pending"] is None
+
+
+def test_decide_upgrade_target_dropout_resets():
+    """第1日提出升档，第2日分数回落（目标变低/不变）→ 不升档。"""
+    prev = {"position": 0.0, "pending": {"target": 1.0, "days": 1}}
+    d = ct.decide_position(0.1, 1.0, prev)  # 目标回落到 0.9
+    assert not d["changed"] and d["pending"] == {"target": 0.9, "days": 1}
+
+
+def test_decide_upgrade_resets_when_target_changes():
+    prev = {"position": 0.0, "pending": {"target": 1.0, "days": 1}}
+    # 次日目标变为 0.9（分数回落）→ pending 重置为 0.9 的第1天
+    d = ct.decide_position(0.1, 1.0, prev)
+    assert not d["changed"] and d["pending"] == {"target": 0.9, "days": 1}
+
+
+def test_decide_cap_forces_immediate_down():
+    prev = {"position": 1.0, "pending": None}
+    dec = ct.decide_position(0.5, 0.3, prev)  # 分数满仓但风控封顶3成
+    assert dec["changed"] and dec["direction"] == "down" and dec["position"] == 0.3
+
+
+def test_decide_hold_clears_pending():
+    prev = {"position": 0.6, "pending": {"target": 1.0, "days": 1}}
+    d = ct.decide_position(-0.20, 1.0, prev)  # 目标=当前档0.6
+    assert not d["changed"] and d["pending"] is None
+
+
+def test_hysteresis_band_blocks_threshold_jitter():
+    """分数在满仓线 0.40 下方 0.05 处震荡：原逻辑立即降档，滞回带内维持。"""
+    prev = {"position": 1.0, "pending": None}
+    d = ct.decide_position(0.38, 1.0, prev)  # 0.38 ∈ [0.35, 0.40) → 维持满仓
+    assert not d["changed"] and d["position"] == 1.0
+    d2 = ct.decide_position(0.34, 1.0, prev)  # 明确跌破 0.35 → 降九成
+    assert d2["changed"] and d2["position"] == 0.9
+
+
+def test_hysteresis_band_downgrade_path():
+    prev = {"position": 0.6, "pending": None}
+    # 0.01 ∈ [0.0, 0.05) → 维持六成（原逻辑降三成）
+    assert ct.decide_position(0.01, 1.0, prev)["position"] == 0.6
+    # -0.28 ∈ [-0.40, -0.35) 滞回带 → 维持三成
+    prev3 = {"position": 0.3, "pending": None}
+    assert ct.decide_position(-0.28, 1.0, prev3)["position"] == 0.3
+    # -0.41 明确跌破 -0.40（带滞回带维持线）→ 空仓
+    assert ct.decide_position(-0.41, 1.0, prev3)["position"] == 0.0
+
+
+def test_hysteresis_not_apply_to_upgrade():
+    """滞回带只护降档，不放松升档：不达高档位线不提议升档；达满仓线才提议（两日确认）。"""
+    prev = {"position": 0.6, "pending": None}
+    d = ct.decide_position(-0.20, 1.0, prev)
+    assert d["position"] == 0.6 and d["pending"] is None  # 未过0.9档升档线(-0.15)
+    d2 = ct.decide_position(0.41, 1.0, prev)
+    assert not d2["changed"] and d2["pending"]["target"] == 1.0  # 达满仓线，提议升档待确认
+
+
+# ---------------- 合成 ----------------
+
+def test_composite_bounded():
+    core = {"score": 0.9}
+    deriv = {"score": 0.15}
+    flow = {"score": 0.10}
+    mood = {"score": 0.08}
+    news = {"score": 0.15}
+    assert ct.composite(core, deriv, flow, mood, news) == 1.0  # 整体封顶
+    # 修正合计 0.48 被封到 0.30
+    assert ct.composite({"score": 0.0}, deriv, flow, mood, news) == 0.30
+    core_n = {"score": -0.9}
+    assert ct.composite(core_n, deriv, flow, mood, news) == -0.6  # -0.9+0.30
+
+
+def test_modifier_cannot_flip_neutral_market():
+    """修正层合计封顶 ±0.30 < 满仓线 0.40：中性核心永不被实时数据推到满仓档。"""
+    mods = ({"score": 0.15}, {"score": 0.10}, {"score": 0.08}, {"score": 0.15})
+    s = ct.composite({"score": 0.0}, *mods)
+    assert s == 0.30
+    assert ct.score_to_tier(s) == 0.9  # 最多到九成档，到不了满仓档
+
+
+def test_spearman_ic_perfect_rank():
+    # 完全正相关秩 → IC=1；完全负相关 → IC=-1
+    assert ct.spearman_ic([1, 2, 3, 4, 5], [10, 20, 30, 40, 50]) == pytest.approx(1.0, abs=1e-9)
+    assert ct.spearman_ic([1, 2, 3, 4, 5], [50, 40, 30, 20, 10]) == pytest.approx(-1.0, abs=1e-9)
+    # 并列秩处理不崩溃
+    r = ct.spearman_ic([1, 1, 2, 2, 3], [5, 4, 3, 2, 1])
+    assert -1.0 <= r <= 1.0
+
+
+def test_shadow_ic_sample_threshold():
+    # 样本 <10 → IC=None（不足门槛）
+    hist = [{"core": i, "next_ret": 0.01 * i} for i in range(5)]
+    out = ct.shadow_ic(hist)
+    assert out["core"]["ic"] is None and out["core"]["n"] == 5
+    # 样本 ≥10 且 core 与收益正相关 → 有 IC
+    hist = [{"core": i, "next_ret": 0.01 * (i - 5)} for i in range(20)]
+    out = ct.shadow_ic(hist)
+    assert out["core"]["ic"] is not None and out["core"]["n"] == 20
+    assert out["core"]["ic"] > 0.5
+    # 无 next_ret 样本不计
+    hist2 = [{"core": 1.0, "next_ret": None}] * 20
+    out2 = ct.shadow_ic(hist2)
+    assert out2["core"]["ic"] is None and out2["core"]["n"] == 0
+
+
+# ---------------- 中际旭创双确认 ----------------
+
+def test_stock_confirm_index_up_stock_weak_downgrade():
+    """指数看多但个股趋势走弱 → 降档确认 -0.10。"""
+    r = ct.stock_confirm(
+        {"score": -0.8}, {"score": -0.6}, {"score": 0.7})
+    assert r["score"] == -0.10
+    assert r["agree"] is False
+
+
+def test_stock_confirm_index_down_stock_strong_upgrade():
+    """指数看空但个股企稳走强 → 温和升档 +0.08。"""
+    r = ct.stock_confirm(
+        {"score": 0.8}, {"score": 0.6}, {"score": -0.7})
+    assert r["score"] == 0.08
+    assert r["agree"] is False
+
+
+def test_stock_confirm_agree_neutral():
+    """指数与个股同向 → 中性（主信号已覆盖）。"""
+    r = ct.stock_confirm(
+        {"score": 0.8}, {"score": 0.6}, {"score": 0.7})
+    assert r["score"] == 0.0
+    assert r["agree"] is True
+
+
+def test_stock_confirm_mild_divergence_no_action():
+    """轻微背离（个股方向未破 ±0.1）→ 不动作。"""
+    r = ct.stock_confirm(
+        {"score": -0.05}, {"score": -0.05}, {"score": 0.7})
+    assert r["score"] == 0.0
+    assert r["agree"] is False
+
+
+def test_stock_confirm_missing_data_skip():
+    """个股数据不足 → 跳过，不动作。"""
+    r = ct.stock_confirm(None, None, {"score": 0.7})
+    assert r["score"] == 0.0
+    assert r["agree"] is None
