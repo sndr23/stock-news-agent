@@ -125,6 +125,28 @@ def test_macro_exposure_absent_snapshot():
     assert nl.macro_exposure({})["factor"] == 1.0
 
 
+def test_macro_exposure_citic_net_short():
+    # 中信全合约净加空超阈值 → 降仓
+    citic = {"pos_history": [{"day": "2026-08-21",
+                              "net": {"IF": -1200, "IC": -800, "IH": -500, "IM": -700,
+                                      "_total": -3200}}]}
+    m = nl.macro_exposure({}, citic_state=citic)
+    assert m["factor"] <= 0.9
+    assert any("净加空" in r for r in m["reasons"])
+
+
+def test_macro_exposure_citic_net_long():
+    # 中信净加多 → 不降仓
+    citic = {"pos_history": [{"day": "2026-08-20",
+                              "net": {"IF": 500, "IC": 300, "_total": 800}}]}
+    m = nl.macro_exposure({}, citic_state=citic)
+    assert m["factor"] == 1.0
+
+
+def test_macro_exposure_no_citic_history():
+    assert nl.macro_exposure({}, citic_state={})["factor"] == 1.0
+
+
 # ---------- L2 反向：watchlist 合并 ----------
 def test_merge_watchlist_no_dup():
     wl = {"stocks": [{"name": "招商银行", "code": "600036"}]}

@@ -264,7 +264,8 @@ def main():
         try:
             _st = nlink.load_realtime_state()
             macro = nlink.macro_exposure(nlink.load_factor_state(),
-                                         base_exposure=1.0)
+                                         base_exposure=1.0,
+                                         citic_state=nlink.load_citic_pos_state())
             events = nlink.recent_pushed_events(_st, hours=48.0)
             holding_news = nlink.related_news_for_holdings(events, names, names)
             logger.info("协同层已加载：相关资讯 %d 组，宏观 overlay=%s",

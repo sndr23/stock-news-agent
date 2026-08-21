@@ -302,6 +302,13 @@ def main():
         return 1
 
     state["last_pushed_day"] = d.strftime("%Y%m%d")
+    # 落盘当日全合约净持仓摘要（供策略层 L3 宏观 overlay 消费，浅耦合只读）
+    daily_compact = {p: v["net_var"] for p, v in daily.items()}
+    daily_compact["_total"] = sum(daily_compact.values())
+    history = state.get("pos_history") or []
+    history.append({"day": d.strftime("%Y-%m-%d"),
+                    "net": daily_compact})
+    state["pos_history"] = history[-90:]  # 保留约 90 个交易日
     _save_state(state)
     logger.info(f"推送成功: {title}")
     return 0

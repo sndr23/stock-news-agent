@@ -50,6 +50,7 @@ _DIR_LABEL = {
 # 宏观 overlay（L3）：当 IC 深度贴水（年化≤-4%）扩大杠杆权重
 _IC_DEEP_SHORT_BPS = -0.04
 _FUND_FLOW_LOW_YI = -80.0  # 主力单日净流出 > 80 亿
+_CITIC_NET_SHORT_LOTS = -2000  # 中信全合约当日净加空 > 2000 手 → 降仓
 
 
 def _http_get_json(url: str, timeout: int = 15) -> dict:
@@ -84,23 +85,42 @@ def load_realtime_state() -> dict:
 
 def load_factor_state() -> dict:
     """读因子状态（云端 Gist 优先，本地降级）。只读。"""
+    return _read_gist_file(FACTOR_STATE_FILENAME) or _read_local(_FACTOR_STATE_PATH)
+
+
+CITIC_POS_STATE_FILENAME = "citic_pos_state.json"
+_CITIC_POS_STATE_PATH = PROJECT_ROOT / "logs" / "citic_pos_state.json"
+
+
+def load_citic_pos_state() -> dict:
+    """读中信期货净持仓状态（云端 Gist 优先，本地降级）。只读。"""
+    return _read_gist_file(CITIC_POS_STATE_FILENAME) or _read_local(_CITIC_POS_STATE_PATH)
+
+
+def _read_gist_file(filename: str) -> dict:
+    """从共用 Gist（GIST_ID）读指定状态文件；失败/无配置返回 {}"""
     gist_token = os.getenv("GIST_TOKEN", "").strip()
     gist_id = os.getenv("GIST_ID", "").strip()
-    if gist_token and gist_id:
-        try:
-            url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-            req = Request(url, headers={"Authorization": f"token {gist_token}",
-                                        "Accept": "application/vnd.github+json",
-                                        "User-Agent": "strategy-news-link"})
-            with urlopen(req, timeout=15) as resp:
-                g = json.loads(resp.read().decode("utf-8"))
-            fobj = (g.get("files") or {}).get(FACTOR_STATE_FILENAME)
-            if fobj is not None:
-                return json.loads(fobj.get("content") or "{}")
-        except Exception as e:
-            logger.warning("Gist 因子状态读取失败，降级本地: %s", type(e).__name__)
+    if not (gist_token and gist_id):
+        return {}
     try:
-        return json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
+        url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
+        req = Request(url, headers={"Authorization": f"token {gist_token}",
+                                    "Accept": "application/vnd.github+json",
+                                    "User-Agent": "strategy-news-link"})
+        with urlopen(req, timeout=15) as resp:
+            g = json.loads(resp.read().decode("utf-8"))
+        fobj = (g.get("files") or {}).get(filename)
+        if fobj is not None:
+            return json.loads(fobj.get("content") or "{}")
+    except Exception as e:
+        logger.warning("Gist 状态文件 %s 读取失败: %s", filename, type(e).__name__)
+    return {}
+
+
+def _read_local(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
@@ -269,10 +289,11 @@ def merge_watchlist_holdings(watchlist: dict, holdings: dict, names: dict) -> di
 
 
 def macro_exposure(state_factor: dict,
-                   base_exposure: float = 1.0) -> dict:
-    """L3 宏观 overlay：读 factor_state 快照，产出仓位系数修正。
+                   base_exposure: float = 1.0,
+                   citic_state: dict = None) -> dict:
+    """L3 宏观 overlay：读 factor_state 快照 + 中信期货净持仓，产出仓位系数修正。
     返回 {"factor": 修正系数, "reasons": [原因], "exposure": base*factor}。
-    约束：只读、向下修正（顶部风险），IC 深度贴水/资金大幅流出时减仓。
+    约束：只读、向下修正（顶部风险），IC 深度贴水/资金大幅流出/中信大幅加空时减仓。
     """
     snapshot = (state_factor.get("snapshot") or {}) or {}
     reasons = []
@@ -296,6 +317,19 @@ def macro_exposure(state_factor: dict,
         factor = min(factor, 0.92)
     elif risk_state:
         reasons.append(f"风险状态：{risk_state}")
+
+    # 中信期货全合约净持仓方向（L3 目标要求 2026-08-21）：取 pos_history 最新一条
+    citic_hist = (citic_state or {}).get("pos_history") or []
+    citic_latest = citic_hist[-1] if citic_hist else None
+    if citic_latest:
+        net = _to_float((citic_latest.get("net") or {}).get("_total"))
+        if net is not None:
+            day = str(citic_latest.get("day") or "")
+            if net <= _CITIC_NET_SHORT_LOTS:
+                reasons.append(f"中信全合约净加空 {int(net)} 手（{day}，谨慎）")
+                factor = min(factor, 0.9)
+            else:
+                reasons.append(f"中信净持仓 {int(net)} 手（{day}）")
     if not reasons:
         reasons.append("宏观状态正常，维持基准仓位")
     return {"factor": round(factor, 3),
