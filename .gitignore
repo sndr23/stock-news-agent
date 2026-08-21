@@ -57,3 +57,7 @@ neodata_*.txt
 # TRAE HTML 分享包临时产物（不入库）
 .trae-html-share-packages/
 logs/*.md
+
+# 策略层本地数据缓存与持仓状态（可重建/本地私有，不入库）
+data/strategy_cache/
+data/strategy_state.json

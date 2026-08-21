@@ -8,5 +8,8 @@ httpx~=0.28.0
 akshare~=1.18.0
 requests~=2.32.0
 pandas~=2.3.0
+# 策略层（2026-08-21）：数值计算与组合优化（SLSQP）
+numpy>=1.26,<3.0.0
+scipy>=1.11,<2.0.0
 # 交易日判断（2026-08-13 与 requirements-cloud.txt 对齐：本地 RT_ALWAYS_ON=0 时节假日判断依赖它）
 chinese_calendar>=1.9.0,<2.0.0

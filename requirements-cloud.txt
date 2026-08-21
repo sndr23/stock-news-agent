@@ -6,6 +6,9 @@ httpx~=0.28.0
 akshare~=1.18.0
 requests~=2.32.0
 pandas~=2.3.0
+# 策略层（2026-08-21）：数值计算与组合优化（SLSQP）
+numpy>=1.26,<3.0.0
+scipy>=1.11,<2.0.0
 chinese_calendar>=1.9.0,<2.0.0
 # 测试门禁依赖（2026-08-06 新增：CI 跑 -m unit 单元测试）
 pytest>=8.0.0
