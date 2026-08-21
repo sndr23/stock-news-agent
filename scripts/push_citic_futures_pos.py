@@ -202,21 +202,12 @@ def _save_state(state: dict) -> None:
 # ============================================================
 # 消息格式化
 # ============================================================
-# A股惯例：红涨绿跌。净加多单=利好红，净加空单=利空绿
-_RED = "#e23a3a"
-_GREEN = "#2e7d32"
-
-
-def _color_val(v: int, bold: bool = False) -> str:
-    """带红涨绿跌配色的数值（正=净加多单红，负=净加空单绿）"""
-    if v >= 0:
-        color, arrow = _RED, "▲"
-    else:
-        color, arrow = _GREEN, "▼"
-    inner = f"{arrow} {v:+d}"
+def _fmt_val(v: int, bold: bool = False) -> str:
+    """带符号数值，可选加粗"""
+    inner = f"{v:+d}"
     if bold:
         inner = f"<b>{inner}</b>"
-    return f'<font color="{color}">{inner}</font>'
+    return inner
 
 
 def format_message(d: date, daily: dict, recent: list) -> str:
@@ -237,10 +228,10 @@ def format_message(d: date, daily: dict, recent: list) -> str:
     ]
     for p in PRODUCTS:
         if p in daily:
-            lines.append(f"| {name_map[p]} | {_color_val(daily[p]['net_var'])} |")
+            lines.append(f"| {name_map[p]} | {_fmt_val(daily[p]['net_var'])} |")
     lines += [
         "",
-        f"**合计：{_color_val(total, bold=True)}（{direction}）**",
+        f"**合计：{_fmt_val(total, bold=True)}（{direction}）**",
         "",
         "---",
         "",
@@ -250,7 +241,7 @@ def format_message(d: date, daily: dict, recent: list) -> str:
         "| :--- | ---: |",
     ]
     for r in recent:
-        lines.append(f"| {r['day']} | {_color_val(r['total'])} |")
+        lines.append(f"| {r['day']} | {_fmt_val(r['total'])} |")
     lines += [
         "",
         "---",
