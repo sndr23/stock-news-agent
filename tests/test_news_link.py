@@ -109,6 +109,23 @@ def test_macro_exposure_deep_short_basis():
     assert m["exposure"] < 1.0
 
 
+def test_macro_exposure_mild_discount_no_trigger():
+    # annual_pct 单位为百分点：微幅贴水 -2% 不构成深度贴水，不降仓
+    st = {"snapshot": {"basis": {"IC": {"annual_pct": -2.0}}}}
+    m = nl.macro_exposure(st)
+    assert m["factor"] == 1.0
+    assert not any("贴水" in r for r in m["reasons"])
+
+
+def test_macro_exposure_basis_display_units():
+    # 展示口径：-12.11 百分点 → "-12.1%"，禁止二次 ×100 变 "-1211.0%"
+    st = {"snapshot": {"basis": {"IC": {"annual_pct": -12.11}}}}
+    m = nl.macro_exposure(st)
+    joined = " ".join(m["reasons"])
+    assert "IC年化贴水 -12.1%" in joined
+    assert "-1211" not in joined
+
+
 def test_macro_exposure_fund_outflow():
     st = {"snapshot": {"flows": {"main_net_yi": -120.0}}}
     m = nl.macro_exposure(st)

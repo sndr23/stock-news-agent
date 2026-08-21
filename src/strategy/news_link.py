@@ -47,9 +47,9 @@ _DIR_LABEL = {
     "bearish": ("利空", -1.0),
 }
 
-# 宏观 overlay（L3）：当 IC 深度贴水（年化≤-4%）扩大杠杆权重
-_IC_DEEP_SHORT_BPS = -0.04
-_FUND_FLOW_LOW_YI = -80.0  # 主力单日净流出 > 80 亿
+# 宏观 overlay（L3）：annual_pct 以百分点存储（-12.11 = -12.11%，对齐 factor_collector）
+_IC_DEEP_SHORT_PCT = -4.0
+_FUND_FLOW_LOW_YI = -80.0  # 主力单日净流出 > 80 亿（单位：亿）
 _CITIC_NET_SHORT_LOTS = -2000  # 中信全合约当日净加空 > 2000 手 → 降仓
 
 
@@ -302,8 +302,8 @@ def macro_exposure(state_factor: dict,
     for code in ("IF", "IC", "IM", "IH"):
         b = (basis.get(code) or {})
         ap = _to_float(b.get("annual_pct"))
-        if ap is not None and ap <= _IC_DEEP_SHORT_BPS:
-            reasons.append(f"{code}年化贴水 {ap*100:.1f}%（深度贴水，谨慎）")
+        if ap is not None and ap <= _IC_DEEP_SHORT_PCT:
+            reasons.append(f"{code}年化贴水 {ap:.1f}%（深度贴水，谨慎）")
             factor = min(factor, 0.95)
     flows = snapshot.get("flows") or {}
     main_net = _to_float(flows.get("main_net_yi"))
