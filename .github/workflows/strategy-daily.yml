@@ -23,6 +23,8 @@ jobs:
     env:
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
 
     steps:
       - name: 检出代码
@@ -50,8 +52,8 @@ jobs:
           restore-keys: |
             strategy-cache-
 
-      - name: 执行策略日报推送
-        run: python scripts/run_strategy.py --push --backtest
+      - name: 执行策略日报推送（三层协同）
+        run: python scripts/run_strategy.py --push --backtest --link
 
       - name: 上传日志（调试用）
         if: always()
