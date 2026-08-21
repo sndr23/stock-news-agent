@@ -2199,8 +2199,10 @@ def format_push_alert(news: dict, judge: dict, factor_env: str = "", opposite_no
     factor_env（P0-1 2026-08-19 融合展示）: 由 _factor_env_line 生成的单行
     因子快照（"市场环境: ...IC贴水/日元/上证..."），空串时不附该行，
     向后兼容（factor_collector 未跑/快照过期 → 推送退化为原格式）。
-    env_note（P2-2 2026-08-19）: judge 的共振/背离标注（LLM 结合量化环境
-    生成，如"背离: 利好但风险收缩期，谨慎对待"），空串不展示。
+    env_note（P2-2 2026-08-19，2026-08-22 停用展示）: judge 的共振/背离标注
+    （LLM 结合量化环境生成，如"背离: 利好但风险收缩期，谨慎对待"）。已不再渲染到
+    推送（用户决定——择时报告已覆盖量化环境判断）；LLM prompt/解析链路保留，
+    需要时可恢复展示。
     opposite_note（P6-2 2026-08-19）: 跨事件矛盾附注（近48h同主体反向已推
     事件），空串不展示——叙事链的"矛盾"环节，双向可见。
     """
@@ -2224,8 +2226,6 @@ def format_push_alert(news: dict, judge: dict, factor_env: str = "", opposite_no
     lines = [f"{emoji}【{label}】{title}", ""]
     meta = [f"**范围**: {scope_label}", f"**影响分**: {score}", f"**板块**: {sector_str}"]
     lines.append(" | ".join(meta))
-    if env_note:
-        lines.append(f"**环境**: {env_note}")
     if factor_env:
         lines.append(factor_env)
     if opposite_note:
@@ -2490,12 +2490,12 @@ def run_once(dry_run: bool = False) -> dict:
     # pushed_events 已在 LLM 判定前初始化（P6-3 上移）
     # 风险收缩期联动（2026-08-14 第二阶段）：factor_collector 写入的 risk_state，
     # risk_off 时对无硬事件佐证的科技利好降级不推。
-    # P0-1（2026-08-19）：同一份 factor_state（已在第 4 步加载）取 snapshot 生成
-    # "市场环境"行附在每条推送卡片上，一次 Gist 读取三用。
+    # 2026-08-22 停用：不再附"市场环境"因子快照行（用户决定——已上线创业板择时
+    # 系统，14:30 择时报告含完整因子快照+仓位信号，资讯推送附该行冗余且时间戳过期）。
+    # _factor_env_line 函数保留（纯函数+测试覆盖），需要时可恢复。
     risk_state = factor_state.get("risk_state")
     if risk_state not in ("risk_off", "neutral"):
         risk_state = "neutral"
-    factor_env = _factor_env_line(factor_state.get("snapshot") or {})
     for n, j in reps:
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
@@ -2587,7 +2587,7 @@ def run_once(dry_run: bool = False) -> dict:
         # P6-2：跨事件矛盾附注（近48h同主体反向已推事件）——叙事链"矛盾"环节
         opposite_note = _opposite_events_note(n["_sig"], str(j.get("direction") or ""),
                                               pushed_events)
-        content = format_push_alert(n, j, factor_env=factor_env, opposite_note=opposite_note)
+        content = format_push_alert(n, j, opposite_note=opposite_note)
         if dry_run:
             logger.info(f"[dry-run] 将推送: {n.get('title', '')[:50]}")
             # Windows 控制台默认 GBK 无法打印 emoji，先切 UTF-8 容错
