@@ -403,8 +403,10 @@ def stock_confirm(stock_trend: dict, stock_mom: dict, index_trend: dict,
     st = float(stock_trend.get("score") or 0.0)
     sm = float(stock_mom.get("score") or 0.0)
     it = float(index_trend.get("score") or 0.0)
-    # 个股综合方向（趋势+动量等权）；当日盘中强弱折算为动量增量（上限±0.4）
-    day = max(-0.4, min(0.4, intraday_pct / 5.0))
+    # 个股综合方向（趋势+动量等权）；当日盘中强弱折算为动量增量。
+    # ⚠ 权重刻意压低（/8、±0.25 封顶）：维护"创业板指数为主导"——旭创仅作
+    # 情绪佐证，盘中涨跌幅不得主导方向判断（初版 /5±0.4 在±2%即饱和、反客为主）。
+    day = max(-0.25, min(0.25, intraday_pct / 8.0))
     stock_dir = 0.5 * st + 0.5 * sm + day
     agree = (stock_dir >= 0) == (it >= 0)
     s = 0.0
@@ -457,7 +459,8 @@ def _rank(a):
 
 
 def shadow_ic(history: list, fields: tuple = ("core", "basis", "flow", "mood",
-                                              "news", "position")) -> dict:
+                                              "news", "chan", "stock", "sox",
+                                              "position")) -> dict:
     """影子期各因子的 Spearman IC（因子秩 vs 前瞻收益秩）。
     前瞻口径：next_ret(1日)/r3(3日)/r5(5日)/r10(10日)。样本 < MIN_IC_SAMPLES 记不足。
     返回 {field: {"ic": float|None, "n": int, **{"horizon_<h>": ic_d...}}}。

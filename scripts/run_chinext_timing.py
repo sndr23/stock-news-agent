@@ -335,8 +335,9 @@ def score_all(ctx: dict) -> dict:
         pass
     caps = cf.defensive_state(closes, vol_pctile, glass)
     # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
-    # 附注A曾误写/误用">0.90"(那是便宜度>0.9=极便宜，语义反了，已修正)，
-    # 经样本外寻优确认：估值极贵时降仓(躲2015后估值消化期)为正向逻辑。
+    # ⚠ 语义纠正后实证为"净负贡献"（附注A：+291.9%基线 → +188.8%）：
+    # 该约束并非已验证的正向超额，而是用户拍板保留的保守约束（泡沫期事前降仓）。
+    # 勿误作"已验证正贡献"。
     _erp_series = ctx.get("erp_pctile") or []
     if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -599,7 +600,9 @@ def main():
     logger.info("399006 日线 %d 根（%s ~ %s）", len(df),
                 df.index[0].date(), df.index[-1].date())
 
-    if args.shadow:
+    if args.shadow and not args.push:
+        # 纯 --shadow 报告模式。--push --shadow（云端组合）不在此短路，
+        # 否则推送逻辑永远执行不到（曾致云端 14:45 从不推送/状态不写/影子不积累）。
         state = load_state()
         hist = state.get("history") or []
         if not hist:
