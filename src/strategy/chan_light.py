@@ -72,7 +72,8 @@ def find_fractals(merged: List[Tuple[int, float, float]],
 
 def compute_bis(prices_high: Sequence[float], prices_low: Sequence[float],
                 fractals: List[Tuple[str, int]]) -> List[dict]:
-    """由分型+价格构造笔，含 gap 校验。返回 [{type,start,end,px0,px1}]。"""
+    """由分型+价格构造笔（简化实现：允许短笔，不做 gap≥3 严格校验）。
+    返回 [{type,start,end,px0,px1}]。"""
     bis = []
     prev = None
     for ftype, fidx in fractals:
@@ -85,15 +86,13 @@ def compute_bis(prices_high: Sequence[float], prices_low: Sequence[float],
             prev = (ftype, fidx)
             continue
         if ftype != ptype:
-            # 顶底交替成笔
-            gap = abs(fidx - pidx)
-            if gap >= 3 or True:  # 允许短笔，简化
-                if ptype == "bottom":
-                    bis.append({"type": "up", "start": pidx, "end": fidx,
-                                "px0": prices_low[pidx], "px1": prices_high[fidx]})
-                else:
-                    bis.append({"type": "down", "start": pidx, "end": fidx,
-                                "px0": prices_high[pidx], "px1": prices_low[fidx]})
+            # 顶底交替成笔（简化实现：允许短笔，不做 gap≥3 严格校验）
+            if ptype == "bottom":
+                bis.append({"type": "up", "start": pidx, "end": fidx,
+                            "px0": prices_low[pidx], "px1": prices_high[fidx]})
+            else:
+                bis.append({"type": "down", "start": pidx, "end": fidx,
+                            "px0": prices_high[pidx], "px1": prices_low[fidx]})
             prev = (ftype, fidx)
     return bis
 

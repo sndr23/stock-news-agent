@@ -8,7 +8,7 @@ name: 创业板仓位信号
 # 周一至周五触发；重复 run 由脚本 last_date 去重兜底。
 on:
   schedule:
-    - cron: "30 6 * * 1-5"   # 北京时间 14:30
+    - cron: "45 6 * * 1-5"   # 北京时间 14:45
   workflow_dispatch:
 
 concurrency:

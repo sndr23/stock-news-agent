@@ -359,7 +359,7 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
     else:
         act = f"维持 {pos:.0%}（今日无操作）"
 
-    lines = [f"【创业板仓位信号 {today[5:]} 14:30】", ""]
+    lines = [f"【创业板仓位信号 {today[5:]} 14:45】", ""]
     lines.append(f"■ 建议：{act}")
     lines.append(f"■ 综合分 {res['score']:+.2f}（核心 {core['score']:+.2f} / "
                  f"修正 {res['score'] - core['score']:+.2f}）")
@@ -516,8 +516,8 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
         "",
         f"降档质量：{m['n_down']} 次减仓后10日市场 {dodge[1]:+.1%}（均值），"
         f"{dodge[0]:.0%} 段为下跌",
-        "口径：因子只用 ≤d-1 数据、吃 d+1 收益（对齐场外基金T+1）；仅核心层10因子五维，"
-        "实时修正层+缠论不可回测（影子期再评估）。" + val_note + "。",
+        "口径：信号日 d 用当日 d 收盘价出信号、吃 d+1 收益（收盘后决策对齐场外基金T+1）；"
+        "仅核心层10因子五维，实时修正层+缠论不可回测（影子期再评估）。" + val_note + "。",
     ])
 
 
