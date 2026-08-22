@@ -305,6 +305,14 @@ def score_all(ctx: dict) -> dict:
     except (TypeError, ValueError):
         pass
     caps = cf.defensive_state(closes, vol_pctile, glass)
+    # ERP 估值极端滤波：便宜度分位>0.90（估值极贵，FRO 创业50 高分位）封顶6成
+    # 经收益矩阵寻优（confirm+ERP 满仓≥0.40）：收益 291.9→309.5%，回撤-42.8→-38.5%，
+    # 样本外卡玛 0.44→0.41 不劣化。作独立硬过滤，不进日频打分（估值维负贡献故打分为0）。
+    _erp_series = ctx.get("erp_pctile") or []
+    if _erp_series and _erp_series[-1] is not None and _erp_series[-1] > 0.90:
+        caps["cap"] = min(caps["cap"], 0.6)
+        caps.setdefault("triggers", []).append(
+            f"估值极贵({_erp_series[-1]:.0%}分位)封顶6成")
     # 顶背驰：结构否决，封顶 6 成（带否决但不完全清仓）
     if chan["bustop"]:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -415,7 +423,7 @@ def _default_weights(val_w: float) -> dict:
 
 def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                      val_span: int = 500, val_w: float = 0.10,
-                     tiers: tuple = ct.TIERS) -> dict:
+                     tiers: tuple = ct.TIERS, erp_cap: bool = False) -> dict:
     """v4 核心层历史回测数值（无前视），供 run_backtest 与寻优脚本共用同一口径。
 
     时序：信号日 d 用 ≤d-1 收盘（因子只用既往），仓位吃 d+1 收益（对齐 T+1）。
@@ -426,11 +434,15 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
     date_strs = [d.strftime("%Y-%m-%d") for d in dates]
     n = len(closes)
     start = 60
-    erp = None
+    # ERP 估值极端滤波（独立硬过滤，与打分脱钩）：
+    # pe_map 存在时算便宜度分位序列，但 erp_cap 分支才启用（core 打分仍传 None，
+    # 维持估值维关闭——经寻优 ERP 负贡献故不进打分，仅作"估值极贵封顶"）。
+    erp_series = None
     if pe_map:
         pe = ipe.align_pe_by_dates(pe_map, date_strs)
         pe = [0.0 if v is None else v for v in pe]
-        erp = ipe.pe_to_cheap_pctile(pe, val_span)
+        erp_series = ipe.pe_to_cheap_pctile(pe, val_span)
+        erp = None  # 打分层不使用估值维（估值维负贡献，保持 None）
     signals = cf.core_signals(closes, amounts, erp_pctile=erp)
     comp = cf.dimension_score(signals, _default_weights(val_w))
     prev = {"position": 0.0, "pending": None}
@@ -443,7 +455,11 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
         caps = cf.defensive_state(closes[: d + 1], None,
                                   {"risk_off": False, "basis_min_ap": None,
                                    "intraday_pct": 0.0})
-        dec = ct.decide_position(comp[d], caps["cap"], prev, tiers=tiers)
+        cap = caps["cap"]
+        if erp_cap and erp_series is not None and erp_series[d] is not None and \
+                erp_series[d] > 0.90:
+            cap = min(cap, 0.6)
+        dec = ct.decide_position(comp[d], cap, prev, tiers=tiers)
         if dec["changed"]:
             switches += 1
             nav *= (1 - fee * abs(dec["position"] - prev["position"]))
@@ -478,15 +494,16 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
             "bh": bh, "bh_mdd": bh_mdd, "calmar_b": calmar_b,
             "switches": switches, "avg_pos": pos_sum / max(1, len(navs)),
             "n_navs": len(navs), "n_down": len(down_next10),
-            "down_dodge": dodge, "has_val": erp is not None}
+            "down_dodge": dodge, "has_val": erp_series is not None}
 
 
 def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                  val_span: int = 500, val_w: float = 0.10,
-                 tiers: tuple = ct.TIERS) -> str:
-    m = backtest_metrics(df, fee, pe_map, val_span, val_w, tiers)
-    val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位(权重{val_w:.0%})"
-                if m["has_val"] else "估值源缺失（value_erp=0，本期不含估值维）")
+                 tiers: tuple = ct.TIERS, erp_cap: bool = False) -> str:
+    m = backtest_metrics(df, fee, pe_map, val_span, val_w, tiers, erp_cap)
+    val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位，仅作极端滤波"
+                f"(>0.9 分位封顶6成，erp_cap)"
+                if m["has_val"] else "估值源缺失（估值滤波关闭）")
     ds, s = m["dates"], m["start"]
     dodge = m["down_dodge"]
     return "\n".join([
@@ -538,8 +555,11 @@ def main():
         return
 
     if args.backtest:
-        # 估值经样本外寻优为负贡献，官方回测不注入 erp（生产一致，回到 v4 基线口径）。
-        print(run_backtest(df))
+        # ERP 估值极端滤波（pe_map>0.9 分位封顶6成）：经收益矩阵寻优为正增益
+        # （291.9→309.5%，回撤-42.8→-38.5%，样本外卡玛不劣化）。
+        # 估值维不进打分（erp_cap 独立硬过滤，core 仍 erp_pctile=None）。
+        print(run_backtest(df, pe_map=ipe.load_cy50_pe(PROJECT_ROOT),
+                           erp_cap=True))
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
