@@ -35,7 +35,7 @@
 | `scripts/factor_collector.py` | 量化因子采集/方向合成/异动推送（P0–P12，含 IC 验证） | ✅ 生产（realtime-factor） |
 | `scripts/signal_backtest.py` | 已推事件信号质量回测（后 1/3/5 日一致性 + 分层 IC） | ✅ 生产（signal-backtest） |
 | `scripts/push_citic_futures_pos.py` | 中信期货 IF/IH/IC/IM 净持仓日报（全合约聚合口径，Gist 去重） | ✅ 生产（citic-pos-push） |
-| `scripts/run_chinext_timing.py` | **创业板仓位择时**（核心工具）：核心层10因子+缠论+旭创双确认+外盘辅助确认 → 目标仓位推送 | ✅ 生产（chinext-timing，每日14:30） |
+| `scripts/run_chinext_timing.py` | **创业板仓位择时**（核心工具）：核心层10因子+缠论+旭创双确认+外盘辅助确认 → 目标仓位推送 | ✅ 生产（chinext-timing，每日14:45） |
 | `src/strategy/chinext_*.py` | 创业板择时系统模块（见下节） | ✅ 2026-08-22 新增 |
 | `src/strategy/fund_rotation.py` | 基金轮动辅助（独立功能） | ✅ 本地 |
 | `archive/选股策略层_20260822/` | ~~机构式多因子选股框架~~（已归档停用，见下节） | ⛔ 2026-08-22 归档 |
@@ -44,7 +44,7 @@
 
 ## 创业板仓位择时系统（src/strategy/，2026-08-22 核心）
 
-**单资产择时**：预测创业板指（399006）方向，输出目标仓位（0/60/90/100%），供用户在 15:00 截单前手动执行场外基金申赎。**每日 14:30 自动推送**（`chinext-timing.yml`）。
+**单资产择时**：预测创业板指（399006）方向，输出目标仓位（0/60/90/100%），供用户在 15:00 截单前手动执行场外基金申赎。**每日 14:45 自动推送**（`chinext-timing.yml`，cron-job.org jobId=8309384）。
 
 ```
 核心层（可回测，权重100%基准）
@@ -73,7 +73,7 @@
 | 08:45 | 盘前简报 | market-brief |
 | 盘中×N | 实时资讯（每30分钟） | realtime-push |
 | 盘中×N | 因子采集（盘中15分钟） | realtime-factor |
-| **14:30** | **创业板仓位信号** | **chinext-timing** |
+| **14:45** | **创业板仓位信号** | **chinext-timing** |
 | 15:10 | 盘后复盘 | market-brief |
 | 17:00 | 中信持仓日报 | citic-pos-push |
 | 周六 | 信号质量回测 | signal-backtest |
