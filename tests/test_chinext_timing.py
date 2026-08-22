@@ -448,3 +448,35 @@ def test_update_shadow_history_accepts_res_top_level():
     assert h["chan"] == -0.08          # 修复前恒 0
     assert h["stock"] == -0.10         # 修复前恒 0
     assert h["sox"] == -0.04           # 外盘实值
+
+
+def test_shadow_raw_captures_main_net_yi():
+    """回归：_shadow_raw 必须读取快照键 main_net_yi（曾误读 main_net 致资金流原始值恒 None，
+    资金维原始 IC 验门静默失效）；缺源一律置 None 且键恒存在（与"缺源降级0"解耦）。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import _shadow_raw
+
+    ctx = {"snapshot": {
+        "basis": {"IC": {"annual_pct": -9.5}, "IM": {"annual_pct": -11.2}},
+        "flows": {"main_net_yi": -86.4},
+        "breadth": {"down_pct": 74.0},
+        "option": {"pcr": 1.62}}}
+    raw = _shadow_raw(ctx)
+    assert raw["basis_min_ap"] == -11.2     # IC/IM 最差年化
+    assert raw["main_net"] == -86.4         # 修复前恒 None
+    assert raw["down_pct"] == 74.0
+    assert raw["pcr"] == 1.62
+
+    # 缺源：四键全部存在且为 None（不允许键缺失，避免下游 KeyError/假0）
+    raw2 = _shadow_raw({"snapshot": {}})
+    assert raw2 == {"basis_min_ap": None, "main_net": None,
+                    "down_pct": None, "pcr": None}
+
+    # 兼容旧快照缺失 flows 键
+    raw3 = _shadow_raw({"snapshot": {"breadth": {"down_pct": 10.0}}})
+    assert raw3["main_net"] is None
+    assert raw3["down_pct"] == 10.0
