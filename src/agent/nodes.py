@@ -17,7 +17,14 @@ import json
 import re
 import time
 import logging
-from langchain_core.messages import AIMessage
+try:
+    # LangChain 消息类型仅用于 LangGraph agent 节点返回 messages 字段；
+    # 云端 production 不装 langchain，降级为轻量占位，保证模块可 import（CI 门禁依赖）。
+    from langchain_core.messages import AIMessage
+except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
+    # 极简消息占位：仅承载 content，匹配 AIMessage 的构造/读取接口即可
+    from collections import namedtuple
+    AIMessage = lambda content="", **kw: namedtuple("AIMessage", "content")(content=content)
 
 logger = logging.getLogger(__name__)
 
@@ -890,7 +897,16 @@ def _llm_analyze_batch_structured(batch: list, deadline: float = 0) -> list:
     if deadline and time.monotonic() >= deadline:
         raise Exception("LLM 总超时熔断，跳过方式A")
     try:
-        from langchain_core.messages import HumanMessage, SystemMessage
+        # 惰性：云端无 langchain 时用轻量占位消息类（仅承载 content，
+        # 供 mock 化测试与 requests 降级路径复用，功能与原 langchain 消息等价）
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+        except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
+            class _Msg:
+                def __init__(self, content=""):
+                    self.content = content
+            HumanMessage = _Msg
+            SystemMessage = _Msg
         llm = _build_llm()
         resp = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=prompt)])
         content = resp.content if isinstance(resp.content, str) else str(resp.content)

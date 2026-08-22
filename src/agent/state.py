@@ -4,7 +4,15 @@ A股资讯监测 Agent 状态定义
 基于 LangGraph 1.0 的 StateGraph 状态模型
 """
 from typing import TypedDict, Annotated, Literal
-from langgraph.graph.message import add_messages
+try:
+    # LangGraph 1.0 reducer 仅用于 AgentState.messages 注解元数据；
+    # 云端 production 不装 langgraph，降级为恒等 reducer，保证类型模块可 import（CI 门禁依赖）。
+    from langgraph.graph.message import add_messages
+except ImportError:  # pragma: no cover - 仅无 langgraph 的云端环境触发
+    def add_messages(left, right):
+        if isinstance(right, list):
+            return left + right
+        return (left or []) + [right]
 
 NO_DATA_SENTINEL = "NO_DATA_AVAILABLE"
 

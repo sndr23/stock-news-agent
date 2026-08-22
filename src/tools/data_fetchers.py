@@ -14,7 +14,12 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from langchain_core.tools import tool
+try:
+    # LangChain Tools 对接层是可选的：云端 production 按 requirements-cloud.txt 不装 langchain，
+    # 此处惰性降级为恒等装饰器，避免无 langchain 环境 import 失败（CI 测试门禁依赖此容错）。
+    from langchain_core.tools import tool
+except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
+    tool = lambda f: f
 
 logger = logging.getLogger(__name__)
 
