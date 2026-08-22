@@ -309,6 +309,27 @@ def core_signals(close: Sequence[float], amount: Sequence[float],
     }
 
 
+# ---------------- 候选因子（未接入权重，验门通过后建议接入） ----------------
+
+def factor_short_reversal(close: Sequence[float], horizon: int = 5) -> list:
+    """短期反转（候选，2026-08-22）：近 horizon 日累计收益的反向 → [-1,1]。
+
+    逻辑：A 股创业板散户占比高 + 涨跌停制度，短期（1~5 日）动量反转是
+    国内实证最稳健的异象之一——短期涨幅过大 → 反转看空，急跌 → 反弹看多。
+    与 core_signals 中 60 日动量互补（60 日趋势 vs 5 日反转，不同频段）。
+
+    ⚠ 验门纪律：本因子为**候选**，未接入 dimension_score 权重。
+    必须经 scripts/factor_ic_probe.py 历史 IC 验证（|IC|≥0.05 且样本≥10，
+    且样本外分段稳健）后方可接入；否则保持候选。
+    """
+    out = [0.0] * len(close)
+    for i in range(horizon, len(close)):
+        m = close[i] / close[i - horizon] - 1.0
+        # 反向：近 5 日涨 8% → -1；跌 8% → +1（5 日 8% ≈ 创业板日波动 2σ 尺度）
+        out[i] = round(max(-1.0, min(1.0, -m / 0.08)), 3)
+    return out
+
+
 def dimension_score(signals: dict, weights: dict = None) -> list:
     """按 v4 维度权重合成核心综合分。signals: {name: [score...]}。返回 [score...]。
     维度权重：趋势0.35 量价0.20 波动0.20 估值0.10 落袋0.15。"""

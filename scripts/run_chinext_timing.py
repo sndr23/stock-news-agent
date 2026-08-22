@@ -98,13 +98,32 @@ def save_state(state: dict) -> bool:
 # ---------------- 数据聚合 ----------------
 
 def gather_context(df) -> dict:
-    """聚合全部数据源，任何一源失败独立降级。"""
+    """聚合全部数据源，任何一源失败独立降级。
+
+    数据口径收口（2026-08-22）：末根若为当日（14:45 盘中 partial），
+    无条件剔除——closes/amounts/highs/lows/dates 同步去掉末根。
+    - 信号只用 ≤d-1 完整日线（与回测口径一致，杜绝 partial 污染均线/量能/波动）；
+    - 无论数据层缓存是否命中（缓存 TTL=1 天导致"末根是否当日"抖动），
+      本函数行为恒一：当日 bar 一律剔除 → 同一时点信号可复现；
+    - 当日盘中信息走 intraday（指数涨跌幅）与 day_amount_ratio（量能比）；
+    - 影子 1 日前瞻回填 next_ret 时 closes[i+1] 因此恒为完整收盘，消除偏置。
+    """
     closes = df["close"].tolist()
     amounts = (df["amount"].tolist() if "amount" in df else [0.0] * len(closes))
     dates = [d.strftime("%Y-%m-%d") for d in df.index]
     # 缠论需 high/low（新浪全量链提供；备用链缺则退化跳过缠论）
     highs = (df["high"].tolist() if "high" in df else [])
     lows = (df["low"].tolist() if "low" in df else [])
+    today_s = datetime.now().strftime("%Y-%m-%d")
+    _last_raw_date = dates[-1] if dates else None
+    if dates and dates[-1] == today_s and len(closes) > 1:
+        closes = closes[:-1]
+        amounts = amounts[:-1]
+        dates = dates[:-1]
+        if highs:
+            highs = highs[:-1]
+        if lows:
+            lows = lows[:-1]
 
     intraday = 0.0
     try:
@@ -176,16 +195,14 @@ def gather_context(df) -> dict:
     except Exception as e:
         logger.warning("中际旭创数据读取失败（跳过双确认）: %s", type(e).__name__)
 
-    # 修复2：实盘量价口径收口——当日(14:45)新浪返回 partial 累计成交额，
-    # 若用它进量能滚动分位会系统性低估量能分位(更容易落"缩量"档→盘中偏空)。
-    # 处理：末根若为当日 partial，量能序列用 ≤d-1 完整量占位(保持长度与 close 对齐)，
     # 当日实时量能单独记录 day_amount_ratio 供盘面判断，不进量价因子分位。
+    # （末根 partial 已在 gather_context 顶部剔除；仅当原始末根确为当日时才计算，
+    #   缓存命中（末根为昨日完整量）时 ratio 语义不存在，置 0 不报告）
     day_amount_ratio = 0.0
-    if len(amounts) >= 2 and dates and dates[-1] == datetime.now().strftime("%Y-%m-%d"):
-        if amounts[-1] and amounts[-2]:
-            day_amount_ratio = amounts[-1] / amounts[-2]
-        amounts = list(amounts)
-        amounts[-1] = amounts[-2]  # 当日 partial 作废，用昨量占位(长度不变)
+    if _last_raw_date == today_s:
+        _amt_raw = (df["amount"].tolist() if "amount" in df else [])
+        if len(_amt_raw) >= 2 and _amt_raw[-1] and _amt_raw[-2]:
+            day_amount_ratio = _amt_raw[-1] / _amt_raw[-2]
     return {"closes": closes, "amounts": amounts, "dates": dates,
             "highs": highs, "lows": lows,
             "intraday": intraday, "snapshot": snapshot,
@@ -546,11 +563,11 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
     # pe_map 存在时算便宜度分位序列，但 erp_cap 分支才启用（core 打分仍传 None，
     # 维持估值维关闭——经寻优 ERP 负贡献故不进打分，仅作"估值极贵封顶"）。
     erp_series = None
+    erp = None  # 打分层不使用估值维（估值维负贡献，保持 None）；pe_map 缺失也安全
     if pe_map:
         pe = ipe.align_pe_by_dates(pe_map, date_strs)
         pe = [0.0 if v is None else v for v in pe]
         erp_series = ipe.pe_to_cheap_pctile(pe, val_span)
-        erp = None  # 打分层不使用估值维（估值维负贡献，保持 None）
     signals = cf.core_signals(closes, amounts, erp_pctile=erp)
     comp = cf.dimension_score(signals, _default_weights(val_w))
     prev = {"position": 0.0, "pending": None}
@@ -569,16 +586,20 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
             # 便宜度<0.10=PE处于顶部10%（估值极贵）→封顶6成，与 score_all 同口径
             cap = min(cap, 0.6)
         dec = ct.decide_position(comp[d], cap, prev, tiers=tiers)
+        fee_cost = 0.0
         if dec["changed"]:
             switches += 1
-            nav *= (1 - fee * abs(dec["position"] - prev["position"]))
+            fee_cost = fee * abs(dec["position"] - prev["position"])
+            nav *= (1 - fee_cost)
             if dec["direction"] == "down" and d + 11 < n:
                 down_next10.append(closes[d + 10] / closes[d] - 1.0)
         prev = {"position": dec["position"], "pending": dec["pending"]}
         pos_sum += dec["position"]
         r = closes[d + 1] / closes[d] - 1.0
         nav *= (1 + dec["position"] * r)
-        daily_rets.append(dec["position"] * r)
+        # 换仓费计入当日收益（此前只扣 nav 未计 daily_rets → 夏普不反映成本，
+        # fee 敏感性分析失真；fee=0 时本行无影响）
+        daily_rets.append(dec["position"] * r - fee_cost)
         peak = max(peak, nav)
         navs.append(nav)
     total = nav - 1.0
@@ -667,7 +688,19 @@ def main():
                 eff = "" if e.get("ic") is None \
                     else ("✓" if abs(e["ic"]) >= 0.05 else "×")
                 parts.append(f"{hl}日:{tag}{eff}")
-            print(f"  {f:<8} " + "  ".join(parts))
+            print(f"  {f:<16} " + "  ".join(parts))
+        # 修正层验门：raw 原始输入的分层单调性（1 日前瞻，离散档分 IC 分辨力弱，
+        # 分层看"因子值高→收益高/低"是否单调，比单个 IC 更稳健）
+        print("\n修正层原始输入 · 分层单调性（3组，1日前瞻）")
+        for f in ("raw.basis_min_ap", "raw.main_net", "raw.down_pct", "raw.pcr"):
+            lay = ct.layer_ic(hist, f)
+            if not lay.get("ok"):
+                print(f"  {f:<16} 样本不足（n={lay.get('n', 0)}，需≥{lay['min_samples'] if 'min_samples' in lay else 30}）")
+                continue
+            gs = "  ".join(f"组{g+1}:因子{gr[0]:+.2f}→收益{gr[1]:+.2%}(n={gr[2]})"
+                           for g, gr in enumerate(lay["groups"]))
+            tag = "单调✓" if lay["monotone"] else "非单调"
+            print(f"  {f:<16} {gs} | 高低差{lay['spread']:+.2%} {tag}")
         return
 
     if args.backtest:

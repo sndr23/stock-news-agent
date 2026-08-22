@@ -458,23 +458,40 @@ def _rank(a):
     return ranks
 
 
+def _nested_get(h: dict, path: str):
+    """支持点分路径取值：'raw.basis_min_ap' → h['raw']['basis_min_ap']。
+    任一环缺失返回 None（不抛异常）。"""
+    cur = h
+    for p in str(path).split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
 def shadow_ic(history: list, fields: tuple = ("core", "basis", "flow", "mood",
                                               "news", "chan", "stock", "sox",
-                                              "position")) -> dict:
+                                              "position",
+                                              # 修正层原始输入（raw 验门）：
+                                              # 缺源为 None 的样本自动剔除，不污染 IC
+                                              "raw.basis_min_ap", "raw.main_net",
+                                              "raw.down_pct", "raw.pcr")) -> dict:
     """影子期各因子的 Spearman IC（因子秩 vs 前瞻收益秩）。
     前瞻口径：next_ret(1日)/r3(3日)/r5(5日)/r10(10日)。样本 < MIN_IC_SAMPLES 记不足。
+    field 支持点分路径（如 raw.basis_min_ap）；None 值样本自动跳过（缺源不算 0）。
     返回 {field: {"ic": float|None, "n": int, **{"horizon_<h>": ic_d...}}}。
     history 元素形如 {"date","score","core","basis","flow","mood","news",
                        "chan","stock","kospi","sox","vix","a50","position",
-                       "next_ret","r3","r5","r10"}。
+                       "next_ret","r3","r5","r10","raw": {...}}。
     """
     horizons = {"1": "next_ret", "3": "r3", "5": "r5", "10": "r10"}
     out = {}
     for f in fields:
         entry = {}
         for hlab, hkey in horizons.items():
-            pairs = [(float(h.get(f, 0.0)), float(h[hkey]))
-                     for h in history if h.get(hkey) is not None and f in h]
+            pairs = [(float(_nested_get(h, f)), float(h[hkey]))
+                     for h in history
+                     if h.get(hkey) is not None and _nested_get(h, f) is not None]
             if len(pairs) >= MIN_IC_SAMPLES:
                 xs = [p[0] for p in pairs]
                 ys = [p[1] for p in pairs]
@@ -486,6 +503,43 @@ def shadow_ic(history: list, fields: tuple = ("core", "basis", "flow", "mood",
         entry["n"] = entry["h1"]["n"]
         out[f] = entry
     return out
+
+
+def layer_ic(history: list, field: str, hkey: str = "next_ret",
+             n_groups: int = 3, min_samples: int = 30) -> dict:
+    """分层单调性检验（修正层验门用）：按因子值分 n_groups 组，
+    输出每组样本均因子值/均前瞻收益，以及 单调性 = 高组收益 - 低组收益。
+
+    用途：Spearman IC 对离散档分（-0.06/-0.04/0/0.03...）分辨力弱，
+    分层看"因子值高 → 收益高/低"是否单调，比单个 IC 更稳健。
+    返回 {"ok": bool, "n": int, "groups": [(组均因子值, 组均收益, n)...],
+          "spread": float, "monotone": bool}；样本不足返回 {"ok": False, "n": n}。
+    """
+    pairs = [(float(_nested_get(h, field)), float(h[hkey]))
+             for h in history
+             if h.get(hkey) is not None and _nested_get(h, field) is not None]
+    n = len(pairs)
+    if n < min_samples:
+        return {"ok": False, "n": n, "reason": "样本不足"}
+    pairs.sort(key=lambda p: p[0])
+    # 均分 n_groups 组（余数摊给中间组，保持组间样本均衡）
+    base, rem = divmod(n, n_groups)
+    groups = []
+    i = 0
+    for g in range(n_groups):
+        size = base + (1 if g < rem else 0)
+        if size <= 0:
+            continue
+        seg = pairs[i:i + size]
+        i += size
+        groups.append((sum(x for x, _ in seg) / len(seg),
+                       sum(y for _, y in seg) / len(seg), len(seg)))
+    spread = groups[-1][1] - groups[0][1]
+    # 单调：相邻组收益差同号（允许 0）
+    diffs = [groups[k + 1][1] - groups[k][1] for k in range(len(groups) - 1)]
+    monotone = all(d >= 0 for d in diffs) or all(d <= 0 for d in diffs)
+    return {"ok": True, "n": n, "groups": groups,
+            "spread": round(spread, 4), "monotone": monotone}
 
 
 def spearman_ic(xs: list, ys: list) -> float:

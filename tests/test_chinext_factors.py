@@ -8,7 +8,7 @@ from src.strategy.chinext_factors import (
     defensive_state, core_signals, dimension_score,
     factor_trend_ma20_60, factor_momentum_60, factor_volprice_quadrant,
     factor_amihud, factor_vol_regime, factor_vol_term,
-    factor_pullback_52w, factor_dd60,
+    factor_pullback_52w, factor_dd60, factor_short_reversal,
 )
 
 
@@ -95,3 +95,22 @@ def test_defensive_caps_reduction():
     d = defensive_state(c, vol_pctile=45, glass={"risk_off": False,
                                                  "basis_min_ap": -20.0, "intraday_pct": -3.0})
     assert d["cap"] <= 0.3
+
+def test_short_reversal_uptrend_negative():
+    """候选短期反转：单调上涨序列 → 因子为负（涨多反转看空）。"""
+    up = [100.0 * (1.01 ** i) for i in range(30)]   # 每日 +1%
+    f = factor_short_reversal(up, horizon=5)
+    assert f[-1] < -0.6, "5日累涨≈5.1%→因子≈-0.64（看空）"
+
+
+def test_short_reversal_downtrend_positive():
+    """候选短期反转：急跌序列 → 因子为正（跌多反弹看多）。"""
+    down = [100.0 * (0.99 ** i) for i in range(30)]  # 每日 -1%
+    f = factor_short_reversal(down, horizon=5)
+    assert f[-1] > 0.6, "5日累跌≈4.9%→因子≈+0.61（看多）"
+
+
+def test_short_reversal_warmup_zero():
+    """候选短期反转：前 horizon 根为 0（warmup），与核心层因子同约定。"""
+    f = factor_short_reversal([100.0] * 10, horizon=5)
+    assert f[:5] == [0.0] * 5

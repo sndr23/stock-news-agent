@@ -480,3 +480,132 @@ def test_shadow_raw_captures_main_net_yi():
     raw3 = _shadow_raw({"snapshot": {"breadth": {"down_pct": 10.0}}})
     assert raw3["main_net"] is None
     assert raw3["down_pct"] == 10.0
+
+
+def _make_gather_df(last_date: str, n: int = 70):
+    """构造 gather_context 输入 DataFrame：n 根日线，末根日期可指定。"""
+    import pandas as pd
+    dates = pd.bdate_range(end=pd.Timestamp(last_date), periods=n)
+    closes = [100.0 * (1 + 0.001 * i) for i in range(n)]
+    amounts = [1e8 + i * 1e6 for i in range(n)]
+    highs = [c * 1.01 for c in closes]
+    lows = [c * 0.99 for c in closes]
+    return pd.DataFrame({"close": closes, "amount": amounts,
+                         "high": highs, "low": lows}, index=dates)
+
+
+def test_gather_context_drops_intraday_partial(monkeypatch):
+    """口径收口：末根为当日（14:45 partial）时无条件剔除，信号只用 ≤d-1 完整日线。
+
+    回归背景：此前仅替换 amounts[-1]（closes 仍含 partial 污染均线/波动），
+    且依赖数据层缓存是否命中导致行为抖动（同一时点信号不可复现）。
+    修复后无论缓存命中与否，当日 bar 一律剔除 → 行为恒一。
+    """
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    import run_chinext_timing as rct
+    import datetime as _dt
+
+    class _FakeDT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 24, 14, 45)   # 周一 14:45
+    monkeypatch.setattr(rct, "datetime", _FakeDT)
+    # 屏蔽其余数据源（本测试只验证日线口径）
+    monkeypatch.setattr(rct, "get_quotes", lambda *a, **k: {})
+    monkeypatch.setattr(rct.nl, "load_factor_state", lambda: {})
+    monkeypatch.setattr(rct.nl, "load_citic_pos_state", lambda: {})
+    monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
+    monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
+    monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
+    monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
+
+    # 情形 A：末根为当日（partial）→ 剔除后最后一根应为 08-21（周五）
+    # 71 根（08-18~08-24）剔除当日 → 70 根（08-18~08-21），与 B 完全同窗
+    df_a = _make_gather_df("2026-08-24", n=71)
+    ctx_a = rct.gather_context(df_a)
+    assert ctx_a["dates"][-1] == "2026-08-21", "当日 partial 应被剔除"
+    assert len(ctx_a["closes"]) == len(df_a) - 1
+    assert len(ctx_a["amounts"]) == len(ctx_a["closes"])
+    assert len(ctx_a["highs"]) == len(ctx_a["closes"])
+    assert len(ctx_a["lows"]) == len(ctx_a["closes"])
+    assert ctx_a["day_amount_ratio"] > 0, "当日量能比应单独记录"
+
+    # 情形 B：末根非当日（缓存命中，末根为昨日完整收盘）→ 不剔除，结果与 A 等价
+    df_b = _make_gather_df("2026-08-21", n=70)
+    ctx_b = rct.gather_context(df_b)
+    assert ctx_b["dates"][-1] == "2026-08-21"
+    assert len(ctx_b["closes"]) == len(df_b)
+    # A 剔除后与 B 的信号信息集完全一致（日期/收盘/量能对齐）
+    assert ctx_a["dates"] == ctx_b["dates"]
+    assert ctx_a["closes"] == ctx_b["closes"]
+    assert ctx_a["amounts"] == ctx_b["amounts"]
+    # 情形 B 无当日量能比（末根为完整日，ratio 语义不存在）
+    assert ctx_b["day_amount_ratio"] == 0.0
+
+
+def test_nested_get():
+    """点分路径取值：支持 raw.basis_min_ap；任一环缺失返回 None 不抛异常。"""
+    h = {"raw": {"basis_min_ap": -11.2, "main_net": -86.4}}
+    assert ct._nested_get(h, "raw.basis_min_ap") == -11.2
+    assert ct._nested_get(h, "raw.main_net") == -86.4
+    assert ct._nested_get(h, "raw.nonexist") is None
+    assert ct._nested_get(h, "nonexist.x") is None
+    assert ct._nested_get({}, "raw.pcr") is None
+    assert ct._nested_get({"raw": None}, "raw.pcr") is None
+
+
+def test_shadow_ic_includes_raw_fields():
+    """shadow_ic 应支持 raw 嵌套字段，且 None 样本自动剔除（缺源不算 0）。"""
+    hist = [
+        {"date": "2026-08-10", "core": 0.1, "next_ret": 0.01,
+         "raw": {"basis_min_ap": -5.0, "main_net": 10.0}},
+        {"date": "2026-08-11", "core": 0.2, "next_ret": 0.02,
+         "raw": {"basis_min_ap": -8.0, "main_net": None}},
+        {"date": "2026-08-12", "core": 0.3, "next_ret": 0.03,
+         "raw": {"basis_min_ap": -12.0, "main_net": -30.0}},
+        {"date": "2026-08-13", "core": 0.4, "next_ret": 0.04,
+         "raw": {"basis_min_ap": -15.0, "main_net": None}},
+        {"date": "2026-08-14", "core": 0.5, "next_ret": 0.05,
+         "raw": {"basis_min_ap": -20.0, "main_net": -80.0}},
+        {"date": "2026-08-15", "core": 0.6, "next_ret": 0.06,
+         "raw": {"basis_min_ap": -25.0, "main_net": -100.0}},
+        {"date": "2026-08-16", "core": 0.7, "next_ret": 0.07,
+         "raw": {"basis_min_ap": -30.0, "main_net": -120.0}},
+        {"date": "2026-08-17", "core": 0.8, "next_ret": 0.08,
+         "raw": {"basis_min_ap": -35.0, "main_net": -140.0}},
+        {"date": "2026-08-18", "core": 0.9, "next_ret": 0.09,
+         "raw": {"basis_min_ap": -40.0, "main_net": -160.0}},
+        {"date": "2026-08-19", "core": 1.0, "next_ret": 0.10,
+         "raw": {"basis_min_ap": -45.0, "main_net": -180.0}},
+    ]
+    ic = ct.shadow_ic(hist)
+    # raw.basis_min_ap 全部 10 条非 None
+    assert ic["raw.basis_min_ap"]["n"] == 10
+    # raw.main_net 只有 8 条（None 的 2 条被剔除）
+    assert ic["raw.main_net"]["n"] == 8
+    # basis_min_ap 单调递减（-5→-45）而收益单调递增 → 完美负相关
+    assert ic["raw.basis_min_ap"]["h1"]["ic"] < -0.9
+
+
+def test_layer_ic_monotonic_and_insufficient():
+    """分层单调性：单调因子 spread 为正且 monotone=True；样本不足 ok=False。"""
+    hist = [
+        {"date": f"d{i}", "next_ret": 0.01 * i,
+         "raw": {"basis_min_ap": -1.0 * i}}
+        for i in range(1, 31)      # 30 条：因子越低 → 收益越高（负相关）
+    ]
+    lay = ct.layer_ic(hist, "raw.basis_min_ap")
+    assert lay["ok"] is True
+    assert lay["n"] == 30
+    # 因子（负值递增）vs 收益（递增）：组1因子最负（-1）、收益最低 → 负相关
+    assert lay["spread"] < 0
+    assert lay["monotone"] is True
+
+    # 样本不足
+    small = hist[:5]
+    lay2 = ct.layer_ic(small, "raw.basis_min_ap")
+    assert lay2["ok"] is False
