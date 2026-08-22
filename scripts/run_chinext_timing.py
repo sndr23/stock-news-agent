@@ -410,7 +410,6 @@ def _shadow_raw(ctx: dict) -> dict:
     """提取修正层原始输入（供分层/原始IC验门）：worst_ap/main_net/down_pct/pcr 等。
     缺源全部置 None（与修正层"缺源降级0"解耦，避免假0污染验门）。"""
     snap = ctx.get("snapshot") or {}
-    out: "dict" = {}
     # 贴水：IC/IM 最差年化基差（原始，非档位分）
     _aps = []
     for _code in ("IC", "IM"):
@@ -419,30 +418,34 @@ def _shadow_raw(ctx: dict) -> dict:
             _aps.append(float(_b.get("annual_pct")))
         except (TypeError, ValueError):
             pass
-    out["basis_min_ap"] = min(_aps) if _aps else None
-    # 资金：两市主力净流
-    f = (snap.get("flows") or {})
-    if isinstance(f, dict) and f.get("main_net") is not None:
+    # 资金：两市主力净流。快照键为 main_net_yi（与 factor_collector.build_snapshot
+    # 全链路一致）；曾误读 main_net 致资金流原始值恒 None，资金维原始 IC 验门静默失效。
+    _mn = None
+    _f = snap.get("flows")
+    if isinstance(_f, dict):
+        _mn = _f.get("main_net_yi")
         try:
-            out["main_net"] = float(f["main_net"])
+            _mn = float(_mn) if _mn is not None else None
         except (TypeError, ValueError):
-            out["main_net"] = None
-    # 情绪：下跌占比/涨停情绪
-    b = (snap.get("breadth") or {})
-    if isinstance(b, dict) and b.get("down_pct") is not None:
+            _mn = None
+    # 情绪：下跌占比
+    _dp = None
+    _b = snap.get("breadth")
+    if isinstance(_b, dict) and _b.get("down_pct") is not None:
         try:
-            out["down_pct"] = float(b["down_pct"])
+            _dp = float(_b["down_pct"])
         except (TypeError, ValueError):
-            out["down_pct"] = None
+            _dp = None
     # 期权：PCR
-    o = (snap.get("option") or {})
-    pcr = o.get("pcr") if isinstance(o, dict) else None
-    if pcr is not None:
+    _pcr = None
+    _o = snap.get("option")
+    if isinstance(_o, dict) and _o.get("pcr") is not None:
         try:
-            out["pcr"] = float(pcr)
+            _pcr = float(_o["pcr"])
         except (TypeError, ValueError):
-            out["pcr"] = None
-    return out
+            _pcr = None
+    return {"basis_min_ap": min(_aps) if _aps else None,
+            "main_net": _mn, "down_pct": _dp, "pcr": _pcr}
 
 
 # ---------------- 报告 ----------------
