@@ -17,6 +17,12 @@ name: 创业板仓位信号
 #   重复 run 由脚本 last_date 去重兜底。
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "强制推送（--force，忽略同日去重，用于手动复验如周六再推一次）"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: chinext-timing
@@ -60,7 +66,12 @@ jobs:
             chinext-cache-
 
       - name: 执行仓位信号推送
-        run: python scripts/run_chinext_timing.py --push --shadow
+        run: |
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python scripts/run_chinext_timing.py --push --shadow --force
+          else
+            python scripts/run_chinext_timing.py --push --shadow
+          fi
 
       - name: 上传日志（调试用）
         if: always()

@@ -14,6 +14,7 @@
 用法：
   python scripts/run_chinext_timing.py --dry-run    # 本地打印
   python scripts/run_chinext_timing.py --push       # 推送 + 写状态（云端）
+  python scripts/run_chinext_timing.py --push --force  # 忽略同日去重，强推（复验用，如周六）
   python scripts/run_chinext_timing.py --backtest   # 核心层历史回测验证
 """
 from __future__ import annotations
@@ -660,6 +661,8 @@ def main():
     ap.add_argument("--push", action="store_true", help="推送 + 写状态（云端定时）")
     ap.add_argument("--backtest", action="store_true", help="核心层历史回测")
     ap.add_argument("--shadow", action="store_true", help="影子期因子IC报告")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略同日去重，强制推送（手动复验用，如周六再验一次）")
     args = ap.parse_args()
 
     # 历史源：新浪全量（12年，绕代理）优先，东财增量链回退
@@ -716,8 +719,8 @@ def main():
     res = score_all(ctx)
 
     state = load_state()
-    if args.push and str(state.get("last_date") or "") == today:
-        logger.warning("今日已推送过（last_date=%s），去重跳过", today)
+    if args.push and not args.force and str(state.get("last_date") or "") == today:
+        logger.warning("今日已推送过（last_date=%s），去重跳过（--force 可略过）", today)
         return
     prev_pos = float(state.get("position") or 0.0)
     prev = {"position": prev_pos, "pending": state.get("pending")}
