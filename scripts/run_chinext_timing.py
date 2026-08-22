@@ -9,7 +9,7 @@
   399006 日线(东财/腾讯) + 盘中实时(腾讯)
   + factor_state 快照（贴水/资金流/涨停情绪/宽度/波动分位/risk_state）
   + citic_pos_state（中信全合约净持仓）
-  + 当日已推资讯事件（LLM 方向 × 科技相关度）
+  + 当日资讯候选（已推送强档 ∪ 预筛候选，LLM 方向 × 科技相关度）
 
 用法：
   python scripts/run_chinext_timing.py --dry-run    # 本地打印
@@ -152,8 +152,9 @@ def gather_context(df) -> dict:
     try:
         rt = nl.load_realtime_state()
         today = datetime.now().strftime("%Y-%m-%d")
-        events = [e for e in nl.recent_pushed_events(rt, hours=30)
-                  if str(e.get("t") or "").startswith(today)]
+        # 资讯输入覆盖全部重大候选：已推送强档 ∪ 当日预筛候选（P7-1）。
+        # 收敛点：资讯维度只看当日真实候选（含方向），不看历史事件。
+        events = nl.today_news_events(rt, today)
     except Exception as e:
         logger.warning("资讯事件读取失败: %s", type(e).__name__)
 

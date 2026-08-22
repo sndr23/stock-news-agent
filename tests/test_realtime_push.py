@@ -243,6 +243,35 @@ class TestMergeState:
     def test_empty_state_has_pushed_events(self):
         assert rtp._empty_state()["pushed_events"] == []
 
+    def test_empty_state_has_candidate_events(self):
+        # P7-1：状态默认必须含 candidate_events（供择时 news_modifier 并集读取）
+        assert rtp._empty_state()["candidate_events"] == []
+
+    def test_candidate_events_merge_union_dedup(self):
+        # P7-1：candidate_events 按 (日期, 事件签名) 合并去重，pushed=True 优先防方向丢失
+        c1 = {"entities": ["x"], "events": ["回购"], "numbers": [],
+              "title_norm": "x", "t": "2026-08-22 10:00:00", "dir": "bullish"}
+        c2 = {"entities": ["y"], "events": ["增持"], "numbers": [],
+              "title_norm": "y", "t": "2026-08-22 10:30:00", "dir": "bearish"}
+        local = {"seen": {}, "pushed_events": [], "candidate_events": [dict(c1)]}
+        remote = {"seen": {}, "pushed_events": [], "candidate_events": [dict(c1), dict(c2)]}
+        merged = rtp._merge_state(local, remote)
+        assert len(merged["candidate_events"]) == 2
+
+    def test_candidate_merge_pushed_priority(self):
+        # 并发写：一方已成推送、另一方仍是未推候选，合并后保留 pushed=True（防丢方向/状态）
+        base = {"entities": ["z"], "events": ["中标"], "numbers": [],
+                "title_norm": "z", "t": "2026-08-22 11:00:00"}
+        pushed = {**base, "dir": "bullish", "pushed": True}
+        unpushed = {**base, "dir": "neutral", "pushed": False}
+        local = {"seen": {}, "pushed_events": [], "candidate_events": [dict(pushed)]}
+        remote = {"seen": {}, "pushed_events": [], "candidate_events": [dict(unpushed)]}
+        merged = rtp._merge_state(local, remote)
+        matched = [e for e in merged["candidate_events"] if e["title_norm"] == "z"]
+        assert len(matched) == 1
+        assert matched[0]["pushed"] is True
+        assert matched[0]["dir"] == "bullish"
+
 
 # ============================================================
 # LLM 判定：idx 对齐 + JSON 抢救 + 批次失败降级

@@ -977,6 +977,11 @@ def _empty_state() -> dict:
         # 已推送事件签名（推送级同事件去重，48h 窗口）：
         # [{"t": str, "stocks": [], "entities": [], "events": [], "numbers": [], "title_norm": str}]
         "pushed_events": [],
+        # 当日预筛候选（P7-1 2026-08-22 新增）：经 LLM 判定的全部重大候选（含方向+事件签名），
+        # 供创业板择时 news_modifier 消费"已推送 ∪ 预筛候选"，覆盖全部重大候选而非仅强档推送。
+        # 记录于 LLM 判定后的每一候选（无论最终推/不推）；pushed_events 仍为"实际已推送"权威。
+        # [{**事件签名, "dir": str, "t": str, "pushed": bool}]
+        "candidate_events": [],
     }
 
 
@@ -1118,6 +1123,11 @@ def _event_sig_key(e: dict) -> str:
             + (e.get("title_norm") or ""))
 
 
+def _day_key(e: dict) -> str:
+    """事件所在日期（YYYY-MM-DD，取 t 字段前缀）"""
+    return str(e.get("t") or "")[:10]
+
+
 def _merge_state(local: dict, remote: dict) -> dict:
     """合并两份状态（Gist 读-改-写防并发覆盖）：取并集，pushed=True 优先
 
@@ -1147,6 +1157,18 @@ def _merge_state(local: dict, remote: dict) -> dict:
     for e in (local.get("pushed_events") or []):
         merged_events.setdefault(_event_sig_key(e), e)
     local["pushed_events"] = list(merged_events.values())
+
+    # 合并当日预筛候选（P7-1）：按 (日期, 事件签名) 去重，pushed=True 优先（并发写防丢方向）。
+    # 并发实例各自读-改-写时，直接覆盖会把另一方新增的候选方向丢掉 → 合并后冲突窗口收窄到单次写入。
+    merged_cands = {}
+    for e in (remote.get("candidate_events") or []):
+        merged_cands[(_day_key(e), _event_sig_key(e))] = e
+    for e in (local.get("candidate_events") or []):
+        _k = (_day_key(e), _event_sig_key(e))
+        old = merged_cands.get(_k)
+        if old is None or (e.get("pushed") and not old.get("pushed")):
+            merged_cands[_k] = e
+    local["candidate_events"] = list(merged_cands.values())
     return local
 
 
@@ -1206,6 +1228,12 @@ def save_state(state: dict) -> None:
     if len(pe) > 300:
         pe = sorted(pe, key=lambda e: e.get("t", ""))[-300:]
     state["pushed_events"] = pe
+
+    # 滚动清理过期当日预筛候选（P7-1，48h 窗口）+ 上限 300 条防爆胀
+    ce = [e for e in (state.get("candidate_events") or []) if e.get("t", "") >= cutoff]
+    if len(ce) > 300:
+        ce = sorted(ce, key=lambda e: e.get("t", ""))[-300:]
+    state["candidate_events"] = ce
 
     if gist_token and gist_id and not _merge_failed:
         _gist_save(gist_token, gist_id, state)
@@ -2496,6 +2524,7 @@ def run_once(dry_run: bool = False) -> dict:
     risk_state = factor_state.get("risk_state")
     if risk_state not in ("risk_off", "neutral"):
         risk_state = "neutral"
+    _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
@@ -2503,6 +2532,15 @@ def run_once(dry_run: bool = False) -> dict:
             logger.info(f"LLM 未判定，挂起下轮重试: {n.get('title', '')[:40]}")
             skipped += 1
             continue
+        # P7-1（2026-08-22）：预筛候选持久化——资讯维度可消费"当日全部重大候选"而非仅强档推送。
+        # 每个经 LLM 判定的候选（含方向+事件签名）写入 candidate_events，今日作用域、按事件去重。
+        # pushed 与否由 pushed_events 权威记录；此处统一量，供择时 news_modifier 并集读取。
+        _dir0 = str(j.get("direction") or "")
+        _ck = (now[:10], _event_sig_key(n.get("_sig") or {}))
+        if _ck not in _cand_seen:
+            _cand_seen.add(_ck)
+            state.setdefault("candidate_events", []).append(
+                {**n.get("_sig", {}), "dir": _dir0, "t": now, "pushed": False})
         # 2026-08-04 用户口径：仅强利好/强利空（bullish/bearish）推送；
         # 弱档/中性/混合（mildly_bullish/mildly_bearish/neutral/mixed）一律不推，
         # 覆盖 market/sector/stock、外围科技必推、科技防漏推等全部路径。

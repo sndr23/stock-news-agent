@@ -142,6 +142,36 @@ def recent_pushed_events(state: dict, hours: float = 48.0) -> list:
     return out
 
 
+def _event_key(e: dict) -> str:
+    """事件去重键（日期+事件签名），供 news 维度并集去重。"""
+    return (str(e.get("t") or "")[:10] + "#"
+            + "|".join(sorted(e.get("entities") or [])) + "#"
+            + "|".join(sorted(e.get("events") or [])) + "#"
+            + "|".join(sorted(e.get("numbers") or [])) + "#"
+            + str(e.get("title_norm") or ""))
+
+
+def today_news_events(state: dict, today: str = None) -> list:
+    """今日资讯输入 = 已推送 ∪ 当日预筛候选（P7-1 2026-08-22）。
+
+    此前 news_modifier 仅能读"当日强档已推送"；real_time_push 现把每个经 LLM 判定
+    的重大候选（含方向）持久化为 candidate_events，使资讯维度覆盖全部重大候选。
+    按 (日期, 事件签名) 去重（已推送的候选同时在 pushed_events 与 candidate_events，
+    并集去重避免重复计权），倒序返回。方向由 dir 字段（LLM 判定）承载。
+    """
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    ded = {}
+    for e in (*((state.get("pushed_events")) or []),
+              *((state.get("candidate_events")) or [])):
+        _t = str(e.get("t") or "")
+        if not _t.startswith(today):
+            continue
+        ded.setdefault(_event_key(e), e)
+    out = list(ded.values())
+    out.sort(key=lambda x: x.get("t", "") or "", reverse=True)
+    return out
+
+
 def _norm_name(name: str) -> str:
     """名称归一化：去除空格、常见公司后缀，供匹配使用。"""
     s = str(name or "").strip()

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>资讯覆盖扩展 + 事件后验 + 硬信号事件研究（2026-08-22）</title>
+<style>
+  :root{--ink:#1a2332;--mut:#6b7686;--line:#e3e8ee;--bg:#f7f9fb;
+    --bull:#0a7d4f;--bear:#b3272e;--accent:#2b5bd9;--warn:#b26a00;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    color:var(--ink);background:var(--bg);line-height:1.6}
+  .wrap{max-width:960px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:24px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:12px;
+    padding:20px 24px;margin-bottom:18px;box-shadow:0 1px 2px rgba(20,30,50,.03)}
+  h2{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+  .tag{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;color:#fff}
+  .tag.short{background:var(--accent)}.tag.mid{background:var(--warn)}
+  .tag.bt{background:#7a5bd9}.tag.done{background:var(--bull)}
+  .meta{color:var(--mut);font-size:12px;margin-bottom:10px}
+  .p{font-size:14px;margin:8px 0}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}
+  th,td{border-bottom:1px solid var(--line);padding:7px 9px;text-align:right}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:#f2f5f9;color:#33415c;font-weight:600}
+  tr.hl td{background:#f0f7f3}
+  .n{color:var(--mut)}
+  .pos{color:var(--bull);font-weight:600}.neg{color:var(--bear);font-weight:600}
+  .pill{display:inline-block;font-size:12px;font-weight:600;padding:2px 10px;
+    border-radius:999px;background:#eef2f7;color:#33415c;margin-top:2px}
+  code{background:#eef1f5;padding:1px 6px;border-radius:5px;font-size:12px;
+    font-family:Consolas,monospace}
+  .verdict{border-left:4px solid var(--accent);background:#f3f6ff;
+    padding:12px 16px;border-radius:0 8px 8px 0;font-size:14px;margin:10px 0}
+  .verdict.ok{border-color:var(--bull);background:#f0f8f4}
+  .verdict.no{border-color:var(--bear);background:#fdf2f3}
+  ul{margin:8px 0 8px 20px;padding:0}li{font-size:14px;margin:4px 0}
+  .foot{color:var(--mut);font-size:12px;margin-top:26px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>三层资讯优化：覆盖扩展 + 事件后验 + 硬信号事件研究</h1>
+  <div class="sub">P7 阶段落地报告 · 2026-08-22 · 与创业板择时（14:45）数据链同口径</div>
+
+  <div class="card">
+    <h2><span class="tag short">1 · 短期已落地</span> 资讯维度覆盖全部重大候选</h2>
+    <div class="meta">real_time_push + news_link + run_chinext_timing · 权重不变（±0.06 纪律）</div>
+    <p class="p">此前 news_modifier 只能读到"当日强档已推送"（推送 48h 窗口 + 当日过滤）。现把 <b>全部经 LLM 判定的重大候选</b>（含方向）持久化为 <code>candidate_events</code>，资讯输入 = <b>已推送强档 ∪ 当日预筛候选</b>，按 (日期,事件签名) 去重。</p>
+    <ul>
+      <li><b>real_time_push.py</b>：状态新增 <code>candidate_events</code>；Gist 合并按 (日期,签名) 去重、<code>pushed=True</code> 优先（并发写防方向丢失）；滚动清理 48h、上限 300 条；在 LLM 判定后统一记录每个候选（推/不推都记）。</li>
+      <li><b>news_link.py</b>：新增 <code>today_news_events(state)</code> 返回当日并集去重事件，方向字段对齐 <code>_DIR_LABEL</code>（bullish/bearish/weak/neutral）。</li>
+      <li><b>run_chinext_timing.py</b>：资讯读入改走 <code>today_news_events</code>，覆盖全部候选。</li>
+    </ul>
+    <p class="p">验证：单测 <b>843 passed</b>（+6 新增：并集/去重/跨日/空态/合并优先级）；本机 dry-run 全链正常（资讯+0.00，硬风控压 0%）。</p>
+    <div class="verdict ok"><b>覆盖变全、权重不变</b>——资讯维度开始"看全部重大候选"而非只看强档，为中期后验提供真实输入。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="tag mid">2 · 中期已备好</span> 事件后验脚本（影子期后运行）</h2>
+    <div class="meta">scripts/_study_push_events.py · 事件研究引擎 scripts/_event_study.py</div>
+    <p class="p">用累积的 <code>pushed_events</code> 做"有强档推送日 vs 无推送日 → 创业板次/3/5 日收益差"，并测方向 IC。内置<b>验门门槛</b>：信号日 ≥10 或跨度 ≥20 自然日才判有效，否则提示"影子期数据不足，继续积累"。</p>
+    <ul>
+      <li>防前视：事件 E（交易日公开）→ 前向收益从 E 收盘起算 <code>close[E+h]/close[E]-1</code>。</li>
+      <li>旧推送缺 <code>dir</code> 字段时按标题文本启发式兜底（研究用粗粒度，报告会标注）。</li>
+      <li>输出：有/无信号差 + bull/bear 分拆 + 方向 Spearman IC 验门。</li>
+    </ul>
+    <p class="p">现状：<b>影子期数据不足</b>——本机 Gist 快照仅 08-11 ~ 08-13 三个信号交易日（58 条事件→3 日），正确地落在"继续积累"分支。正式数据自 08-24 首个云端推广起累积，影子期满后重跑即可判提权。</p>
+    <div class="verdict"><b>这是把软信号变硬的正道</b>：先验证方向有效性，见效再提权，避免拍脑袋放大资讯权重。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="tag bt">3 · 已回测</span> 硬信号事件研究（龙虎榜机构 + 业绩预告）</h2>
+    <div class="meta">scripts/_study_hard_signals.py · 官方结构化披露，不依赖 LLM，可回踩验门</div>
+    <p class="p">两个客观数据源做纯历史事件研究，方向 IC 验门门槛 <code>|IC|≥0.05 且样本≥10</code>（与影子 IC 同纪律）。龙虎榜机构 ≥3kw 净买/≤-3kw 净卖；业绩预告按显著幅度（预增≥100% / 预减≤-50%）。</p>
+
+    <h2 style="font-size:15px">业绩预告（近 5 季度报告期，事件 5394，信号交易日 111）</h2>
+    <table>
+      <thead><tr><th>horizon</th><th>有信号均值</th><th>无信号均值</th><th>差</th><th>MW-p</th><th>方向IC</th></tr></thead>
+      <tbody>
+        <tr><td>+1 日</td><td>+0.22%</td><td>+0.05%</td><td>+0.17pp</td><td>0.329</td><td>+0.004</td></tr>
+        <tr><td>+3 日</td><td>+0.33%</td><td>+0.15%</td><td>+0.18pp</td><td>0.381</td><td class="neg">-0.015</td></tr>
+        <tr><td>+5 日</td><td>+0.35%</td><td>+0.27%</td><td>+0.07pp</td><td>0.886</td><td class="neg">-0.013</td></tr>
+      </tbody>
+    </table>
+    <p class="p n">特征：利空预告日后收益反而偏高（预期差/超跌修复），方向与信号背离；完全无择时价值。</p>
+
+    <h2 style="font-size:15px">龙虎榜机构（近 78 周，事件 7909，信号交易日 333）</h2>
+    <table>
+      <thead><tr><th>horizon</th><th>有信号均值</th><th>无信号均值</th><th>差</th><th>MW-p</th><th>方向IC</th></tr></thead>
+      <tbody>
+        <tr><td>+1 日</td><td>+0.15%</td><td>+0.04%</td><td class="pos">+0.11pp</td><td>0.108</td><td>+0.007</td></tr>
+        <tr class="hl"><td>+3 日</td><td>+0.44%</td><td>+0.13%</td><td class="pos">+0.31pp</td><td class="pos">0.010</td><td>−0.016</td></tr>
+        <tr class="hl"><td>+5 日</td><td>+0.72%</td><td>+0.22%</td><td class="pos">+0.50pp</td><td class="pos">0.014</td><td>−0.000</td></tr>
+      </tbody>
+    </table>
+    <p class="p n">特征：机构上榜日后 +3/+5 日显著正超额（p&lt;0.02），但 bull/bear 相差甚微、方向 IC≈0——体现<b>上榜后的动量延续（氛围/关注度效应）</b>，而非"机构方向可预测涨跌"。</p>
+
+    <div class="verdict no"><b>验门结论：两源均不足以"方向择时"进核心层（IC≈0）。</b>业绩预告无价值、不建议引入；龙虎榜机构虽有事件后显著正超额（p&lt;0.02），但方向 IC 未达门槛，只宜作为"事件日历/情绪氛围"参考，不可作方向因子——符合"影子 IC 达标才转正"的既有纪律。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="pill">待确认</span> 推送/提权策略建议</h2>
+    <ol>
+      <li><b>短期已上线</b>：资讯维度 = 已推送 ∪ 全部重大候选，权重维持 ±0.06。本次改动已就绪，是否随下轮 commit 一起推送云端？</li>
+      <li><b>中期自动化可选</b>：可为 <code>_study_push_events.py</code> 加一个定时（如每周日下午）跑影子期后验，脚本已内置en数据不足门槛，无需人工盯。</li>
+      <li><b>硬信号暂维权</b>：业绩预告/龙虎榜方向不进核心层（IC 未达门槛）。龙虎榜"上榜后动量"作为氛围增强是个可选项，但要再做一个<b>分层多空回测</b>确认不是幸存/聚集偏差，您决定要不要往下做。</li>
+    </ol>
+  </div>
+
+  <div class="foot">涉及改动：real_time_push.py / news_link.py / run_chinext_timing.py / 新增研发脚本（_event_study.py, _study_push_events.py, _study_hard_signals.py）· 单测 843 passed 未回归。数据来源：akshare 官方接口 + 本机 Gist 快照。</div>
+</div>
+</body>
+</html>

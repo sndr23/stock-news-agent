@@ -187,3 +187,60 @@ def test_format_event_line():
     line = nl.format_event_line(e)
     assert "利多" in line
     assert "茅台提价超预期" in line
+
+
+# ---------- P7-1：今日资讯输入 = 已推送 ∪ 预筛候选 ----------
+def _cand(title, dir_, entities=(), events=(), numbers=(), t="2026-08-22 10:00:00",
+          pushed=None):
+    e = {"title_norm": title, "dir": dir_, "entities": list(entities),
+         "events": list(events), "numbers": list(numbers), "t": t}
+    if pushed is not None:
+        e["pushed"] = pushed
+    return e
+
+
+def test_today_news_events_union_pushed_and_candidate():
+    state = {
+        "pushed_events": [_cand("英伟达订单超预期", "bullish",
+                                entities=["英伟达"], t="2026-08-22 09:00:00")],
+        "candidate_events": [_cand("光模块集采招标", "mildly_bullish",
+                                   entities=["中际旭创"], t="2026-08-22 10:30:00")],
+    }
+    evs = nl.today_news_events(state, "2026-08-22")
+    assert len(evs) == 2  # 已推送 + 预筛弱档候选都覆盖
+
+
+def test_today_news_events_dedup_same_event():
+    # 同一事件同时出现在 pushed_events 与 candidate_events（已推送的候选并存），
+    # 按 (日期,事件签名) 去重，只计一次，不重复计权。
+    state = {
+        "pushed_events": [_cand("英伟达订单超预期", "bullish",
+                                entities=["英伟达"], t="2026-08-22 09:00:00")],
+        "candidate_events": [_cand("英伟达订单超预期", "bullish",
+                                   entities=["英伟达"], t="2026-08-22 09:05:00")],
+    }
+    evs = nl.today_news_events(state, "2026-08-22")
+    assert len(evs) == 1
+
+
+def test_today_news_events_excludes_other_days():
+    # 只收敛当日真实候选，昨日事件（即便强档已推）不入今日资讯维度。
+    state = {
+        "pushed_events": [_cand("昨日利空", "bearish",
+                                entities=["宁德时代"], t="2026-08-21 15:00:00")],
+        "candidate_events": [_cand("今日利多", "bullish",
+                                   entities=["中际旭创"], t="2026-08-22 09:00:00")],
+    }
+    evs = nl.today_news_events(state, "2026-08-22")
+    assert len(evs) == 1
+    assert evs[0]["title_norm"] == "今日利多"
+
+
+def test_today_news_events_default_today():
+    # 缺省 today 用系统当前日期
+    evs = nl.today_news_events({}, None)
+    assert evs == []
+
+
+def test_today_news_events_empty_state():
+    assert nl.today_news_events({}, "2026-08-22") == []
