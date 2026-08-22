@@ -16,10 +16,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 try:
     # LangChain Tools 对接层是可选的：云端 production 按 requirements-cloud.txt 不装 langchain，
-    # 此处惰性降级为恒等装饰器，避免无 langchain 环境 import 失败（CI 测试门禁依赖此容错）。
+    # 此处惰性降级，避免无 langchain 环境 import 失败（CI 测试门禁依赖此容错）。
     from langchain_core.tools import tool
 except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
-    tool = lambda f: f
+    class _ToolStub:
+        """模拟 LangChain StructuredTool 的最小接口：可调用 + 暴露 .func 原始函数。
+        生产脚本用 get_stock_news.func() 取装饰前函数执行，故必须保留 .func 属性。"""
+        def __init__(self, fn):
+            self.func = fn
+        def __call__(self, *args, **kwargs):
+            return self.func(*args, **kwargs)
+        def invoke(self, *args, **kwargs):
+            return self.func(*args, **kwargs)
+    tool = lambda f: _ToolStub(f)
 
 logger = logging.getLogger(__name__)
 
