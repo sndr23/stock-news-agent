@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A股量化监测 Agent 全链路深度分析 · 2026-08-22</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --text2: #9da7b3;
+    --text3: #6e7681;
+    --red: #f85149;
+    --redbg: rgba(248,81,73,.12);
+    --green: #3fb950;
+    --greenbg: rgba(63,185,80,.12);
+    --orange: #d29922;
+    --orangebg: rgba(210,153,34,.12);
+    --yellow: #e3b341;
+    --blue: #58a6ff;
+    --bluebg: rgba(88,166,255,.12);
+    --purple: #bc8cff;
+    --cyan: #39c5cf;
+    --mono: "SF Mono", Consolas, "JetBrains Mono", monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.65; font-size:14px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:32px 28px 80px; }
+  header { border-bottom:1px solid var(--border); padding-bottom:28px; margin-bottom:28px; }
+  .kicker { color:var(--blue); font-size:12px; letter-spacing:2px; text-transform:uppercase; margin-bottom:8px; }
+  h1 { font-size:30px; font-weight:700; letter-spacing:.5px; }
+  .sub { color:var(--text2); margin-top:8px; font-size:14px; }
+  .meta { color:var(--text3); font-size:12px; margin-top:10px; font-family:var(--mono); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:14px; margin:28px 0; }
+  .card { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:16px 18px; }
+  .card .num { font-size:26px; font-weight:700; font-family:var(--mono); }
+  .card .lbl { color:var(--text2); font-size:12px; margin-top:4px; }
+  .card .hint { color:var(--text3); font-size:11px; margin-top:2px; }
+  h2 { font-size:20px; margin:42px 0 16px; padding-left:12px; border-left:4px solid var(--blue); }
+  h3 { font-size:16px; margin:26px 0 12px; color:var(--blue); }
+  h4 { font-size:14px; margin:18px 0 8px; color:var(--text); }
+  p { margin:8px 0; color:var(--text2); }
+  .lead { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:18px 22px; margin:14px 0; }
+  .lead b { color:var(--text); }
+  .verdict { border-left:4px solid var(--orange); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  @media (max-width:900px){ .grid2,.grid3{ grid-template-columns:1fr; } }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:13px; }
+  th { text-align:left; color:var(--text2); font-weight:600; background:var(--bg3); }
+  th,td { padding:9px 12px; border:1px solid var(--border); vertical-align:top; }
+  tr:nth-child(even) td { background:rgba(255,255,255,.015); }
+  code { font-family:var(--mono); font-size:12px; background:var(--bg3); padding:1px 6px; border-radius:4px; color:var(--cyan); }
+  .tag { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px; margin-right:4px; }
+  .t-red { background:var(--redbg); color:var(--red); }
+  .t-green { background:var(--greenbg); color:var(--green); }
+  .t-orange { background:var(--orangebg); color:var(--orange); }
+  .t-blue { background:var(--bluebg); color:var(--blue); }
+  .t-gray { background:rgba(255,255,255,.06); color:var(--text2); }
+  .risk { border-radius:8px; padding:2px 8px; font-size:12px; font-weight:600; }
+  .r-hi { background:var(--redbg); color:var(--red); }
+  .r-mid { background:var(--orangebg); color:var(--orange); }
+  .r-low { background:rgba(110,118,129,.18); color:var(--text2); }
+  .r-note { background:rgba(88,166,255,.12); color:var(--blue); }
+  .bar { height:8px; border-radius:4px; background:var(--bg3); overflow:hidden; margin-top:6px; }
+  .bar i { display:block; height:100%; border-radius:4px; }
+  .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:16px 0; }
+  .step { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:12px; color:var(--text2); }
+  .step b { color:var(--text); display:block; font-size:13px; }
+  .arrow { color:var(--text3); font-size:14px; }
+  .foot { margin-top:50px; padding-top:18px; border-top:1px solid var(--border); color:var(--text3); font-size:12px; }
+  .svg-box { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:16px; overflow-x:auto; }
+  svg text { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; margin:10px 0; color:var(--text2); font-size:12px; }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  .pill { font-size:11px; padding:1px 8px; border-radius:10px; background:var(--bg3); color:var(--text2); border:1px solid var(--border); }
+  .timeline { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin:14px 0; }
+  .tl { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center; }
+  .tl .t { font-size:12px; font-weight:700; color:var(--blue); }
+  .tl .d { font-size:12px; margin-top:3px; color:var(--text2); }
+  .tl .w { font-size:11px; color:var(--text3); margin-top:2px; font-family:var(--mono); }
+  .quote { border-left:3px solid var(--purple); background:var(--bg2); padding:12px 16px; border-radius:0 8px 8px 0; margin:14px 0; color:var(--text2); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Full-Chain Deep Analysis · 只读审查</div>
+  <h1>A股量化监测 Agent 全链路深度分析</h1>
+  <div class="sub">多源聚合资讯推送（LLM 判定软信号）+ 创业板单资产择时（量化内核）+ 因子采集/回测/持仓日报 的完整技术体检</div>
+  <div class="meta">审查时间 2026-08-22 20:56 (GMT+8) ｜ 范围 src/ + scripts/ + .github/ + tests/ + logs/ + data/ + archive/ ｜ 无代码改动</div>
+</header>
+
+<div class="cards">
+  <div class="card"><div class="num" style="color:var(--blue)">15.8k</div><div class="lbl">活跃代码行数</div><div class="hint">real_time_push 3041 行为最大单体</div></div>
+  <div class="card"><div class="num" style="color:var(--green)">856</div><div class="lbl">测试函数 / 41 文件</div><div class="hint">全 mock 无网络，CI 门禁</div></div>
+  <div class="card"><div class="num" style="color:var(--purple)">6</div><div class="lbl">GitHub Actions</div><div class="hint">全部带 concurrency + 测试门禁</div></div>
+  <div class="card"><div class="num" style="color:var(--orange)">133</div><div class="lbl">git 提交</div><div class="hint">2026-08 密集迭代</div></div>
+  <div class="card"><div class="num" style="color:var(--cyan)">10</div><div class="lbl">新闻/信号源</div><div class="hint">8 新闻 + 龙虎榜/业绩预告</div></div>
+  <div class="card"><div class="num" style="color:var(--red)">13</div><div class="lbl">同事件合并分支</div><div class="hint">每分支带实证事故注释</div></div>
+</div>
+
+<h2>一、结论先行</h2>
+
+<div class="lead">
+  <b>本质是两套系统，不是一个"量化程序"。</b>① 事件驱动资讯推送——LLM 判定 + 三层去重 + 微信快讯，是<b>软信号/信息流系统</b>；② 创业板单资产择时——10 因子打分 + 仓位状态机 + 缠论 + 旭创双确认，是<b>真正的量化内核</b>。另有因子采集、信号回测、中信持仓日报、简报等辅助链路。
+</div>
+
+<div class="lead">
+  <b>最强项是工程容错，而非 alpha。</b>事件级指纹 + 同事件签名 13 分支（每个分支标注对应实证事故：恩智浦三推 / 索尼×台积电三推 / 日本央行加息三推 / 纳指三推）、Gist fail-stop 状态机、漏推保护链（挂起重试 ≤3 轮 / 候选溢出 pending / 300s 熔断 / 心跳告警）、CI 测试门禁——这套工程纪律显著优于同类个人项目。
+</div>
+
+<div class="lead">
+  <b>最需审慎的是回测数字。</b>择时"生产口径 +188.8% / 基线 +291.9% / 持有 +171.3%"的超额主要来自<b>熊市降仓（平均仓位 53%）而非方向预测能力</b>；降档后 10 日仅 51% 段下跌 ≈ 掷硬币；因子权重经 12 年同一样本 in-sample 寻优。更关键的是<b>回测信息集不对称</b>：docstring 声称"≤d-1 收盘"，实际因子用 <code>close[:i+1]</code>（含当日收盘）当日决策——修正为昨收口径 <code>comp[d-1]</code> 后 +291.93%→+163.69%，<b>跑输买入持有 +171.28%</b>，严格口径下无可验证正向 alpha。
+</div>
+
+<div class="lead">
+  <b>信任基石仍空缺。</b><code>signal_backtest</code> 是设计中的可信度底座，但 <code>dir</code> 字段 2026-08-19 才上线——当前 64 条已推事件<b>可评估 0 条（冷启动）</b>，资讯信号"是否有效"暂时无法量化，与"先验证、再优化"纪律存在张力。
+</div>
+
+<div class="lead verdict">
+  <b>工程债与隐藏问题并存（本次审查新发现）：</b>Gist 读-改-写非原子（高）· 择时权重 in-sample（高）· <code>run_fund_rotation.py:29</code> 存在<b>必然 ImportError</b>（<code>push_report</code> 不存在）· <code>decide_position</code> 的 capped 语义误导 · 修正层分项封顶未落实 · 数据源 100% 免费 HTTP 抓取（东财已实证反爬）。
+</div>
+
+<h2>二、系统架构全景</h2>
+
+<div class="svg-box">
+<svg viewBox="0 0 1120 560" xmlns="http://www.w3.org/2000/svg" style="min-width:900px">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <!-- 状态层 -->
+  <rect x="60" y="14" width="1000" height="64" rx="10" fill="#1c2330" stroke="#3d444d" stroke-dasharray="5 4"/>
+  <text x="80" y="38" fill="#bc8cff" font-size="14" font-weight="700">状态层 · GitHub Gist + logs/</text>
+  <text x="80" y="58" fill="#9da7b3" font-size="12">real_time_state / factor_state / citic_pos_state / chinext_timing_state —— 跨容器读-改-写合并，fail-stop 容错</text>
+
+  <!-- ① 资讯流 -->
+  <rect x="60" y="120" width="480" height="216" rx="10" fill="#161b22" stroke="#2d333b"/>
+  <text x="80" y="146" fill="#58a6ff" font-size="14" font-weight="700">① 资讯事件流 · real_time_push.py (3041 行)</text>
+  <text x="80" y="170" fill="#9da7b3" font-size="11.5">8新闻源(东财/新浪/同花顺/富途/财联社/华尔街见闻/金十/GoogleRSS)</text>
+  <text x="80" y="188" fill="#9da7b3" font-size="11.5">+ 2信号源(龙虎榜/业绩预告)</text>
+  <text x="80" y="212" fill="#e6edf3" font-size="11.5">三层去重(URL→标题→SimHash) → 事件指纹48h → 预筛≥0.55</text>
+  <text x="80" y="230" fill="#e6edf3" font-size="11.5">→ LLM 6档判定(300s熔断/idx对齐/挂起重试) → 强档门槛</text>
+  <text x="80" y="248" fill="#e6edf3" font-size="11.5">→ 同事件合并(13分支) → 跨轮拦截 → 同题材饱和 → 推送</text>
+  <text x="80" y="272" fill="#9da7b3" font-size="11.5">未达标 → 静默记指纹 ｜ 未判定/溢出 → 挂起下轮(≤3轮)</text>
+  <rect x="80" y="288" width="120" height="26" rx="13" fill="rgba(248,81,73,.12)"/>
+  <text x="140" y="305" fill="#f85149" font-size="11" text-anchor="middle">PushPlus/企微微信</text>
+
+  <!-- ② 因子流 -->
+  <rect x="580" y="120" width="480" height="216" rx="10" fill="#161b22" stroke="#2d333b"/>
+  <text x="600" y="146" fill="#58a6ff" font-size="14" font-weight="700">② 量化因子流 · factor_collector.py (2589 行)</text>
+  <text x="600" y="170" fill="#9da7b3" font-size="11.5">6 正式维：对冲(贴水) / 风险 / 量价 / 汇率(日元) / 波动率 / 宽度</text>
+  <text x="600" y="188" fill="#9da7b3" font-size="11.5">影子维：GC007流动性 / 期权PCR / KOSPI / 日线5维 / 分钟2维</text>
+  <text x="600" y="212" fill="#e6edf3" font-size="11.5">方向合成：IC加权 Σ(w·s)/Σw (n≥20) ｜ 阈值 ±0.5 判偏多/偏空</text>
+  <text x="600" y="230" fill="#e6edf3" font-size="11.5">异动检测 → risk_state(任一warning→risk_off)</text>
+  <text x="600" y="248" fill="#9da7b3" font-size="11.5">2026-08-22 起停推仅采集，保 snapshot 供择时修正层</text>
+  <rect x="600" y="288" width="150" height="26" rx="13" fill="rgba(63,185,80,.12)"/>
+  <text x="675" y="305" fill="#3fb950" font-size="11" text-anchor="middle">→ Gist factor_state.json</text>
+
+  <!-- ③ 择时 -->
+  <rect x="170" y="380" width="780" height="130" rx="10" fill="#161b22" stroke="#2d333b"/>
+  <text x="190" y="406" fill="#58a6ff" font-size="14" font-weight="700">③ 创业板仓位择时 · run_chinext_timing.py (742 行) — 每日 14:45 推送</text>
+  <text x="190" y="430" fill="#e6edf3" font-size="11.5">核心层 10 因子（趋势0.35/量价0.20/波动0.20/估值0.10/落袋0.15，可回测）</text>
+  <text x="190" y="448" fill="#e6edf3" font-size="11.5">+ 修正层(贴水/资金/情绪/资讯/缠论/旭创, ±0.30 封顶)</text>
+  <text x="190" y="466" fill="#e6edf3" font-size="11.5">+ 硬风控(回撤/波动分位/risk_off/深贴水/急跌/顶背驰/外盘/ERP极贵封顶)</text>
+  <text x="190" y="490" fill="#9da7b3" font-size="11.5">→ 档位状态机 0/60/90/100%：升档连续2日确认 · 降档当日生效 → 微信推送</text>
+
+  <!-- ④⑤⑥⑦ -->
+  <rect x="60" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
+  <text x="180" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">④ 信号回测(周六) · 后1/3/5日一致率+IC</text>
+  <rect x="440" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
+  <text x="560" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">⑤ 中信持仓日报(17:00) · 全合约聚合</text>
+  <rect x="820" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
+  <text x="940" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">⑥ 盘前/盘后简报(08:45/15:10)</text>
+
+  <!-- 连接线 -->
+  <line x1="300" y1="336" x2="300" y2="380" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrb)"/>
+  <line x1="560" y1="336" x2="560" y2="380" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrb)"/>
+  <line x1="670" y1="336" x2="700" y2="380" stroke="#58a6ff" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="500" y1="336" x2="500" y2="380" stroke="#58a6ff" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <text x="282" y="360" fill="#6e7681" font-size="10.5">risk_off 联动</text>
+  <text x="512" y="362" fill="#6e7681" font-size="10.5">修正层数据源</text>
+  <line x1="180" y1="510" x2="180" y2="526" stroke="#6e7681" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="560" y1="510" x2="560" y2="526" stroke="#6e7681" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="940" y1="510" x2="940" y2="526" stroke="#6e7681" stroke-width="1.2" marker-end="url(#arr)"/>
+</svg>
+</div>
+<div class="legend">
+  <span><i style="background:#58a6ff"></i>核心子系统</span>
+  <span><i style="background:#bc8cff"></i>状态层</span>
+  <span><i style="background:#2d333b"></i>辅助链路</span>
+  <span>调度：cron-job.org 外部 POST（盘中 15-30min）为主，GitHub cron 用于对延迟不敏感任务</span>
+</div>
+
+<h2>三、调度拓扑（6 个 workflow，全部 concurrency 防并发 + 单测门禁）</h2>
+<table>
+  <tr><th>Workflow</th><th>触发方式</th><th>频次</th><th>状态</th><th>备注</th></tr>
+  <tr><td><code>realtime-push</code></td><td>cron-job.org POST workflow_dispatch</td><td>盘中每 30 分钟</td><td><span class="tag t-green">生产</span></td><td>不用自带 cron（延迟 5-20min）；私有仓 2000min/月额度接近上限</td></tr>
+  <tr><td><code>realtime-factor</code></td><td>cron-job.org 分时段</td><td>盘中15min/美股30min/其余60min ≈46 次/日</td><td><span class="tag t-blue">仅采集</span></td><td>2026-08-22 起 <code>--dry-run</code> 停推，保 snapshot 供择时</td></tr>
+  <tr><td><code>chinext-timing</code></td><td>cron-job.org 每日 14:45</td><td>1 次/日</td><td><span class="tag t-green">生产</span></td><td>jobId=8309384；last_date 去重兜底</td></tr>
+  <tr><td><code>citic-pos-push</code></td><td>GitHub cron 17:00</td><td>1 次/日</td><td><span class="tag t-green">生产</span></td><td>数据未就绪退出码2 → 10min×4 重试</td></tr>
+  <tr><td><code>market-brief</code></td><td>GitHub cron 08:45 / 15:10</td><td>2 次/日</td><td><span class="tag t-green">生产</span></td><td>对延迟不敏感，可直接用自带 cron</td></tr>
+  <tr><td><code>signal-backtest</code></td><td>GitHub cron 周六 09:30</td><td>1 次/周</td><td><span class="tag t-orange">冷启动</span></td><td>dir 方向字段 08-19 才上线，样本积累中</td></tr>
+</table>
+
+<h2>四、子系统深析</h2>
+
+<h3>4.1 资讯推送管线 —— 软信号系统</h3>
+
+<div class="flow">
+  <div class="step"><b>0 状态加载</b>fail-stop：损坏即拒绝</div><span class="arrow">→</span>
+  <div class="step"><b>1 抓取</b>8+2 源并行，三层去重</div><span class="arrow">→</span>
+  <div class="step"><b>2 增量</b>事件指纹 48h</div><span class="arrow">→</span>
+  <div class="step"><b>3 预筛</b>≥0.55 / 直通信号词<br>溢出挂 pending</div><span class="arrow">→</span>
+  <div class="step"><b>4 LLM</b>6档方向+0-10分<br>idx对齐 · 300s熔断</div><span class="arrow">→</span>
+  <div class="step"><b>5 合并</b>同事件13分支<br>选代表·跨轮拦截</div><span class="arrow">→</span>
+  <div class="step"><b>6 推送</b>红涨绿跌<br>双后端故障转移</div>
+</div>
+
+<div class="grid2">
+  <div>
+    <h4>去重体系（全项目最扎实）</h4>
+    <table>
+      <tr><th>层级</th><th>机制</th></tr>
+      <tr><td>三层近似</td><td>URL 规范化 → 标题精确 → SimHash(32bit MD5 3-gram, 海明≤3)</td></tr>
+      <tr><td>事件指纹</td><td>信号词 → <code>date|sig+ev+st/标题前6字</code>（不掺数字防分叉）</td></tr>
+      <tr><td>同事件合并</td><td>13 分支：实体重叠/金额交集/LCS≥5/时段+市场域/指数词/Jaccard≥0.6/央行+政策词+方向守卫/子序列兜底…</td></tr>
+      <tr><td>方向守卫</td><td>涨跌对立冲突、鹰鸽政策冲突均不合并</td></tr>
+      <tr><td>跨轮拦截</td><td>对比 pushed_events 历史，防同日重复推</td></tr>
+    </table>
+  </div>
+  <div>
+    <h4>LLM 判定与容错</h4>
+    <table>
+      <tr><th>项</th><th>设计</th></tr>
+      <tr><td>输出 schema</td><td>6 档方向 + 影响分 0-10 + 置信度 3 档 + 影响范围 3 级 + 板块/个股</td></tr>
+      <tr><td>对齐防漏推</td><td>idx 原样回显优先 → 标题兜底 → 未回显挂起下轮</td></tr>
+      <tr><td>JSON 容错</td><td>代码块→平衡括号→中文标点修复→正则抢救→截断恢复</td></tr>
+      <tr><td>方向兜底</td><td>别名表(看涨/利多/强利好…) + 否定词窗口 + 规则判定</td></tr>
+      <tr><td>熔断</td><td>单轮 300s 总超时，防多批重试叠加突破 Actions 10min</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3>4.2 量化因子流 —— 方向合成与 risk_state</h3>
+<table>
+  <tr><th>维度</th><th>逻辑</th><th>异动阈值</th><th>方向贡献</th></tr>
+  <tr><td>对冲</td><td>IC/IM 贴水 3 日单调收敛 / 走扩</td><td>创 20 日最深</td><td>收敛=+1 / 走扩=-1</td></tr>
+  <tr><td>风险</td><td>risk_state 映射</td><td>—</td><td>neutral=0 / risk_off=-1</td></tr>
+  <tr><td>量价</td><td>核心指数量比突破/破位</td><td>量比≥1.5</td><td>突破=+1 / 破位=-1</td></tr>
+  <tr><td>汇率</td><td>美元/日元急升/急贬</td><td>|Δ|≥1.5%</td><td>急升=-1 / 急贬=+1</td></tr>
+  <tr><td>波动率</td><td>20 日已实现波动率分位</td><td>≥80 分位</td><td>=-1</td></tr>
+  <tr><td>宽度</td><td>普跌/普涨占比</td><td>普跌≥80%</td><td>=-1 / +1</td></tr>
+</table>
+<p><b>合成</b>：等权 或 IC 加权 <code>Σ(w·s)/Σw</code>（n≥20 启用，权重=max(IC,0)+0.1，未覆盖维地板 0.1）；P5-1 门控：高波→利空维 ×1.5、普跌+日元急升→汇率/宽度 ×1.5。<b>risk_state</b>：任一 warning → risk_off（无时效衰减，偏简）。<b>消费方</b>：资讯管线降级科技利好 + 择时修正层 + news_link L3 宏观 overlay。</p>
+
+<h3>4.3 创业板仓位择时 —— 真正的量化内核</h3>
+
+<div class="grid3">
+  <div class="card">
+    <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">核心层（可回测 · 权重 100% 基准）</div>
+    <p style="font-size:12px;margin-top:8px">趋势 0.35 + 量价 0.20 + 波动 0.20 + 估值 0.10 + 落袋 0.15<br>10 因子全部由 399006 日线计算，12 年可回测</p>
+    <div class="bar"><i style="width:35%;background:#f85149"></i></div>
+    <div class="bar"><i style="width:20%;background:#d29922"></i></div>
+    <div class="bar"><i style="width:20%;background:#58a6ff"></i></div>
+    <div class="bar"><i style="width:10%;background:#bc8cff"></i></div>
+    <div class="bar"><i style="width:15%;background:#3fb950"></i></div>
+  </div>
+  <div class="card">
+    <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">修正层（当日实时 · ±0.30 封顶）</div>
+    <p style="font-size:12px;margin-top:8px">贴水 ±0.06 + 资金 ±0.05 + 情绪 ±0.04 + 资讯 ±0.06<br>+ 缠论 ±0.08 + 旭创双确认 ±0.10<br><span class="tag t-orange">注意</span> 分项上限未落实，仅总 clamp 生效</p>
+  </div>
+  <div class="card">
+    <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">硬风控（最高优先级 · 覆盖一切）</div>
+    <p style="font-size:12px;margin-top:8px">回撤≤-12%→3成 · vol≥95分位→6成 · risk_off→3成<br>深贴水→6成 · 盘中急跌→3成 · 缠论顶背驰→6成<br>外盘确认(SOX≤-3%+盘中条件) · ERP 极贵封顶→6成</p>
+  </div>
+</div>
+
+<div class="grid2">
+  <div>
+    <h4>档位状态机</h4>
+    <div class="timeline">
+      <div class="tl"><div class="t">100%</div><div class="d">score ≥ 0.40</div></div>
+      <div class="tl"><div class="t">90%</div><div class="d">score ≥ -0.15</div></div>
+      <div class="tl"><div class="t">60%</div><div class="d">score ≥ -0.30</div></div>
+      <div class="tl"><div class="t">0%</div><div class="d">score &lt; -0.30</div></div>
+    </div>
+    <p style="font-size:12px">升档需<b>连续 2 日</b>同目标确认；降档<b>当日生效</b>（非对称：进场慢、出场快）；HYST_MARGIN=0.05 防震荡换手。</p>
+  </div>
+  <div>
+    <h4>旭创双确认（中际旭创 300308）</h4>
+    <table>
+      <tr><th>情形</th><th>动作</th></tr>
+      <tr><td>指数看多 × 个股走弱（背离预警）</td><td><b>-0.10</b> 降档确认</td></tr>
+      <tr><td>指数看空 × 个股企稳走强</td><td><b>+0.08</b> 温和升档</td></tr>
+      <tr><td>同向</td><td>中性（主信号已覆盖）</td></tr>
+    </table>
+    <p style="font-size:12px">实况验证：指数 +0.60 × 旭创 -0.39 → 综合 -0.09→-0.19，避免情绪背离时进场。旭创侧回测夏普 0.99 但回撤 -58.8%（beta≈2.0），+2620% 为幸存者偏差已自标。</p>
+  </div>
+</div>
+
+<h4>回测口径与数字（必须诚实解读）</h4>
+<table>
+  <tr><th>口径</th><th>累计</th><th>夏普</th><th>最大回撤</th><th>卡玛</th><th>解读</th></tr>
+  <tr><td>生产配置（含 ERP 极贵封顶）</td><td><b>+188.8%</b></td><td>0.60</td><td>-42.0%</td><td>0.22</td><td>用户拍板保留的保守变体（牺牲 ~103pp 收益换泡沫期约束）</td></tr>
+  <tr><td>基线（无估值滤波）</td><td>+291.9%</td><td>0.68</td><td>-42.8%</td><td>0.28</td><td>超额主要来自熊市降仓：平均仓位 53%</td></tr>
+  <tr><td>买入持有</td><td>+171.3%</td><td>—</td><td>-69.7%</td><td>0.12</td><td>最实在的改善项是回撤 -69.7% → -42%</td></tr>
+</table>
+<p><b>验门纪律</b>（全项目最"量化"处）：因子进核心层必须 |IC|≥0.05 且样本≥10；已关闭业绩预告（IC=0）、两融、外盘打分（全样本 IC&lt;0.05）、估值打分（样本外负贡献，仅保留极贵封顶滤波）。</p>
+
+<div class="quote">
+  ⚠️ <b>附注 A 勘误</b>：ERP 滤波首版存在<b>语义反转 bug</b>（用便宜度 &gt;0.90 触发 = "便宜时封顶"，与"极贵封顶"相反），虚增收益至 +309.5%。已纠正为便宜度&lt;0.10（500 日顶部 10%）触发。纠正后该滤波为净负贡献，用户拍板保留作保守变体——生产口径以 +188.8% 为准。
+</div>
+
+<div class="quote" style="border-left-color:var(--red)">
+  🔴 <b>回测信息集不对称（本次复核实证）</b>：<code>backtest_metrics</code> docstring 声称"信号日 d 用 ≤d-1 收盘"，但实现为因子 <code>close[:i+1]</code>（<b>含当日收盘</b>，chinext_factors.py:85）+ <code>decide_position(comp[d])</code> 当日决策、吃 d→d+1 收益——回测比实盘 14:45 盘中快照多拿当日收盘。修正为昨收口径 <code>comp[d-1]</code> 后：+291.93%→<b>+163.69%</b>（夏普 0.68→0.51），<b>跑输买入持有 +171.28%</b>——严格口径下无可验证正向 alpha，现有超额数字应视为"上限口径"（2026-08-22 复核量化）。
+</div>
+
+<h3>4.4 辅助子系统</h3>
+<table>
+  <tr><th>子系统</th><th>要点</th><th>状态</th></tr>
+  <tr><td>中信持仓日报</td><td>中金所 ccpm XML，全合约聚合口径（IF/IH/IC/IM 中信净增减合计）；Gist 按 last_pushed_day 去重；pos_history 90 日供 L3 消费（净空&gt;2000 手阈值）</td><td><span class="tag t-green">生产</span></td></tr>
+  <tr><td>信号质量回测</td><td>pushed_events → 后 1/3/5 日一致率 + 分层 IC(P11 Spearman 单调) + 因子 IC(P4-6 平均秩，1 日前瞻，n&lt;20 等权)</td><td><span class="tag t-orange">冷启动</span> 64 条可评估 0 条</td></tr>
+  <tr><td>基金轮动</td><td>8 基金候选池 + MA20×宏观 overlay + 滞回建议（本地独立）</td><td><span class="tag t-red">入口不可用</span> ImportError</td></tr>
+  <tr><td>盘前/盘后简报</td><td>morning=隔夜 Top5+因子环境+自选；evening=已推事件+方向/板块统计</td><td><span class="tag t-green">生产</span></td></tr>
+</table>
+
+<h2>五、风险清单（按严重度）</h2>
+<table>
+  <tr><th style="width:90px">级别</th><th>风险</th><th>位置</th></tr>
+  <tr><td><span class="risk r-hi">高</span></td><td>Gist 读-改-写<b>非原子</b> + PATCH 无 ETag/If-Match，本地 <code>--loop</code> 与云端双端并发仍存 last-write-wins 覆盖窗口（历史事故：4759 条 seen 被冲）</td><td>save_state / _merge_state</td></tr>
+  <tr><td><span class="risk r-hi">高</span></td><td>择时回测<b>单资产 in-sample 寻优</b>：权重/阈值 12 年同一样本调出，缺严格样本外 walk-forward 验证</td><td>backtest_metrics</td></tr>
+  <tr><td><span class="risk r-hi">高</span></td><td><b>回测信息集不对称（本次复核实证）</b>：docstring 声称"≤d-1"，实现用 <code>close[:i+1]</code>（含当日收盘）+ <code>comp[d]</code> 当日决策；修正为昨收口径 <code>comp[d-1]</code> 后 +291.93%→+163.69%，<b>跑输买入持有 +171.28%</b>，严格口径下无可验证正向 alpha</td><td>chinext_factors.py:85 / backtest_metrics</td></tr>
+  <tr><td><span class="risk r-mid">中高</span></td><td>资讯信号有效性<b>冷启动无结论</b>（64 条可评估 0 条），阈值/prompt 调优缺量化反馈闭环</td><td>signal_backtest</td></tr>
+  <tr><td><span class="risk r-mid">中</span></td><td><code>_is_same_event</code> 13 分支/160 行复杂度过高，"打地鼠式"守卫，任一误判 → 漏推/重复推</td><td>real_time_push L803-962</td></tr>
+  <tr><td><span class="risk r-mid">中</span></td><td><b>run_fund_rotation.py ImportError</b>：<code>from src.tools.push import push_report</code> 函数不存在 → 入口必崩（本次新发现）</td><td>run_fund_rotation.py:29</td></tr>
+  <tr><td><span class="risk r-mid">中</span></td><td><code>decide_position</code> 的 capped 语义错误：检测"滞回带保档"而非"风控封顶"，风控降档时备注误导（功能正确）</td><td>chinext_timing</td></tr>
+  <tr><td><span class="risk r-mid">中</span></td><td>修正层分项封顶未落实（注释 ±0.05/0.04/0.06 vs 实际 ±0.10/0.08/0.15），仅总 clamp 约束</td><td>_dimension_modifier</td></tr>
+  <tr><td><span class="risk r-low">中低</span></td><td>数据源 100% 免费 HTTP 抓取：东财 push2his 已实证反爬、乐咕 PE 字段偶变、外盘源不稳、Google News 需代理</td><td>data_fetchers / factor_collector</td></tr>
+  <tr><td><span class="risk r-low">中低</span></td><td>Gist 读写逻辑 4 处重复（factor/signal/citic/realtime），news_link 已有统一 <code>_read_gist_file</code> 应抽公共模块</td><td>各脚本</td></tr>
+  <tr><td><span class="risk r-low">中低</span></td><td>死代码：WxPusher 未接入、src/agent 废弃但测试仍依赖、v3/v4 双打分逻辑并存易误用</td><td>多处</td></tr>
+  <tr><td><span class="risk r-note">注意</span></td><td><code>.ENV</code> 含真实 API Key / PushPlus / Gist Token —— 已 gitignore 不入库，本地权限需自管</td><td>.ENV</td></tr>
+</table>
+
+<h2>六、改进路线图</h2>
+
+<h3>P0 —— 堵缺口，对齐"先验证、再优化"纪律</h3>
+<table>
+  <tr><th style="width:40px">#</th><th>动作</th><th>预期收益</th></tr>
+  <tr><td>1</td><td><b>先修回测信息集口径</b>（因子序列滞后一天 <code>comp[d-1]</code> 对齐实盘 14:45 快照），再做 <b>walk-forward 时间序列切分</b>（滚动训练/测试）替代整段 in-sample 寻优；signal_backtest 冷启动期作为观察期，2-4 周后按一致率收紧/放宽阈值</td><td>把"+291.9%"从 in-sample/上限口径变成有样本外背书的数字</td></tr>
+  <tr><td>2</td><td><b>根治 Gist 并发</b>：单写端（云端独占+本地只读）或引入 DB（SQLite on D1/Supabase）；Gist 读改写抽公共模块消除 4 处重复</td><td>根除 last-write-wins 覆盖窗口</td></tr>
+</table>
+
+<h3>P1 —— 工程健康</h3>
+<table>
+  <tr><th style="width:40px">#</th><th>动作</th></tr>
+  <tr><td>3</td><td>修复 <code>run_fund_rotation.py</code>：改调 <code>push_news</code>/<code>format_ranked_news_md</code> 或归档该入口</td></tr>
+  <tr><td>4</td><td>修正 <code>decide_position</code> capped 语义 + 落实修正层分项封顶 + 清理 v3/v4 双打分死代码</td></tr>
+  <tr><td>5</td><td>按 <code>docs/数据源加固方案_20260822.md</code> 接入 <b>Tushare Pro</b>（¥0，覆盖 399006 日线/旭创/PE 三核心点），免费源保留为降级链</td></tr>
+  <tr><td>6</td><td>去重复杂度收敛：评估嵌入向量相似度兜底 13 分支；哨兵词表收敛进 keyword_tables（单一事实来源）</td></tr>
+</table>
+
+<h3>P2 —— 长期</h3>
+<p style="font-size:13px">收口 langchain 表述（data_fetchers 已优雅降级，README 措辞同步）；接入 ruff lint/type-check 门禁；KOSPI 接入；factor risk_state 增加时效衰减；sources 健康度告警（连续 N 轮付费源失败→推送）。</p>
+
+<h2>七、一句话总结</h2>
+<div class="lead verdict">
+  <b>工程成熟度（去重/容错/测试/CI）远超个人项目的典型水平，alpha 验证链（样本外回测/信号有效性）是当前最大缺口。项目正处在"系统已跑通、可信度待建立"的临界点——下一步的胜负手是 walk-forward 样本外验证与信号回测冷启动积累，而非继续加因子。</b>
+</div>
+
+<div class="foot">
+  分析口径：只读审查，无代码改动 ｜ 生成：2026-08-22 20:56 (GMT+8) ｜ 对应 Markdown 版：docs/项目全链路深度分析_20260822.md
+</div>
+
+</div>
+</body>
+</html>
