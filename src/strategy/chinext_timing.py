@@ -385,14 +385,17 @@ def decide_position(score: float, cap: float, prev: dict,
 MOD_TOTAL_CAP = 0.30  # 修正层合计封顶：中性市场最多被推到六成档，永远到不了满仓档
 
 
-def stock_confirm(stock_trend: dict, stock_mom: dict, index_trend: dict) -> dict:
-    """科技龙头情绪标的（中际旭创）二次确认：指数信号方向 × 个股趋势/动量一致性。
+def stock_confirm(stock_trend: dict, stock_mom: dict, index_trend: dict,
+                  intraday_pct: float = 0.0) -> dict:
+    """科技龙头情绪标的（中际旭创）二次确认：指数信号方向 × 个股趋势/动量/当日走势。
 
     定位：用户持有基金重仓中际旭创，它作为创业板科技龙头的**情绪领先指标**，
     提供方向确认而非替代主信号（创业板指数）。
     - 指数看多但情绪标的走弱（龙头先于指数走弱）→ 降档确认（-0.10）
     - 指数看空但情绪标的走强（龙头先于指数企稳）→ 升档确认（+0.08）
     - 两者同向 → 中性（不额外加分，主信号已覆盖）
+    当日盘中涨幅 intraday_pct 并入个股方向（当日龙头强弱反映情绪），
+    不单独构成触发，只微调 stock_dir 的敏感窗。
     返回 {"score": 有界修正, "agree": bool, "detail": str}。
     """
     if not stock_trend or not stock_mom or not index_trend:
@@ -400,11 +403,13 @@ def stock_confirm(stock_trend: dict, stock_mom: dict, index_trend: dict) -> dict
     st = float(stock_trend.get("score") or 0.0)
     sm = float(stock_mom.get("score") or 0.0)
     it = float(index_trend.get("score") or 0.0)
-    # 个股综合方向（趋势+动量等权）
-    stock_dir = 0.5 * st + 0.5 * sm
+    # 个股综合方向（趋势+动量等权）；当日盘中强弱折算为动量增量（上限±0.4）
+    day = max(-0.4, min(0.4, intraday_pct / 5.0))
+    stock_dir = 0.5 * st + 0.5 * sm + day
     agree = (stock_dir >= 0) == (it >= 0)
     s = 0.0
-    detail = f"个股方向{stock_dir:+.2f}/指数{it:+.2f}"
+    detail = (f"个股方向{stock_dir:+.2f}/指数{it:+.2f}"
+              f"(盘中{intraday_pct:+.1f}%)")
     if not agree:
         # 背离：指数看多但个股走弱 → 降档；指数看空但个股走强 → 温和升档
         if it >= 0 and stock_dir < -0.1:
@@ -453,23 +458,30 @@ def _rank(a):
 
 def shadow_ic(history: list, fields: tuple = ("core", "basis", "flow", "mood",
                                               "news", "position")) -> dict:
-    """影子期各因子的 Spearman IC（因子秩 vs 次日收益秩）。
-    只在有 next_ret 的样本上计算；样本 < MIN_IC_SAMPLES 记为不足。
-    返回 {field: {"ic": float|None, "n": int}}。
+    """影子期各因子的 Spearman IC（因子秩 vs 前瞻收益秩）。
+    前瞻口径：next_ret(1日)/r3(3日)/r5(5日)/r10(10日)。样本 < MIN_IC_SAMPLES 记不足。
+    返回 {field: {"ic": float|None, "n": int, **{"horizon_<h>": ic_d...}}}。
     history 元素形如 {"date","score","core","basis","flow","mood","news",
-                       "kospi","sox","vix","a50","position","next_ret"}。
+                       "chan","stock","kospi","sox","vix","a50","position",
+                       "next_ret","r3","r5","r10"}。
     """
-    samples = [h for h in history if h.get("next_ret") is not None]
+    horizons = {"1": "next_ret", "3": "r3", "5": "r5", "10": "r10"}
     out = {}
     for f in fields:
-        pairs = [(float(h.get(f, 0.0)), float(h["next_ret"]))
-                 for h in samples if f in h]
-        if len(pairs) >= MIN_IC_SAMPLES:
-            xs = [p[0] for p in pairs]
-            ys = [p[1] for p in pairs]
-            out[f] = {"ic": round(spearman_ic(xs, ys), 4), "n": len(pairs)}
-        else:
-            out[f] = {"ic": None, "n": len(pairs)}
+        entry = {}
+        for hlab, hkey in horizons.items():
+            pairs = [(float(h.get(f, 0.0)), float(h[hkey]))
+                     for h in history if h.get(hkey) is not None and f in h]
+            if len(pairs) >= MIN_IC_SAMPLES:
+                xs = [p[0] for p in pairs]
+                ys = [p[1] for p in pairs]
+                entry[f"h{hlab}"] = {"ic": round(spearman_ic(xs, ys), 4),
+                                     "n": len(pairs)}
+            else:
+                entry[f"h{hlab}"] = {"ic": None, "n": len(pairs)}
+        entry["ic"] = entry["h1"]["ic"]  # 主口径仍为 1 日(main 预览兼容)
+        entry["n"] = entry["h1"]["n"]
+        out[f] = entry
     return out
 
 

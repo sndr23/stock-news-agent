@@ -397,3 +397,26 @@ def test_stock_confirm_missing_data_skip():
     r = ct.stock_confirm(None, None, {"score": 0.7})
     assert r["score"] == 0.0
     assert r["agree"] is None
+
+
+def test_stock_confirm_intraday_drop_triggers_downgrade():
+    """当日盘中大跌拉低个股方向 → 对原本中性/看多的指数触发降档确认。"""
+    # 无盘中时：基准 -0.05 不破 ±0.1 → 不动作
+    r0 = ct.stock_confirm({"score": 0.0}, {"score": -0.1}, {"score": 0.7})
+    assert r0["score"] == 0.0
+    # 有 -5% 盘中（day=-0.4）→ stock_dir≈-0.45 → 指数多/个股弱，降档
+    r = ct.stock_confirm({"score": 0.0}, {"score": -0.1}, {"score": 0.7},
+                         intraday_pct=-5.0)
+    assert r["score"] == -0.10
+    assert r["agree"] is False
+
+
+def test_stock_confirm_intraday_cap_bound():
+    """盘中涨跌幅折算的动量增量有界（±0.4），极端值不失控。"""
+    r_pos = ct.stock_confirm({"score": 0.8}, {"score": 0.6}, {"score": -0.7},
+                             intraday_pct=99.0)
+    r_neg = ct.stock_confirm({"score": 0.0}, {"score": -0.1}, {"score": 0.7},
+                             intraday_pct=-99.0)
+    # 有界后仍只落在定义档位（±0.10/±0.08/0）
+    assert r_pos["score"] in (-0.10, 0.08, 0.0)
+    assert r_neg["score"] in (-0.10, 0.08, 0.0)

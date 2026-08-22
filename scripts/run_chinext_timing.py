@@ -146,26 +146,52 @@ def gather_context(df) -> dict:
     except Exception as e:
         logger.warning("外盘状态读取失败（降级为0）: %s", type(e).__name__)
 
-    # 中际旭创（双确认个股侧）：趋势/动量/盘中，缺源降级为 None（跳过确认）
+    # 中际旭创（双确认个股侧）：趋势/动量/盘中，缺源降级为 None（跳过确认）。
+    # 用 ≤d-1 完整日收盘算趋势/动量（当日 partial close 会污染均线，与量价修复同口径），
+    # 当日实时涨跌幅单独注入 stock_ctx，14:45 旭创当日走势才真正进入双确认。
     stock_ctx = None
     try:
         sdf = load_stock_sina(SYMBOL_STOCK)
         if sdf is not None and not sdf.empty:
-            scloses = sdf["close"].tolist()
+            scloses_full = sdf["close"].tolist()
+            sdates = [d.strftime("%Y-%m-%d") for d in sdf.index]
+            today_s = datetime.now().strftime("%Y-%m-%d")
+            # 若末根为当日 partial，剔除后再算 trend/mom（与回测一致用完整日）
+            scloses = (scloses_full[:-1] if sdates and sdates[-1] == today_s
+                       else scloses_full[:])
+            st_pct = 0.0
+            try:
+                st_pct = float((get_quotes([f"0.{SYMBOL_STOCK}"]).get(
+                    SYMBOL_STOCK) or 0.0))
+            except Exception as e:
+                logger.warning("旭创盘中行情失败（当日走势不进双确认）: %s",
+                               type(e).__name__)
             stock_ctx = {
-                "trend": ct.trend_score(scloses),
-                "mom": ct.momentum_score(scloses),
-                "last_close": scloses[-1],
+                "trend": ct.trend_score(scloses) if len(scloses) >= 30 else None,
+                "mom": ct.momentum_score(scloses) if len(scloses) >= 60 else None,
+                "last_close": (scloses[-1] if scloses else None),
+                "intraday_pct": st_pct,
                 "date": str(sdf.index[-1].date()),
             }
     except Exception as e:
         logger.warning("中际旭创数据读取失败（跳过双确认）: %s", type(e).__name__)
 
+    # 修复2：实盘量价口径收口——当日(14:45)新浪返回 partial 累计成交额，
+    # 若用它进量能滚动分位会系统性低估量能分位(更容易落"缩量"档→盘中偏空)。
+    # 处理：末根若为当日 partial，量能序列用 ≤d-1 完整量占位(保持长度与 close 对齐)，
+    # 当日实时量能单独记录 day_amount_ratio 供盘面判断，不进量价因子分位。
+    day_amount_ratio = 0.0
+    if len(amounts) >= 2 and dates and dates[-1] == datetime.now().strftime("%Y-%m-%d"):
+        if amounts[-1] and amounts[-2]:
+            day_amount_ratio = amounts[-1] / amounts[-2]
+        amounts = list(amounts)
+        amounts[-1] = amounts[-2]  # 当日 partial 作废，用昨量占位(长度不变)
     return {"closes": closes, "amounts": amounts, "dates": dates,
             "highs": highs, "lows": lows,
             "intraday": intraday, "snapshot": snapshot,
             "citic_net": citic_net, "citic_day": citic_day, "events": events,
             "overseas_drop": overseas_drop, "stock_ctx": stock_ctx,
+            "day_amount_ratio": day_amount_ratio,
             "erp_pctile": _load_erp_basis(dates)}
 
 
@@ -279,9 +305,12 @@ def score_all(ctx: dict) -> dict:
     # 中际旭创双确认：指数信号 × 个股趋势/动量一致性（有界 ±0.10）
     stock_conf = {"score": 0.0, "agree": None, "detail": "个股数据不足，跳过"}
     sc = ctx.get("stock_ctx")
-    if sc:
+    if sc and sc.get("trend") and sc.get("mom"):
         idx_trend = {"score": float((core["signals"].get("trend_ma20_60") or 0.0))}
-        stock_conf = ct.stock_confirm(sc["trend"], sc["mom"], idx_trend)
+        stock_conf = ct.stock_confirm(sc["trend"], sc["mom"], idx_trend,
+                                      sc.get("intraday_pct") or 0.0)
+    else:
+        stock_conf = {"score": 0.0, "agree": None, "detail": "个股数据不足，跳过"}
     mods["score"] = ct.clamp(mods["score"] + chan["score"] + stock_conf["score"],
                              -0.30, 0.30)
     mods["chan"] = chan
@@ -305,14 +334,14 @@ def score_all(ctx: dict) -> dict:
     except (TypeError, ValueError):
         pass
     caps = cf.defensive_state(closes, vol_pctile, glass)
-    # ERP 估值极端滤波：便宜度分位>0.90（估值极贵，FRO 创业50 高分位）封顶6成
-    # 经收益矩阵寻优（confirm+ERP 满仓≥0.40）：收益 291.9→309.5%，回撤-42.8→-38.5%，
-    # 样本外卡玛 0.44→0.41 不劣化。作独立硬过滤，不进日频打分（估值维负贡献故打分为0）。
+    # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
+    # 附注A曾误写/误用">0.90"(那是便宜度>0.9=极便宜，语义反了，已修正)，
+    # 经样本外寻优确认：估值极贵时降仓(躲2015后估值消化期)为正向逻辑。
     _erp_series = ctx.get("erp_pctile") or []
-    if _erp_series and _erp_series[-1] is not None and _erp_series[-1] > 0.90:
+    if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
         caps["cap"] = min(caps["cap"], 0.6)
         caps.setdefault("triggers", []).append(
-            f"估值极贵({_erp_series[-1]:.0%}分位)封顶6成")
+            f"估值极贵(便宜度{_erp_series[-1]:.0%})封顶6成")
     # 顶背驰：结构否决，封顶 6 成（带否决但不完全清仓）
     if chan["bustop"]:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -324,7 +353,12 @@ def score_all(ctx: dict) -> dict:
 
 def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                           mods: dict, position: float) -> None:
-    """补填历史 next_ret + 追加今日记录（各维分数 vs 次日涨幅 → 后续算 IC）。"""
+    """补填历史多期前瞻 + 追加今日记录（各维分数 vs 1/3/5/10日前瞻 → 后续算 IC）。
+
+    前瞻字段推进（字段存的是 index 偏移，计算时统一换算）：
+      fwd3_off / fwd5_off / fwd10_off = 距完成记录日的交易日数，
+      当前值 None=该期尚未来临；shadow_ic 据此换算实际前瞻收益。
+    """
     hist = state.setdefault("history", [])
     closes, dates = ctx["closes"], ctx["dates"]
     idx = {d: i for i, d in enumerate(dates)}
@@ -333,13 +367,34 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
             i = idx.get(str(h.get("date") or ""))
             if i is not None and i + 1 < len(closes) and dates[i] < today:
                 h["next_ret"] = round(closes[i + 1] / closes[i] - 1.0, 4)
+        # 多期前瞻：记录"还需等几根"递减，0 时用 close 前缀补实际收益
+        for offk, rk, k in (("fwd3_off", "r3", 3), ("fwd5_off", "r5", 5),
+                            ("fwd10_off", "r10", 10)):
+            off = h.get(offk)
+            if isinstance(off, (int, float)) and h.get(rk) is None:
+                i = idx.get(str(h.get("date") or ""))
+                if i is None:
+                    continue
+                move = int(off)
+                if move <= 0 and i + k < len(closes) and dates[i] < today:
+                    base = closes[i]
+                    h[rk] = round(closes[i + k] / base - 1.0, 4)
+                elif dates[i] < today:
+                    h[offk] = move - 1  # 尚未到期，递减等待
     ovs_drop = ctx.get("overseas_drop") or 0.0
+    stock_d = (mods.get("stock") or {}).get("score", 0.0) if mods else 0.0
+    chan_d = (mods.get("chan") or {}).get("score", 0.0) if mods else 0.0
     hist.append({"date": today, "score": score,
-                 "core": mods["core"]["score"],
-                 "basis": mods["basis"], "flow": mods["flow"],
-                 "mood": mods["mood"], "news": mods["news"],
-                 "kospi": 0.0, "sox": ovs_drop, "vix": 0.0, "a50": 0.0,
-                 "position": position, "next_ret": None})
+                 "core": mods["core"]["score"] if mods else 0.0,
+                 "basis": mods["basis"] if mods else 0.0,
+                 "flow": mods["flow"] if mods else 0.0,
+                 "mood": mods["mood"] if mods else 0.0,
+                 "news": mods["news"] if mods else 0.0,
+                 "chan": chan_d, "stock": stock_d,
+                 "kospi": 0.0, "sox": min(ovs_drop, 0.0), "vix": 0.0, "a50": 0.0,
+                 "position": position, "next_ret": None,
+                 "fwd3_off": 3, "fwd5_off": 5, "fwd10_off": 10,
+                 "r3": None, "r5": None, "r10": None})
     state["history"] = hist[-HISTORY_LIMIT:]
 
 
@@ -382,6 +437,9 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
     if od <= -0.03:
         lines.append(f"■ 外围：SOX/纳指/标普 t-1 最差 {od:.1%}（外围大幅下杀）")
     lines.append(f"■ 盘中：创业板指 {ctx['intraday']:+.2f}%")
+    dar = ctx.get("day_amount_ratio") or 0.0
+    if dar:
+        lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子用昨日完整量）")
     if caps["triggers"]:
         lines.append("■ 硬风控：" + "；".join(caps["triggers"]))
     else:
@@ -457,7 +515,8 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                                    "intraday_pct": 0.0})
         cap = caps["cap"]
         if erp_cap and erp_series is not None and erp_series[d] is not None and \
-                erp_series[d] > 0.90:
+                erp_series[d] < 0.10:
+            # 便宜度<0.10=PE处于顶部10%（估值极贵）→封顶6成，与 score_all 同口径
             cap = min(cap, 0.6)
         dec = ct.decide_position(comp[d], cap, prev, tiers=tiers)
         if dec["changed"]:
@@ -502,7 +561,7 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                  tiers: tuple = ct.TIERS, erp_cap: bool = False) -> str:
     m = backtest_metrics(df, fee, pe_map, val_span, val_w, tiers, erp_cap)
     val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位，仅作极端滤波"
-                f"(>0.9 分位封顶6成，erp_cap)"
+                f"(便宜度<0.1=PE顶部10% 封顶6成，erp_cap)"
                 if m["has_val"] else "估值源缺失（估值滤波关闭）")
     ds, s = m["dates"], m["start"]
     dodge = m["down_dodge"]
@@ -547,16 +606,20 @@ def main():
             print("影子期尚无样本记录（需在 --push 模式下运行积累）")
             return
         ic = ct.shadow_ic(hist)
-        print("创业板择时·影子期因子 IC（Spearman vs 次日收益）")
+        print("创业板择时·影子期因子 IC（Spearman vs 1/3/5/10日前瞻）")
         for f, info in ic.items():
-            tag = "样本不足" if info["ic"] is None else f"{info['ic']:+.4f}"
-            eff = "" if info["ic"] is None else ("✓" if abs(info["ic"]) >= 0.05 else "×")
-            print(f"  {f:<10} IC={tag:<12} n={info['n']:<4} {eff}")
+            parts = []
+            for hl, hr in (("1", "h1"), ("3", "h3"), ("5", "h5"), ("10", "h10")):
+                e = info.get(hr) or {}
+                tag = "样本不足" if e.get("ic") is None else f"{e['ic']:+.4f}"
+                eff = "" if e.get("ic") is None \
+                    else ("✓" if abs(e["ic"]) >= 0.05 else "×")
+                parts.append(f"{hl}日:{tag}{eff}")
+            print(f"  {f:<8} " + "  ".join(parts))
         return
 
     if args.backtest:
-        # ERP 估值极端滤波（pe_map>0.9 分位封顶6成）：经收益矩阵寻优为正增益
-        # （291.9→309.5%，回撤-42.8→-38.5%，样本外卡玛不劣化）。
+        # ERP 估值极端滤波（便宜度<0.1=PE顶部10% 封顶6成）：估值极贵时降仓。
         # 估值维不进打分（erp_cap 独立硬过滤，core 仍 erp_pctile=None）。
         print(run_backtest(df, pe_map=ipe.load_cy50_pe(PROJECT_ROOT),
                            erp_cap=True))
