@@ -420,3 +420,31 @@ def test_stock_confirm_intraday_cap_bound():
     # 有界后仍只落在定义档位（±0.10/±0.08/0）
     assert r_pos["score"] in (-0.10, 0.08, 0.0)
     assert r_neg["score"] in (-0.10, 0.08, 0.0)
+
+
+def test_update_shadow_history_accepts_res_top_level():
+    """回归：update_shadow_history 必须兼容 main() 传入的 res 顶层（keyerror 修复）。
+    曾致推送成功后立即 KeyError:'basis'（res 顶层无 basis/flow/mood/news 直接键），
+    chan/stock 若取顶层则恒 None→恒0（假数据）。验证正确解构 res["mods"]。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import update_shadow_history as ush
+
+    res = {"core": {"score": 0.6, "signals": {}},
+           "mods": {"basis": -0.06, "flow": 0.0, "mood": 0.03, "news": 0.0,
+                    "chan": {"score": -0.08}, "stock": {"score": -0.10}},
+           "score": 0.54, "caps": {"cap": 0.3}}
+    ctx = {"closes": [100.0, 101.0], "dates": ["2026-08-21", "2026-08-22"],
+           "overseas_drop": -0.04}
+    state = {"history": []}
+    ush(state, ctx, "2026-08-22", res["score"], res, 0.3)  # 传 res 顶层，不应 KeyError
+    h = state["history"][-1]
+    assert h["core"] == 0.6
+    assert h["basis"] == -0.06
+    assert h["mood"] == 0.03
+    assert h["chan"] == -0.08          # 修复前恒 0
+    assert h["stock"] == -0.10         # 修复前恒 0
+    assert h["sox"] == -0.04           # 外盘实值

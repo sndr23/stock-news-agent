@@ -360,6 +360,16 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
       fwd3_off / fwd5_off / fwd10_off = 距完成记录日的交易日数，
       当前值 None=该期尚未来临；shadow_ic 据此换算实际前瞻收益。
     """
+    # 兼容两种入参：res 顶层（main() 传入）或 res["mods"]：basis/flow/mood/news/chan/stock
+    # 在 mods 子字典，core 在 res 顶层（score_all 返回 res={core,mods,score,caps}）。
+    # 曾因 ve 直接用 mods["basis"] 而 main 传 res 导致 KeyError: 'basis'（周一首推必炸），
+    # 且 stock/chan 取顶层恒 None → 恒 0（假数据）。统一解构修复。
+    res = mods  # main 传入的是 res（score_all 的完整返回）
+    m = res.get("mods") or res
+    core_s = (res.get("core") or m.get("core") or {}).get("score", 0.0)
+    ovs_drop = ctx.get("overseas_drop") or 0.0
+    stock_d = (m.get("stock") or {}).get("score", 0.0)
+    chan_d = (m.get("chan") or {}).get("score", 0.0)
     hist = state.setdefault("history", [])
     closes, dates = ctx["closes"], ctx["dates"]
     idx = {d: i for i, d in enumerate(dates)}
@@ -382,21 +392,57 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                     h[rk] = round(closes[i + k] / base - 1.0, 4)
                 elif dates[i] < today:
                     h[offk] = move - 1  # 尚未到期，递减等待
-    ovs_drop = ctx.get("overseas_drop") or 0.0
-    stock_d = (mods.get("stock") or {}).get("score", 0.0) if mods else 0.0
-    chan_d = (mods.get("chan") or {}).get("score", 0.0) if mods else 0.0
-    hist.append({"date": today, "score": score,
-                 "core": mods["core"]["score"] if mods else 0.0,
-                 "basis": mods["basis"] if mods else 0.0,
-                 "flow": mods["flow"] if mods else 0.0,
-                 "mood": mods["mood"] if mods else 0.0,
-                 "news": mods["news"] if mods else 0.0,
+    hist.append({"date": today, "score": score, "core": core_s,
+                 "basis": m.get("basis", 0.0), "flow": m.get("flow", 0.0),
+                 "mood": m.get("mood", 0.0), "news": m.get("news", 0.0),
                  "chan": chan_d, "stock": stock_d,
                  "kospi": 0.0, "sox": min(ovs_drop, 0.0), "vix": 0.0, "a50": 0.0,
                  "position": position, "next_ret": None,
                  "fwd3_off": 3, "fwd5_off": 5, "fwd10_off": 10,
-                 "r3": None, "r5": None, "r10": None})
+                 "r3": None, "r5": None, "r10": None,
+                 # 原始输入（验门增益：离散档分对 Spearman IC 分辨力弱，补原始量可直接做
+                 # 原始 IC / 分层 IC，不依赖档位；snapshot 缺失的指标记 None）
+                 "raw": _shadow_raw(ctx)})
     state["history"] = hist[-HISTORY_LIMIT:]
+
+
+def _shadow_raw(ctx: dict) -> dict:
+    """提取修正层原始输入（供分层/原始IC验门）：worst_ap/main_net/down_pct/pcr 等。
+    缺源全部置 None（与修正层"缺源降级0"解耦，避免假0污染验门）。"""
+    snap = ctx.get("snapshot") or {}
+    out: "dict" = {}
+    # 贴水：IC/IM 最差年化基差（原始，非档位分）
+    _aps = []
+    for _code in ("IC", "IM"):
+        _b = ((snap.get("basis") or {}) or {}).get(_code) or {}
+        try:
+            _aps.append(float(_b.get("annual_pct")))
+        except (TypeError, ValueError):
+            pass
+    out["basis_min_ap"] = min(_aps) if _aps else None
+    # 资金：两市主力净流
+    f = (snap.get("flows") or {})
+    if isinstance(f, dict) and f.get("main_net") is not None:
+        try:
+            out["main_net"] = float(f["main_net"])
+        except (TypeError, ValueError):
+            out["main_net"] = None
+    # 情绪：下跌占比/涨停情绪
+    b = (snap.get("breadth") or {})
+    if isinstance(b, dict) and b.get("down_pct") is not None:
+        try:
+            out["down_pct"] = float(b["down_pct"])
+        except (TypeError, ValueError):
+            out["down_pct"] = None
+    # 期权：PCR
+    o = (snap.get("option") or {})
+    pcr = o.get("pcr") if isinstance(o, dict) else None
+    if pcr is not None:
+        try:
+            out["pcr"] = float(pcr)
+        except (TypeError, ValueError):
+            out["pcr"] = None
+    return out
 
 
 # ---------------- 报告 ----------------
