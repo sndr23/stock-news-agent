@@ -9,7 +9,12 @@ DEPRECATED（2026-08-02）: 批处理管线已无生产入口。
 本文件 build_agent/run_agent 及其经过的深度分析/排名节点不再被任何
 脚本、API、定时任务调用，仅作为历史批处理能力保留供复用/参考。
 """
-from langgraph.graph import StateGraph, START, END
+try:
+    # LangGraph 仅在构建 agent 时真正需要；云端 production 不装 langgraph。
+    # 模块 import（含 CI pytest collection）时若缺失，靠惰性占位保证不崩。
+    from langgraph.graph import StateGraph, START, END
+except ImportError:  # pragma: no cover - 仅无 langgraph 的云端环境触发
+    StateGraph = START = END = None
 
 from src.agent.state import AgentState, create_initial_state
 from src.agent.nodes import (
