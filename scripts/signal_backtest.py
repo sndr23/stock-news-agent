@@ -14,7 +14,9 @@
 
 回测口径：
 - 标的映射: stocks 非空 → 第一个股票名（smartbox 解析代码）；
-  否则 scope=market → 上证指数；sector/无 stocks → 跳过（v1 不做板块指数映射）
+  scope=market → 上证指数；
+  sector/stock 级 → 取 entities 中首个能精确解析到 A 股的实体作板块代理
+  （v1.5，2026-08-22 新增，复用 smartbox 精确匹配）；无实体可解析 → 跳过
 - 基准价: 事件当日收盘价（当日非交易日则其后第一个交易日）
 - 一致判定: 利多组(bullish/mildly_bullish) 后N日收益>0 = 一致；
   利空组(bearish/mildly_bearish) 后N日收益<0 = 一致
@@ -253,6 +255,13 @@ def _resolve_symbol(name: str, cache: dict) -> str:
         if "~" not in line:
             continue
         payload = line.partition("=")[2].strip().strip('"')
+        # smartbox 返回 \uXXXX 转义形式（如 "sz~300308~\u4e2d\u9645..."），
+        # 需先解码回中文再做精确匹配，否则恒失败。
+        if "\\u" in payload:
+            try:
+                payload = payload.encode("latin-1", "ignore").decode("unicode_escape")
+            except Exception:
+                continue
         parts = payload.split("~")
         # 格式: 市场~代码~名称~拼音~类型；名称须精确匹配（防"华创"命中"华创证券"外的模糊项）
         if len(parts) >= 3 and parts[2] == name and parts[0] in ("sh", "sz", "bj"):
@@ -260,6 +269,16 @@ def _resolve_symbol(name: str, cache: dict) -> str:
             break
     cache[name] = symbol
     return symbol
+
+
+def _first_resolvable(entities: list, cache: dict):
+    """entities 中首个可精确解析到 A 股的实体 → (名称, symbol)；
+    全部失败返回 None。用于 sector/stock 级事件的板块代理映射。"""
+    for ent in entities:
+        sym = _resolve_symbol(str(ent), cache)
+        if sym:
+            return str(ent), sym
+    return None
 
 
 # ============================================================
@@ -305,6 +324,7 @@ def backtest(events: list, days: int = DEFAULT_DAYS) -> dict:
         if not group:
             skipped["未标注方向"] += 1
             continue
+        scope = str(e.get("scope", ""))
         stocks = e.get("stocks") or []
         if stocks:
             target_name = str(stocks[0])
@@ -312,11 +332,16 @@ def backtest(events: list, days: int = DEFAULT_DAYS) -> dict:
             if not symbol:
                 skipped["代码解析失败"] += 1
                 continue
-        elif str(e.get("scope", "")) == "market":
+        elif scope == "market":
             target_name, symbol = MARKET_INDEX["name"], MARKET_INDEX["symbol"]
         else:
-            skipped["无个股标的(板块级)"] += 1
-            continue
+            # v1.5（2026-08-22）：sector/stock 级事件用 entities 里首个可解析到
+            # A 股的实体作板块代理，让板块级推送进入可评估池（复用 smartbox 精确匹配）。
+            proxy = _first_resolvable(e.get("entities") or [], symbol_cache)
+            if proxy is None:
+                skipped["无个股标的(板块级)"] += 1
+                continue
+            target_name, symbol = proxy
         if symbol not in kline_cache:
             kline_cache[symbol] = _fetch_kline(symbol)
         klines = kline_cache[symbol]
