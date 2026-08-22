@@ -483,23 +483,36 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
     else:
         act = f"维持 {pos:.0%}（今日无操作）"
 
-    lines = [f"【创业板仓位信号 {today[5:]} 14:45】", ""]
-    lines.append(f"■ 建议：{act}")
-    lines.append(f"■ 综合分 {res['score']:+.2f}（核心 {core['score']:+.2f} / "
-                 f"修正 {res['score'] - core['score']:+.2f}）")
+    from datetime import datetime, timedelta, timezone
+    now_bj = datetime.now(timezone(timedelta(hours=8)))
+    lines = [f"【创业板仓位信号 {today[5:]} {now_bj:%H:%M}】", ""]
+    # 档位基准：综合分按 TIERS 本应到几成（复用现有映射，避免两套口径漂移）
+    tier_target = ct.score_to_tier(float(res["score"]), ct.TIERS)
+    sugg = f"■ 建议：{act}"
+    # 仅当纯档位映射越过风控上限时注记（排除升档待确认造成的差距，避免误标）
+    if tier_target > float(caps.get("cap") or 1.0):
+        sugg += f"（档位基准 {tier_target:.0%}，受硬风控封顶→ {pos:.0%}）"
+    lines.append(sugg)
+    lines.append(f"■ 综合分 {res['score']:+.2f} ＝ 核心 {core['score']:+.2f} ＋ "
+                 f"修正 {res['score'] - core['score']:+.2f}")
     sig = core["signals"]
     _fmt = lambda a, b: f"{a:+.2f}/{b:+.2f}"
-    lines.append(f"  趋势{_fmt(sig['trend_ma20_60'], sig['trend_momentum_60'])}"
+    lines.append("  核心："
+                 f"趋势{_fmt(sig['trend_ma20_60'], sig['trend_momentum_60'])}"
                  f"｜量价{_fmt(sig['volprice_quadrant'], sig['volprice_amihud'])}"
                  f"｜波动{_fmt(sig['vol_regime'], sig['vol_term'])}"
                  f"｜估值{sig['value_erp']:+.2f}"
                  f"｜落袋{_fmt(sig['pullback_52w'], sig['dd60'])}")
-    lines.append(f"  贴水{mods['basis']:+.2f}｜资金{mods['flow']:+.2f}"
+    # 旭创从修正行移除，改由下方"旭创确认"行承载（避免 -0.10 与明细 -0.14 重复且打架）
+    lines.append("  修正："
+                 f"贴水{mods['basis']:+.2f}｜资金{mods['flow']:+.2f}"
                  f"｜情绪{mods['mood']:+.2f}｜资讯{mods['news']:+.2f}"
-                 f"｜缠论{mods['chan'].get('score', 0.0):+.2f}"
-                 f"｜旭创{mods['stock'].get('score', 0.0):+.2f}")
-    if (mods.get("stock") or {}).get("detail") and "跳过" not in (mods["stock"] or {}).get("detail", ""):
-        lines.append(f"  旭创确认：{mods['stock']['detail']}")
+                 f"｜缠论{mods['chan'].get('score', 0.0):+.2f}")
+    lines.append("  注：X/Y＝该因子主信号/副信号（双口径），单值因子仅取主信号。")
+    stock_detail = (mods.get("stock") or {}).get("detail", "")
+    if stock_detail and "跳过" not in stock_detail:
+        net = (mods.get("stock") or {}).get("score", 0.0)
+        lines.append(f"  旭创确认（净{net:+.2f}）：{stock_detail}")
     if (mods.get("chan") or {}).get("detail") and "中性" not in (mods["chan"] or {}).get("detail", ""):
         lines.append(f"  {mods['chan']['detail']}（{mods['chan']['bi_dir']}/{mods['chan']['zone']}）")
     od = ctx.get("overseas_drop") or 0.0
