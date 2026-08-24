@@ -71,6 +71,10 @@ def _patch_all(monkeypatch, push_ok: bool = True):
 
     states = []
     monkeypatch.setattr(rct, "save_state", lambda s: states.append(dict(s)))
+    # 2026-08-24 修复：漏 mock load_state → 场景1/3/4 读真实 Gist state，
+    # 真实 last_date 撞上固定时钟（2026-08-24）→ 去重跳过 → 门禁失败 → 云端不推送。
+    # 默认空 state（场景2/5 各自再覆盖），与数据层 mock 保持一致，隔离真实状态。
+    monkeypatch.setattr(rct, "load_state", lambda: {})
     return sent, states
 
 
