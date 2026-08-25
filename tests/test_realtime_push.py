@@ -1756,10 +1756,30 @@ class TestTopicSaturation:
         assert rtp._topic_saturated(self._sig(sectors=["存储"]), pushed) is False
 
     def test_market_scope_exempt(self):
-        """market 级（宏观数据/大盘）豁免：CPI 永不受饱和拦截"""
+        """2026-08-25 语义收窄：仅宏观数据发布类 market 豁免，CPI 永不受饱和拦截"""
         pushed = [{"sectors": ["宏观"], "stocks": [], "entities": [],
                    "t": self._ts(1)} for _ in range(10)]
-        assert rtp._topic_saturated(self._sig(sectors=["宏观"], scope="market"), pushed) is False
+        sig = self._sig(sectors=["宏观"], scope="market")
+        sig["title_norm"] = "美国7月CPI同比3.4%符合预期"
+        assert rtp._topic_saturated(sig, pushed) is False
+
+    def test_geopolitical_market_saturated(self):
+        """market 级地缘/关税（非数据发布）参与同主题饱和：已推 3 条 → 饱和"""
+        pushed = [{"sectors": [], "stocks": [], "entities": [], "events": [],
+                   "numbers": [], "title_norm": "特朗普称对加拿大汽车关税升至50",
+                   "scope": "market", "t": self._ts(1)} for _ in range(3)]
+        sig = self._sig(scope="market")
+        sig["title_norm"] = "美加贸易谈判破裂 特朗普再威胁加拿大关税"
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_geopolitical_market_below_limit(self):
+        """市场地缘类未达 3 条上限 → 放行"""
+        pushed = [{"sectors": [], "stocks": [], "entities": [], "events": [],
+                   "numbers": [], "title_norm": "伊朗货币里亚尔跌至历史新低",
+                   "scope": "market", "t": self._ts(1)} for _ in range(2)]
+        sig = self._sig(scope="market")
+        sig["title_norm"] = "美国再度加码对伊朗制裁"
+        assert rtp._topic_saturated(sig, pushed) is False
 
     def test_outside_window_not_counted(self):
         """24h 窗口外的推送不计入饱和"""
@@ -1850,3 +1870,83 @@ class TestSameEventEveningRepeat:
         a = self._sig("光模块涨价逻辑延续 龙头提价", ["中际旭创"], ["光模块/CPO"])
         b = self._sig("存储芯片涨价 三星美光跟进", ["三星"], ["存储"])
         assert rtp._is_same_event(a, b) is False
+
+
+class TestSiblingReportsMerge:
+    """2026-08-25 同实体兄弟报道合并（字节豆包×2/小米玄戒×2/华为发布会×2 同轮重复）"""
+
+    @staticmethod
+    def _sig(title, entities=(), sectors=(), events=(), scope="sector"):
+        return {"stocks": [], "entities": sorted(entities), "events": sorted(events),
+                "numbers": [], "sectors": sorted(sectors), "title_norm": title, "scope": scope}
+
+    def test_doubao_duplicate_merged(self):
+        a = self._sig("字节跳动发布豆包工作与飞书深度打通构建企业级Agent", ["字节跳动"])
+        b = self._sig("字节加入企业办公Agent大战 发布豆包工作", ["字节跳动"])
+        assert rtp._is_same_event(a, b) is True
+
+    def test_xuanji_duplicate_merged_same_sector(self):
+        a = self._sig("小米新一代自研处理器玄戒O3亮相采用3nm工艺", ["小米"], ["消费电子"])
+        b = self._sig("小米玄戒芯片完成三个方向演进迭代", ["小米"], ["消费电子"])
+        assert rtp._is_same_event(a, b) is True
+
+    def test_huawei_launch_merged(self):
+        a = self._sig("华为全场景新品发布会将于9月7日召开", ["华为"], ["消费电子"])
+        b = self._sig("华为新一代三折叠旗舰手机9月7日发布", ["华为"], ["消费电子"])
+        assert rtp._is_same_event(a, b) is True
+
+    def test_diff_std_shared_noun_not_merged(self):
+        """反例：仅共享"国际标准"4字通用短语、无共享板块 → 不误并（防漏推）"""
+        a = self._sig("我国牵头固态电池领域首个国际标准立项", ["科技部"])
+        b = self._sig("我国制定磁性元件领域国际标准发布", ["科技部"])
+        assert rtp._is_same_event(a, b) is False
+
+
+class TestNoisePushNewWords20260825:
+    """2026-08-25 审核实证：净流出/震荡回升/涨停/半日涨跌等盘面措辞补词 + 栏目剥离后行情排除"""
+
+    def _j(self, **kw):
+        j = {"push": True, "score": 8, "direction": "bearish", "scope": "sector",
+             "is_leader_stock": False, "entities": []}
+        j.update(kw)
+        return j
+
+    def test_net_flow_filtered(self):
+        """主力资金净流出等资金流盘面不推"""
+        assert rtp._is_noise_push({"title": "主力资金转融券标的板块净流出超742亿元"},
+                                  self._j(), set()) == "盘面异动"
+
+    def test_surging_concept_filtered(self):
+        """概念震荡回升+涨停（非龙头）不推"""
+        assert rtp._is_noise_push({"title": "人形机器人概念震荡回升 兆威机电涨停"},
+                                  self._j(), set()) == "盘面异动"
+
+    def test_noon_review_index_move_as_column(self):
+        """"午评"剥离后仍是"指数名+半日跌" → 栏目汇总（此前 has_signal 误放行）"""
+        assert rtp._is_noise_push({"title": "午评 创业板指半日跌3.5% 算力硬件股大面积调整"},
+                                  self._j(), set()) == "栏目汇总"
+
+    def test_leader_plunge_kept(self):
+        """龙头个股跳水保留（is_leader 例外，防漏推持仓龙头）"""
+        assert rtp._is_noise_push({"title": "万亿中际旭创跳水 股价跌破900元"},
+                                  self._j(is_leader_stock=True), set()) == ""
+
+
+class TestPendingCleanse:
+    """2026-08-25 pending 泄漏清理：已推同事件标题相似记录不再无限重试"""
+
+    def test_similar_pushed_title_removed(self):
+        assert rtp._pending_same_as_pushed(
+            "华为全场景新品发布会将于9月7日召开",
+            "华为全场景新品发布会将于9月7日召开") is True
+        assert rtp._pending_same_as_pushed(
+            "Meta计划在未来几周推出“HATCH”AI代理平台",
+            "Meta计划在未来几周推出HATCHAI代理平台") is True
+        assert rtp._pending_same_as_pushed(
+            "小鹏机器人业务首轮融资超9亿美元",
+            "小鹏机器人业务首轮融资超9亿美元引领物理AI规模量产") is True
+
+    def test_unrelated_not_removed(self):
+        assert rtp._pending_same_as_pushed(
+            "大豆期货午后拉升 贸易商逢高抛售",
+            "字节跳动发布豆包工作与飞书打通") is False

@@ -525,6 +525,9 @@ _NOISE_COLUMN_MARKERS = [
 _NOISE_INDEX_MOVE = [
     "涨超", "跌超", "涨逾", "跌逾", "涨幅扩大", "跌幅扩大", "涨幅扩大至",
     "跌幅扩大至", "现报", "开涨", "开跌", "收涨", "收跌", "上涨", "下跌",
+    # 2026-08-25 审核实证："午评创业板指半日跌35"（"半日跌"）——既有
+    # MOVE 词表缺"半日/盘中/日内涨跌"表述，"跌35"非"下跌"漏判。补入。
+    "半日跌", "半日涨", "盘中跌", "盘中涨", "日内跌", "日内涨",
 ]
 # 纯盘面异动措辞（板块/概念异动、非龙头个股异动；龙头个股消息由 is_leader 例外放行）
 _NOISE_INTRADAY_MARKERS = [
@@ -535,6 +538,13 @@ _NOISE_INTRADAY_MARKERS = [
     # （"中际旭创表现活跃"类不误伤）。
     "表现活跃", "概念活跃", "持续活跃", "反复活跃", "概念走强", "概念走高",
     "集体大涨", "涨停潮", "活跃拉升",
+    # 2026-08-25 审核实证：净流出/震荡回升/跳水/涨停等盘面措辞漏网
+    # （"主力资金转融券标的板块净流出超742亿"、"人形机器人概念震荡回升兆威机电
+    # 涨停"全被推送）。龙头例外仍由 is_leader 放行，不误伤自选龙头（"中际旭创跳水"仍推）。
+    "震荡回升", "震荡回落", "震荡走高", "震荡走低",
+    "净流入", "净流出", "中单净流出", "资金出逃",
+    "快速跳水", "大幅跳水", "跳水", "异动",
+    "涨停", "跌停",
 ]
 # 研报/观点/主题类措辞（2026-08-13 P0 修复：tech_override 排除守卫用——
 # 命中此类措辞的科技消息属"无具体事件的定性判断"，即使 LLM 判 push=false
@@ -683,6 +693,17 @@ def _strip_entities(text: str, entities: set) -> str:
     return text
 
 
+def _is_index_move_text(text: str) -> bool:
+    """是否"指数名+行情措辞"（指数盘中播报，与 _is_noise_push 分支2 同判据）"""
+    return (any(i in text for i in _NOISE_INDEX_NAMES)
+            and any(m in text for m in _NOISE_INDEX_MOVE))
+
+
+def _is_intraday_move_text(text: str) -> bool:
+    """是否命中盘面异动措辞（与 _is_noise_push 分支3 同判据）"""
+    return any(m in text for m in _NOISE_INTRADAY_MARKERS)
+
+
 def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
     """栏目汇总/指数播报/盘面异动类噪声识别（2026-08-11 修复）
 
@@ -707,7 +728,16 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
         for m in _NOISE_COLUMN_MARKERS:
             if m in rest:
                 rest = rest.replace(m, "")
+        # 2026-08-25 审核实证："午评创业板指半日跌35…算力硬件"剥离"午评"后
+        # 因 has_signal_keyword（算力硬件）被误放行，实为指数+盘面行情播报。
+        # 剥离后若仍是"指数名+行情措辞"或"盘面异动措辞"→ 栏目/行情不推。
+        # 但"栏目内嵌重大事件"仍放行（2026-08-13 语义）：CPI 数据发布、龙头
+        # 大额经营事件不得因含"跳水/涨停"盘面词被误杀（test_fix_20260813 回归）。
         if has_signal_keyword(rest) or _is_macro_data_release(rest):
+            if not (_is_macro_data_release(rest) or _is_major_deal_event(rest)
+                    or _hit_headline_entity(rest)):
+                if _is_index_move_text(rest) or _is_intraday_move_text(rest):
+                    return "栏目汇总"
             return ""
         return "栏目汇总"
     if any(i in title for i in _NOISE_INDEX_NAMES) and any(m in title for m in _NOISE_INDEX_MOVE):
@@ -738,6 +768,39 @@ _MACRO_POLICY_KEYWORDS = [
 TOPIC_PUSH_LIMIT = _env_int("RT_TOPIC_LIMIT", 5)
 TOPIC_PUSH_WINDOW_H = 24.0
 
+# 2026-08-25 审核实证：market 级"sectors/entities 全豁免"被人利用——美加关税×7/伊朗×4
+# 全部 scope=market 无限豁免溢出剩余。仅"宏观数据发布类"（CPI/非农/利率决议）保持豁免；
+# 地缘/制裁/关税/央行表态类 market 参与"同主题饱和"，上限 3 条（比板块默认 5 条更严）。
+_MARKET_THEME_PATTERNS = [
+    ("美加关税", ["加拿大", "关税", "卢特尼克", "美加"]),
+    ("伊朗制裁", ["伊朗", "里亚尔", "霍尔木兹"]),
+    ("日本央行", ["日本央行", "日元", "植田"]),
+    ("美债/美财长", ["美债", "贝森特"]),
+]
+MARKET_TOPIC_PUSH_LIMIT = _env_int("RT_MARKET_TOPIC_LIMIT", 3)
+
+
+def _market_theme_keys(text: str) -> set:
+    """标题命中的 market 主题键集合（market 级同主题饱和计数槽位）"""
+    return {tk for tk, kws in _MARKET_THEME_PATTERNS if any(k in text for k in kws)}
+
+
+def _market_theme_saturated(keys: set, pushed_events: list) -> bool:
+    """同 theme 24h 内已推 ≥ MARKET_TOPIC_PUSH_LIMIT 条则饱和（与板块饱和同窗口口径）"""
+    now_ts = time.time()
+    cnt = 0
+    for pe in pushed_events:
+        t = str(pe.get("t") or "")
+        try:
+            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
+            continue
+        if _market_theme_keys(str(pe.get("title_norm") or "")) & keys:
+            cnt += 1
+    return cnt >= MARKET_TOPIC_PUSH_LIMIT
+
 
 def _is_macro_policy(news: dict) -> bool:
     """候选是否属宏观/政策/地缘类（溢出排序优先，防宏观被科技噪声挤占）"""
@@ -755,12 +818,20 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     同实体）——此前用精确交集，与 _is_same_event 合并口径不一致，实体为空时
     板块表述不一致会漏判同题材，饱和限流失准。
     """
-    if str(sig.get("scope") or "stock") == "market":
+    scope = str(sig.get("scope") or "stock")
+    title = str(sig.get("title_norm") or "")
+    # 2026-08-25 修复：market 级仅"宏观数据发布"豁免（CPI/非农等数据本体必须推）；
+    # 地缘/制裁/关税/央行表态类 market 无板块/实体，改用同主题槽位参与饱和计数。
+    if scope == "market" and _is_macro_data_release(title):
         return False
     secs = set(_as_list(sig.get("sectors")))
     ents = {_normalize_entity(e) for e in _as_list(sig.get("stocks"))} | \
            {_normalize_entity(e) for e in _as_list(sig.get("entities"))}
     if not secs and not ents:
+        if scope == "market" and not _is_macro_data_release(title):
+            keys = _market_theme_keys(title)
+            if keys:
+                return _market_theme_saturated(keys, pushed_events)
         return False
     now_ts = time.time()
     cnt = 0
@@ -931,6 +1002,20 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
                 # 修复 LLM 抽板块"AI算力"vs"AI/算力"不一致导致的漏合并（上海算力补贴×2）。
                 if len(_sectors_overlap(sec_a, sec_b)) >= 2 and _lcs_len(ta, tb) >= 2:
                     return True
+                # 2026-08-25 审核实证：同实体兄弟报道（字节豆包×2/小米玄戒×2/华为
+                # 发布会×2）措辞差异大、无事件组/板块交集/LCS 不足，同轮重复推送。
+                # 判据：实体重叠 + 剔除实体词后标题仍共享连续内容；共享≥6字专有
+                # 主题词，或同板块时共享≥2字。避免"国际标准/美加贸易"4字通用短语
+                # 把固态电池/磁性元件、关税抬升/谈判破裂两对不同事件误并。
+                sa = _strip_entities(ta, ent_a); sb = _strip_entities(tb, ent_b)
+                if sa and sb:
+                    s_lcs = _lcs_len(sa, sb)
+                    # 共享连续段 ≥6（专有主题词，如"发布豆包工作"）；或同板块 + ≥2
+                    #（玄戒/华为发布会类）。纯 ≥4 兜底会误并两对不同事件——
+                    # "固态电池国际标准" vs "磁性元件国际标准"（共享"国际标准"4字）、
+                    # "关税抬升至50" vs "美加贸易谈判破裂"（共享"美加贸易"4字）。
+                    if s_lcs >= 6 or (len(_sectors_overlap(sec_a, sec_b)) >= 1 and s_lcs >= 2):
+                        return True
             shorter = min(len(ta), len(tb))
             if shorter >= 8:
                 # 2026-08-11 修复：同主体(实体模糊重叠)或同金额时放宽标题相似阈值——
@@ -1113,6 +1198,17 @@ def load_state() -> dict:
         except Exception as e:
             logger.warning(f"本地状态解析失败，重置: {e}")
     return _empty_state()
+
+
+def _pending_same_as_pushed(pend_title: str, pushed_title: str) -> bool:
+    """pending 清理用宽松同事件判定（归一化标题字符集 Jaccard 或 LCS 覆盖足够高）"""
+    if not pend_title or not pushed_title:
+        return False
+    ja = len(set(pend_title) & set(pushed_title)) / len(set(pend_title) | set(pushed_title))
+    if ja >= 0.55:
+        return True
+    shorter = min(len(pend_title), len(pushed_title))
+    return shorter >= 6 and _lcs_len(pend_title, pushed_title) / shorter >= 0.5
 
 
 def _event_sig_key(e: dict) -> str:
@@ -2666,6 +2762,15 @@ def run_once(dry_run: bool = False) -> dict:
     for fp in list(pending.keys()):
         if fp in seen:
             pending.pop(fp, None)
+        else:
+            # 2026-08-25 审核实证：同事件已推送但 pending 记录因措辞/来源不同
+            #（fp 不同）无法被上文清理，持续无限重试（华为 retry=4/Meta retry=6）。
+            # 兜底：其标题与某条已推事件标题高度相似 → 视为已推同事件，移除。
+            rec = pending[fp]
+            pt = str(rec.get("title") or "")
+            if pt and any(_pending_same_as_pushed(pt, pe.get("title_norm") or "")
+                          for pe in pushed_events):
+                pending.pop(fp, None)
 
     if not dry_run:
         save_state(state)
