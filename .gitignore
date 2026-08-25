@@ -66,3 +66,6 @@ logs/*.md
 data/strategy_cache/
 data/strategy_state.json
 strategy_cache/
+
+# 外部工具残留（系统缓存副本，非项目代码）
+%SystemDrive%/
