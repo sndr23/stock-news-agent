@@ -66,12 +66,34 @@ def fetch_product(product: str, d: date):
         return None
     if r.status_code != 200 or len(r.text) < 500:
         return None
+    # 中金所未公布时返回 200 + HTML 错误页(约2KB)；真实数据为 UTF-8 的
+    # <positionRank> 根 XML(约65KB)。据此判定“数据未就绪”，交由退出码2重试。
+    upper = r.text[:512].upper()
+    if "<HTML" in upper or "<!DOCTYPE" in upper:
+        logger.info(f"{product} {d} 数据未公布（返回错误页，{len(r.text)} 字节），等待重试")
+        return None
     return r
+
+
+_ENT_RE = None
+
+
+def _resolve_entities(text: str) -> str:
+    """把 HTML 实体(&nbsp;等)转成字符，避免 ET 抛 'undefined entity'。"""
+    global _ENT_RE
+    if _ENT_RE is None:
+        import re as _re
+        import html as _html
+        _ENT_RE = _re.compile(r"&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]+);")
+    return _ENT_RE.sub(lambda m: _html.unescape(m.group(0)), text)
 
 
 def parse_xml(text: str):
     import xml.etree.ElementTree as ET
-    root = ET.fromstring(text)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        root = ET.fromstring(_resolve_entities(text))
     rows = []
     for data in root.findall("data"):
         rows.append(
