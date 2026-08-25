@@ -55,8 +55,10 @@ jobs:
       - name: 运行单元测试门禁
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
 
-      - name: 执行因子采集（仅采集写快照，不推送）
-        run: python scripts/factor_collector.py --dry-run
+      # --collect：只采集+写快照/状态（贴水/资金/情绪/risk_state），不推送。
+      # 修复 2026-08-22 回归：原 --dry-run 空跑，快照.ts 停留在 08-21，择时修正层用旧数据。
+      - name: 执行因子采集（写快照供择时系统，不推送）
+        run: python scripts/factor_collector.py --collect
 
       - name: 上传日志（调试用）
         if: always()

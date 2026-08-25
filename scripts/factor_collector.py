@@ -2335,7 +2335,7 @@ def do_push(title: str, content: str) -> dict:
 # ============================================================
 # 主流程
 # ============================================================
-def run_once(push: bool) -> dict:
+def run_once(push: bool, collect: bool = False) -> dict:
     quotes = fetch_index_quotes()
     fx = fetch_fx()
     futures = fetch_index_futures()
@@ -2425,14 +2425,17 @@ def run_once(push: bool) -> dict:
     print(f"[风险状态] {risk_state}")
 
     pushed = []
-    if push:
+    # 状态落盘放宽为 persist（push 或 collect）：修复 2026-08-22 停推回归——
+    # 原 `if push:` 门控把 build_snapshot/_save_state 一并关进推送分支，云端 --dry-run
+    # 空跑不写，快照 4 天停更，择时修正层（贴水/资金/情绪）持续用旧数据。
+    # collect=只采集写快照/状态不推送；dry-run=纯只读维持不变。
+    persist = push or collect
+    if persist:
         state["basis_history"] = new_history
         state["risk_state"] = risk_state
         # 紧凑快照（P0-1 2026-08-19）：资讯卡片"市场环境"行 + 盘前/盘后简报的数据源。
         # 每轮覆盖写，保持最新；factor_collector 盘中 15 分钟/盘后 60 分钟一轮，
         # 快照时效由读取方（real_time_push）按 ts 判断过期。
-        # P1-2/P1-3：快照新增自选股行情与资金流字段。
-        # P3：快照新增外盘/宽度/波动率/风格字段（市场环境行与简报的增量数据源）。
         state["snapshot"] = build_snapshot(tech, basis, fx, risk_state,
                                            stocks=stocks_snap, flows=flows,
                                            global_quotes=global_quotes, breadth=breadth,
@@ -2440,6 +2443,7 @@ def run_once(push: bool) -> dict:
                                            sentiment=sentiment, sector_flows=sector_flows,
                                            liquidity=liquidity, option=option,
                                            sources=health)
+    if push:
         if fresh:
             content = "## 量化因子异动告警\n\n" + "\n\n".join(format_alert(s) for s in fresh)
             r = do_push("量化因子异动", content)
@@ -2538,6 +2542,7 @@ def run_once(push: bool) -> dict:
                 print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}）弱翻转"
                       f"（<{STRONG_DIR_THRESHOLD}），不单独推送，进简报")
         state["last_direction"] = analysis["direction"]
+    if persist:
         _save_state(state)
 
     return {"tech": tech, "basis": basis, "fx": fx, "signals": signals, "pushed": pushed}
@@ -2560,6 +2565,8 @@ def main():
     parser = argparse.ArgumentParser(description="量化因子采集器")
     parser.add_argument("--dry-run", action="store_true", help="只采集+计算+打印，不推送")
     parser.add_argument("--push", action="store_true", help="打印快照；有异动且过冷却则推送")
+    parser.add_argument("--collect", action="store_true",
+                        help="只采集+写快照/状态，不推送（云端择时修正层数据源用）")
     parser.add_argument("--loop", action="store_true", help="常驻轮询")
     args = parser.parse_args()
 
@@ -2582,7 +2589,7 @@ def main():
             logger.info(f"下一轮 {poll}s 后（{'交易时段' if trading else '非交易时段'}）")
             time.sleep(poll)
     else:
-        run_once(push=args.push)
+        run_once(push=args.push, collect=args.collect)
 
 
 if __name__ == "__main__":

@@ -142,6 +142,11 @@ def gather_context(df) -> dict:
         snapshot = fs.get("snapshot") or {}
     except Exception as e:
         logger.warning("factor_state 读取失败: %s", type(e).__name__)
+    # 修正层快照时效兜底（P0-20260824）：快照 ts 非今日=采集停更，
+    # 修正分基于旧快照已失真 → 推送标注告知 + 影子 raw 记 None 防污染验门。
+    # 不擅自改打分（避免行为翻转），仅显式暴露数据时效供人工判断。
+    snapshot_ts = (snapshot.get("ts") or "") if snapshot else ""
+    snapshot_stale = bool(snapshot_ts) and snapshot_ts[:10] != today_s
     try:
         cs = nl.load_citic_pos_state()
         hist = cs.get("pos_history") or []
@@ -208,6 +213,7 @@ def gather_context(df) -> dict:
     return {"closes": closes, "amounts": amounts, "dates": dates,
             "highs": highs, "lows": lows,
             "intraday": intraday, "snapshot": snapshot,
+            "snapshot_ts": snapshot_ts, "snapshot_stale": snapshot_stale,
             "citic_net": citic_net, "citic_day": citic_day, "events": events,
             "overseas_drop": overseas_drop, "stock_ctx": stock_ctx,
             "day_amount_ratio": day_amount_ratio,
@@ -427,7 +433,10 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
 
 def _shadow_raw(ctx: dict) -> dict:
     """提取修正层原始输入（供分层/原始IC验门）：worst_ap/main_net/down_pct/pcr 等。
-    缺源全部置 None（与修正层"缺源降级0"解耦，避免假0污染验门）。"""
+    缺源全部置 None（与修正层"缺源降级0"解耦，避免假0污染验门）。
+    快照停更（stale）时整体置 None：原始值非当日=假样本，污染影子 IC。"""
+    if ctx.get("snapshot_stale"):
+        return {"basis_min_ap": None, "main_net": None, "down_pct": None, "pcr": None}
     snap = ctx.get("snapshot") or {}
     # 贴水：IC/IM 最差年化基差（原始，非档位分）
     _aps = []
@@ -526,6 +535,9 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
         lines.append("■ 硬风控：" + "；".join(caps["triggers"]))
     else:
         lines.append("■ 硬风控：无触发")
+    if ctx.get("snapshot_stale"):
+        lines.append(f"⚠ 修正层数据源停更于 {ctx.get('snapshot_ts', '')}，"
+                     f"贴水/资金/情绪基于旧快照，请结合盘中走势谨慎参考")
     if dec["note"] and not chg and "确认" not in dec["note"][0]:
         lines.append("■ " + "；".join(dec["note"]))
     lines.append("")

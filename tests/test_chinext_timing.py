@@ -482,6 +482,34 @@ def test_shadow_raw_captures_main_net_yi():
     assert raw3["down_pct"] == 10.0
 
 
+def test_shadow_raw_stale_snapshot_all_none():
+    """回归：_shadow_raw 遇快照停更（snapshot_stale=True）整体置 None。
+    原始值非当日=假样本，会污染影子 IC 验门（20260824 实际事故：
+    factor_state 停更 08-21，14:45 信号资金维仍用周五 +167.2亿 给 +0.05）。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import _shadow_raw
+
+    # 即便快照内是"新鲜值"，stale 标记存在即应整体置 None（防旧值冒充当日样本）
+    ctx = {"snapshot_stale": True, "snapshot": {
+        "basis": {"IC": {"annual_pct": -9.5}, "IM": {"annual_pct": -11.2}},
+        "flows": {"main_net_yi": 167.2},
+        "breadth": {"down_pct": 52.8},
+        "option": {"pcr": 1.62}}}
+    assert _shadow_raw(ctx) == {"basis_min_ap": None, "main_net": None,
+                                "down_pct": None, "pcr": None}
+    # stale 关闭时正常取值（对比对照）
+    ctx2 = {"snapshot_stale": False, "snapshot": {
+        "basis": {"IC": {"annual_pct": -9.5}, "IM": {"annual_pct": -11.2}},
+        "flows": {"main_net_yi": 167.2},
+        "breadth": {"down_pct": 52.8}}}
+    assert _shadow_raw(ctx2)["main_net"] == 167.2
+    assert _shadow_raw(ctx2)["basis_min_ap"] == -11.2
+
+
 def _make_gather_df(last_date: str, n: int = 70):
     """构造 gather_context 输入 DataFrame：n 根日线，末根日期可指定。"""
     import pandas as pd

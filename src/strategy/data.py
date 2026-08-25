@@ -396,7 +396,14 @@ def load_index_sina(symbol: str = "399006", datalen: int = 3000,
     key = f"index_sina_full_{symbol}"
     cached = _cache_get(key, ttl_days=ttl_days)
     if cached is not None and not cached.empty:
-        return cached
+        # 新鲜度按末根 bar 日期而非墙钟时长判定（修复 2026-08-25 隔日滞后 bug）：
+        # 原 TTL=1天 固定窗口 + GitHub Actions 每日 cache 恢复，导致周二/周四命中
+        # 前一日缓存、数据滞后一个交易日，核心层用缺日线打分。
+        # 新浪接口盘中含当日 bar，缓存末根须不早于"昨天"才新鲜；早于昨天即重拉。
+        _last_bar = pd.Timestamp(cached.index.max()).date()
+        _today = datetime.now().date()
+        if _last_bar >= _today - timedelta(days=1):
+            return cached
     url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={tsec}&scale=240&ma=no&datalen={datalen}")
     session = requests.Session()

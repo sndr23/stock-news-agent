@@ -14,6 +14,7 @@ from factor_collector import (  # noqa: E402
     calc_basis,
     detect_anomalies,
     filter_by_cooldown,
+    run_once,
     _ma,
 )
 
@@ -34,6 +35,79 @@ def _make_klines(n=65, base=100, step=1.0, vol=100):
             "volume": vol,
         })
     return out
+
+
+def _install_collect_deps(monkeypatch):
+    """mock 掉 run_once 全部数据/推送依赖，返回 spy 计数记录。"""
+    import factor_collector as fc
+    rec = {"save": 0, "push": 0, "snapshot": 0}
+
+    def _save(state):
+        rec["save"] += 1
+
+    def _push(*a, **k):
+        rec["push"] += 1
+        return {"code": 0}
+
+    def _build(*a, **k):
+        rec["snapshot"] += 1
+        return {"built": True}
+
+    stubs = [
+        ("fetch_index_quotes", lambda *a, **k: {}),
+        ("fetch_fx", lambda *a, **k: {}),
+        ("fetch_index_futures", lambda *a, **k: {}),
+        ("fetch_index_kline", lambda *a, **k: []),
+        ("calc_tech_factors", lambda *a, **k: {}),
+        ("calc_vol_regime", lambda *a, **k: {"available": False}),
+        ("calc_basis", lambda *a, **k: {}),
+        ("monitor_stocks", lambda *a, **k: ((), {}, {})),
+        ("fetch_market_flows", lambda *a, **k: {}),
+        ("fetch_global_quotes", lambda *a, **k: {}),
+        ("fetch_market_breadth", lambda *a, **k: {}),
+        ("calc_style_rotation", lambda *a, **k: {}),
+        ("fetch_zt_sentiment", lambda *a, **k: {}),
+        ("fetch_sector_flows", lambda *a, **k: {}),
+        ("fetch_liquidity", lambda *a, **k: {}),
+        ("fetch_option_pcr", lambda *a, **k: {}),
+        ("calc_daily_derived_factors", lambda *a, **k: {}),
+        ("fetch_minute_kline", lambda *a, **k: []),
+        ("calc_minute_factors", lambda *a, **k: {}),
+        ("_load_state", lambda: {}),
+        ("detect_anomalies", lambda *a, **k: ([], [])),
+        ("detect_global_anomalies", lambda *a, **k: []),
+        ("detect_breadth_anomalies", lambda *a, **k: []),
+        ("detect_sentiment_anomalies", lambda *a, **k: []),
+        ("detect_liquidity_anomalies", lambda *a, **k: []),
+        ("detect_flow_anomalies", lambda *a, **k: []),
+        ("detect_option_anomalies", lambda *a, **k: []),
+        ("calc_risk_state", lambda *a, **k: "neutral"),
+        ("format_snapshot", lambda *a, **k: "snap"),
+        ("build_snapshot", _build),
+        ("_save_state", _save),
+        ("do_push", _push),
+    ]
+    for name, f in stubs:
+        monkeypatch.setattr(fc, name, f)
+    return rec
+
+
+def test_collect_writes_snapshot_state_not_push(monkeypatch):
+    """--collect：写快照/状态（persist），绝不推送。修复停推回归的核心断言。"""
+    rec = _install_collect_deps(monkeypatch)
+    run_once(push=False, collect=True)
+    assert rec["snapshot"] == 1
+    assert rec["save"] == 1
+    assert rec["push"] == 0
+
+
+def test_dryrun_is_pure_read_only(monkeypatch):
+    """--dry-run（push=False, collect=False）：纯只读，不写快照/状态、不推送。"""
+    rec = _install_collect_deps(monkeypatch)
+    run_once(push=False, collect=False)
+    assert rec["snapshot"] == 0
+    assert rec["save"] == 0
+    assert rec["push"] == 0
 
 
 def test_ma():
