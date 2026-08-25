@@ -1950,3 +1950,111 @@ class TestPendingCleanse:
         assert rtp._pending_same_as_pushed(
             "大豆期货午后拉升 贸易商逢高抛售",
             "字节跳动发布豆包工作与飞书打通") is False
+
+
+class TestOppositeNotePrimaryEntity20260825:
+    """2026-08-25 实证误配修复：反向事件附注须以对方事件主实体匹配。
+
+    英伟达 Jetson 产品发布（主实体=英伟达）被挂上"易中天三大巨头集体下跌"
+    （英伟达只是文中偶然提及的第三实体，主实体是光模块三巨头）——暗示
+    不存在的叙事矛盾。收紧后：共享实体须为对方主实体（stocks∪首实体）或 ≥2 共享。
+    """
+
+    @staticmethod
+    def _pe(title, entities, stocks=(), direction="bearish", t=None):
+        return {"title_norm": title, "entities": list(entities), "stocks": list(stocks),
+                "sectors": [], "events": [], "numbers": [],
+                "dir": direction,
+                "t": t or (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")}
+
+    def test_incidental_entity_no_note(self):
+        """旧事件第三实体（英伟达）≠ 主实体 → 不挂反向附注"""
+        sig = {"stocks": [], "entities": ["英伟达"], "sectors": ["AI硬件/机器人"],
+               "title_norm": "英伟达宣布JetsonOrinNano2面向入门级边缘AI"}
+        pushed = [self._pe("突然变盘易中天三大巨头集体下跌重磅新技术曝光影响多大",
+                           ["SK海力士", "中际旭创", "英伟达"], direction="bearish")]
+        assert rtp._opposite_events_note(sig, "bullish", pushed) == ""
+
+    def test_primary_entity_reverse_kept(self):
+        """旧事件主实体=英伟达的反向事件仍正常提示"""
+        sig = {"stocks": [], "entities": ["英伟达"], "sectors": [],
+               "title_norm": "英伟达发布新一代数据中心GPU"}
+        pushed = [self._pe("美国对英伟达发起反垄断调查", ["英伟达"], direction="bearish")]
+        note = rtp._opposite_events_note(sig, "bullish", pushed)
+        assert "英伟达" in note and "利空" in note
+
+    def test_stock_primary_reverse_kept(self):
+        """stocks 承载主实体（个股事件）反向提示保留"""
+        sig = {"stocks": ["中际旭创"], "entities": [], "sectors": ["光模块"],
+               "title_norm": "中际旭创获大额订单"}
+        pushed = [self._pe("中际旭创跳水股价跌破900", ["中际旭创"], direction="bearish")]
+        note = rtp._opposite_events_note(sig, "bullish", pushed)
+        assert "中际旭创" in note
+
+    def test_two_shared_entities_kept(self):
+        """双方共享 ≥2 实体（强同主体）即使非首实体也提示"""
+        sig = {"stocks": [], "entities": ["英伟达", "台积电"], "sectors": [],
+               "title_norm": "英伟达与台积电深化合作"}
+        pushed = [self._pe("台积电英伟达合资工厂计划生变", ["台积电", "三星", "英伟达"],
+                           direction="bearish")]
+        note = rtp._opposite_events_note(sig, "bullish", pushed)
+        assert note != ""
+
+
+class TestRelatedRecentPrimaryEntity20260825:
+    """叙事链上下文注入（LLM prompt 前置）同口径收紧：仅旧事件主实体匹配"""
+
+    def test_incidental_entity_not_injected(self):
+        n = {"title": "英伟达宣布JetsonOrinNano2机器人计算机", "content": "入门级边缘AI"}
+        pushed = [{"title_norm": "突然变盘易中天三大巨头集体下跌",
+                   "entities": ["SK海力士", "中际旭创", "英伟达"], "stocks": [],
+                   "dir": "bearish",
+                   "t": (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")}]
+        assert rtp._related_recent_note(n, pushed) == []
+
+    def test_primary_entity_injected(self):
+        n = {"title": "英伟达发布新一代HBM配套GPU", "content": "数据中心级"}
+        pushed = [{"title_norm": "英伟达遭反垄断调查", "entities": ["英伟达"],
+                   "stocks": [], "dir": "bearish",
+                   "t": (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")}]
+        out = rtp._related_recent_note(n, pushed)
+        assert len(out) == 1 and "利空" in out[0]
+
+
+class TestMarketThemeEntityScan20260825:
+    """2026-08-25 伊朗海事漏拦修复：主题键扫描扩展到实体 + market 主题检查先于实体槽位"""
+
+    @staticmethod
+    def _ts(hours_ago=1):
+        return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _sig(title, entities, scope="market"):
+        return {"scope": scope, "sectors": [], "stocks": [], "entities": list(entities),
+                "events": [], "numbers": [], "title_norm": title}
+
+    @staticmethod
+    def _pe(title, entities, t):
+        return {"title_norm": title, "entities": list(entities), "stocks": [],
+                "sectors": [], "events": [], "numbers": [], "dir": "bearish", "t": t}
+
+    def test_entity_carried_theme_saturated(self):
+        """标题无主题词但实体=伊朗：窗口内已有3条伊朗主题 → 饱和拦截（19:03 漏拦场景）"""
+        sig = self._sig("国际海事组织近半年来中东海域发生68起袭击", ["伊朗", "国际海事组织"])
+        pushed = [self._pe("伊朗最高领袖顾问回应美方威胁", ["伊朗"], self._ts(11)),
+                  self._pe("美国加码对伊朗制裁暗藏风险", ["伊朗", "美国"], self._ts(10)),
+                  self._pe("美公布多项针对伊朗经济制裁", ["伊朗", "美国财政部"], self._ts(10))]
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_entity_theme_below_limit_pass(self):
+        """窗口内仅2条主题命中 → 不饱和放行"""
+        sig = self._sig("国际海事组织中东海域袭击统计", ["伊朗"])
+        pushed = [self._pe("伊朗领袖顾问回应威胁", ["伊朗"], self._ts(11)),
+                  self._pe("美对伊朗经济制裁", ["伊朗"], self._ts(10))]
+        assert rtp._topic_saturated(sig, pushed) is False
+
+    def test_cpi_exemption_unchanged(self):
+        """宏观数据发布仍豁免（即使实体非空）"""
+        sig = self._sig("美国8月CPI同比3.2%高于预期", ["美国劳工统计局"])
+        pushed = [self._pe("美国7月CPI同比3.4%符合预期", ["美国"], self._ts(5))] * 5
+        assert rtp._topic_saturated(sig, pushed) is False
