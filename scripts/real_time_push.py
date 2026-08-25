@@ -785,6 +785,18 @@ def _market_theme_keys(text: str) -> set:
     return {tk for tk, kws in _MARKET_THEME_PATTERNS if any(k in text for k in kws)}
 
 
+def _sig_theme_keys(sig: dict) -> set:
+    """事件命中的 market 主题键：标题 + 实体联合扫描。
+
+    2026-08-25 实证漏拦："国际海事组织…中东海域68起袭击"标题无主题词，
+    但 entities=[伊朗]——主题归属承载在实体上，仅扫标题会漏。
+    """
+    text = str(sig.get("title_norm") or "")
+    for k in ("entities", "stocks"):
+        text += " " + " ".join(str(x) for x in _as_list(sig.get(k)))
+    return _market_theme_keys(text)
+
+
 def _market_theme_saturated(keys: set, pushed_events: list) -> bool:
     """同 theme 24h 内已推 ≥ MARKET_TOPIC_PUSH_LIMIT 条则饱和（与板块饱和同窗口口径）"""
     now_ts = time.time()
@@ -797,7 +809,7 @@ def _market_theme_saturated(keys: set, pushed_events: list) -> bool:
             continue
         if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
             continue
-        if _market_theme_keys(str(pe.get("title_norm") or "")) & keys:
+        if _sig_theme_keys(pe) & keys:
             cnt += 1
     return cnt >= MARKET_TOPIC_PUSH_LIMIT
 
@@ -811,7 +823,8 @@ def _is_macro_policy(news: dict) -> bool:
 
 
 def _topic_saturated(sig: dict, pushed_events: list) -> bool:
-    """同题材推送是否已达饱和：market 级豁免；板块/实体 24h 内已推 ≥ 上限
+    """同题材推送是否已达饱和：market 级仅宏观数据豁免（其余走主题槽位，上限3）；
+    板块/实体 24h 内已推 ≥ 上限（5）
 
     2026-08-13 P1 修复（口径对齐）：板块重叠改用 _sectors_overlap（子串包含，
     "AI算力"与"AI/算力"同板块）、实体重叠用归一化后交集（"大摩"与"摩根士丹利"
@@ -821,17 +834,19 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     scope = str(sig.get("scope") or "stock")
     title = str(sig.get("title_norm") or "")
     # 2026-08-25 修复：market 级仅"宏观数据发布"豁免（CPI/非农等数据本体必须推）；
-    # 地缘/制裁/关税/央行表态类 market 无板块/实体，改用同主题槽位参与饱和计数。
-    if scope == "market" and _is_macro_data_release(title):
-        return False
+    # 地缘/制裁/关税/央行表态类 market 走同主题槽位（上限3）。主题检查先于实体
+    # 槽位路径——实证漏拦：伊朗海事事件 entities=[伊朗]非空时走实体槽位（上限5，
+    # 窗口内仅4条）绕过了主题路径（上限3，窗口内5条本应拦截）。
+    if scope == "market":
+        if _is_macro_data_release(title):
+            return False
+        keys = _sig_theme_keys(sig)
+        if keys and _market_theme_saturated(keys, pushed_events):
+            return True
     secs = set(_as_list(sig.get("sectors")))
     ents = {_normalize_entity(e) for e in _as_list(sig.get("stocks"))} | \
            {_normalize_entity(e) for e in _as_list(sig.get("entities"))}
     if not secs and not ents:
-        if scope == "market" and not _is_macro_data_release(title):
-            keys = _market_theme_keys(title)
-            if keys:
-                return _market_theme_saturated(keys, pushed_events)
         return False
     now_ts = time.time()
     cnt = 0
@@ -1487,7 +1502,12 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 5. 外围（美股/港股/国际宏观/地缘）消息，若其直接影响A股大盘或科技板块
 6. AI/科技龙头的新产品、新模型、新芯片发布（OpenAI/微软/英伟达/谷歌/三星/SK海力士等发布
    新模型版本、自研芯片、HBM新品等）——只要消息经证实或来自权威媒体，即属重大，即使
-   没有点名A股公司（2026-08-11 实证漏推：OpenAI发布GPT-5.6-Cyber）
+   没有点名A股公司（2026-08-11 实证漏推：OpenAI发布GPT-5.6-Cyber）。
+   ⚠重大性限定（2026-08-25 实证虚推）：仅旗舰级/生态级产品属重大——数据中心级芯片、
+   HBM/存储新品、大模型版本、自研旗舰SoC、直接改变产业链格局（光模块/CPO/算力链）的产品；
+   入门级/边缘侧/开发者套件类的常规产品线更新（如 Jetson 入门款边缘计算机、配件迭代、
+   开发者工具）不改变产业链格局，不属板块级重大——scope 最多 stock 级且 score ≤5 不推，
+   除非其中包含影响核心算力链的实质性技术跨越（推理成本数量级下降等）
 7. 核心科技板块的利空警示（行业见顶信号、龙头目标价被大幅下调、产能过剩担忧、重大诉讼/
    监管审查）——利空警示同样属于必须推送的重大消息，方向为 bearish（2026-08-11 实证漏推：
    韩国券商砍三星/SK海力士目标价约30%）
@@ -2272,10 +2292,22 @@ def _opposite_events_note(sig: dict, cur_dir: str, pushed_events: list, hours: i
             continue
         pents = {_normalize_entity(e) for e in _as_list(pe.get("stocks"))} | \
                 {_normalize_entity(e) for e in _as_list(pe.get("entities"))}
-        if ents & pents:
-            hits.append(f"{str(pe.get('title_norm') or '')[:40]}（{opp_label}）")
-            if len(hits) >= 2:
-                break
+        shared = ents & pents
+        # 2026-08-25 实证误配：英伟达产品发布（主实体=英伟达）挂上了"易中天三大
+        # 巨头集体下跌"（英伟达只是文中偶然提及的第三实体，主实体是光模块三巨头），
+        # 暗示不存在的叙事矛盾。收紧：共享实体须为对方事件的主实体（stocks∪首实体），
+        # 或双方共享 ≥2 实体（强同主体）。偶然提及的上下文实体不再触发"反向"附注。
+        if not shared:
+            continue
+        pe_primary = {_normalize_entity(e) for e in _as_list(pe.get("stocks"))}
+        pe_ents = _as_list(pe.get("entities"))
+        if pe_ents:
+            pe_primary.add(_normalize_entity(pe_ents[0]))
+        if not (shared & pe_primary) and len(shared) < 2:
+            continue
+        hits.append(f"{str(pe.get('title_norm') or '')[:40]}（{opp_label}）")
+        if len(hits) >= 2:
+            break
     if not hits:
         return ""
     return f"近{hours}h同主体反向已推事件：" + "、".join(hits)
@@ -2293,7 +2325,11 @@ def _related_recent_note(n: dict, pushed_events: list, hours: int = 48) -> list:
     now_ts = time.time()
     out = []
     for pe in pushed_events:
-        kws = [str(e) for e in (_as_list(pe.get("stocks")) + _as_list(pe.get("entities")))
+        # 2026-08-25 收紧（与 _opposite_events_note 同口径）：仅用对方事件的
+        # 主实体（stocks∪首实体）匹配本文。此前全实体子串匹配会把"文中偶然
+        # 提及的上下文实体"（如易中天事件里的英伟达）注入为"同主体反向叙事"，
+        # prompt 又规定反向叙事可上调 score——造成弱关联虚加分。
+        kws = [str(e) for e in (_as_list(pe.get("stocks")) + _as_list(pe.get("entities"))[:1])
                if str(e).strip()]
         if not any(k in text for k in kws):
             continue
