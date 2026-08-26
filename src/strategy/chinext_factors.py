@@ -257,11 +257,11 @@ def defensive_state(close: Sequence[float], vol_pctile: Optional[float] = None,
     n = len(close)
     if n >= 60:
         dd = close[-1] / max(close[-60:]) - 1.0
-        # 两级渐进降档：-8%先到6成，-12%再到3成（平滑降仓减摩擦）
-        if dd <= -0.12:
-            cap = min(cap, 0.3)
-            trig.append(f"距60日高点回撤{dd * 100:.1f}%封顶3成")
-        elif dd <= -0.08:
+        # 回撤降档：-8% 起封顶 6 成。2026-08-26 放宽（原 -12% 再压 3 成）：
+        # 12 年回测证实深档双重惩罚过度——回撤防守已由核心层 dd60 因子计分，
+        # 硬风控不再二次加码；深回撤区 10-20 日均值回归为正（后20日 +1.9%/胜率57%）。
+        # 生产口径 +209.2% vs 原 +189.5%，两段样本均改善（scripts/_diag_critic_20260826.py）。
+        if dd <= -0.08:
             cap = min(cap, 0.6)
             trig.append(f"距60日高点回撤{dd * 100:.1f}%封顶6成")
     if vol_pctile is not None and vol_pctile >= 95:

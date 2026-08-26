@@ -90,11 +90,33 @@ def test_defensive_state_empty_no_crash():
 
 
 def test_defensive_caps_reduction():
-    # 深度回撤触发封顶3成
+    # 盘中急跌(-3%)触发封顶3成（风险触发器仍走最严档）
     c = [100.0 - i * 1.5 for i in range(80)]
     d = defensive_state(c, vol_pctile=45, glass={"risk_off": False,
                                                  "basis_min_ap": -20.0, "intraday_pct": -3.0})
     assert d["cap"] <= 0.3
+
+
+def test_defensive_state_deep_drawdown_cap_06():
+    # 2026-08-26 放宽回归锁：深回撤(-18%)且无其他触发器 → 封顶6成（原3成）
+    c = [100.0 * (0.997 ** i) for i in range(80)]  # 每日-0.3%，60日回撤约-18%
+    d = defensive_state(c, vol_pctile=45, glass=None)
+    assert d["cap"] == 0.6, f"深回撤档应为6成，实际 {d['cap']}"
+    assert any("封顶6成" in t for t in d["triggers"])
+
+
+def test_defensive_state_moderate_drawdown_cap_06():
+    # 中度回撤(-8%~-12%) → 同样6成（两档合并后行为一致）
+    c = [100.0] * 40 + [100.0 * (0.9975 ** i) for i in range(40)]  # 回撤约-9.5%
+    d = defensive_state(c, vol_pctile=None, glass=None)
+    assert d["cap"] == 0.6
+
+
+def test_defensive_state_shallow_drawdown_uncapped():
+    # 浅回撤(<-8%)不触发回撤帽
+    c = [100.0] * 40 + [97.0] * 40  # 回撤-3%
+    d = defensive_state(c, vol_pctile=None, glass=None)
+    assert d["cap"] == 1.0 and not d["triggers"]
 
 def test_short_reversal_uptrend_negative():
     """候选短期反转：单调上涨序列 → 因子为负（涨多反转看空）。"""
