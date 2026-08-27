@@ -55,6 +55,7 @@ import logging
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -886,9 +887,81 @@ def _policy_direction_conflict(ta: str, tb: str) -> bool:
     return (hawk_a and dove_b) or (dove_a and hawk_b)
 
 
+class _SameEventCtx(NamedTuple):
+    """_is_same_event 规则族共享上下文：签名字段一次性抽取，规则函数零重复解析"""
+    ta: str            # 归一化标题（str(x or "")，None→""）
+    tb: str
+    ent_a: set         # 原始实体集（个股∪实体；归一化/模糊匹配在 _entity_overlap 内做）
+    ent_b: set
+    ev_a: set          # 事件组（已剔除市场状态类词）
+    ev_b: set
+    num_a: set         # 核心金额
+    num_b: set
+    sec_a: set
+    sec_b: set
+    shared_ev: set     # ev_a & ev_b
+    ent_overlap: bool
+
+
+def _same_event_ctx(sig_a: dict, sig_b: dict) -> _SameEventCtx:
+    """从两个推送级签名抽取规则判定所需的全量上下文"""
+    ent_a = set(_as_list(sig_a.get("stocks"))) | set(_as_list(sig_a.get("entities")))
+    ent_b = set(_as_list(sig_b.get("stocks"))) | set(_as_list(sig_b.get("entities")))
+    # 2026-08-14 修复：过滤市场状态类事件组（"行情下跌"由 content 关键词规则提取，
+    # 属市场状态描述而非事件动词）。否则非空 events 使"共享事件组"分支
+    # （shared_ev=∅）与"双方均无事件组"分支（not ev_a 不成立）同时失效，
+    # 同事件多源报道无法合并（日本央行加息三连推实证）。
+    ev_a = {e for e in set(_as_list(sig_a.get("events"))) if e not in _MARKET_STATE_EVENTS}
+    ev_b = {e for e in set(_as_list(sig_b.get("events"))) if e not in _MARKET_STATE_EVENTS}
+    # 2026-08-11 修复：实体模糊重叠（"索尼"⊂"索尼半导体解决方案公司"），
+    # 此前仅精确相等，跨源同事件（索尼×台积电合资）48h 内三推实证
+    return _SameEventCtx(
+        ta=str(sig_a.get("title_norm", "") or ""),
+        tb=str(sig_b.get("title_norm", "") or ""),
+        ent_a=ent_a, ent_b=ent_b,
+        ev_a=ev_a, ev_b=ev_b,
+        num_a=set(_as_list(sig_a.get("numbers"))),
+        num_b=set(_as_list(sig_b.get("numbers"))),
+        sec_a=set(_as_list(sig_a.get("sectors"))),
+        sec_b=set(_as_list(sig_b.get("sectors"))),
+        shared_ev=ev_a & ev_b,
+        ent_overlap=_entity_overlap(ent_a, ent_b),
+    )
+
+
+def _same_event_shared_group(ctx: _SameEventCtx) -> bool:
+    """规则1-3：双方共享事件组（shared_ev≠∅）时的合并判定
+
+    1. 主体(实体)交集非空 + 标题守卫 → 同主体同事件
+    2. 核心金额交集非空 → 同事件不同措辞同金额
+    3. 主体交集为空但标题 LCS≥5 → 多源同事件报道
+    """
+    if ctx.ent_overlap:
+        # 2026-08-11 修复（误并实证）：共享事件组 + 实体模糊重叠 直接合并会把
+        # "期货早报…连续21月增持黄金"（事件组=增持）与"多重稳市信号释放…"
+        # （content 含"增持"事件组）误并为同事件——两者标题零共享。
+        # 守卫：标题需共享 ≥3 字连续子串、字符集 Jaccard ≥0.15、或共享高置信
+        # 事件短语锚（寒武纪股权激励类：同个股+同事件组+标题同主题 仍合并）。
+        if ctx.ta and ctx.tb:
+            return (
+                _lcs_len(ctx.ta, ctx.tb) >= 3
+                or len(set(ctx.ta) & set(ctx.tb)) / len(set(ctx.ta) | set(ctx.tb)) >= 0.15
+                or any(p in ctx.ta and p in ctx.tb for p in _EVENT_PHRASE_ANCHORS)
+            )
+        return bool(ctx.ta or ctx.tb)
+    if ctx.num_a & ctx.num_b:
+        return True
+    return _lcs_len(ctx.ta, ctx.tb) >= 5
+
+
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
 
+    结构（SNA-04 重构，行为与重构前完全等价，57 处去重专项测试锁定）：
+    - 共享事件组族 _same_event_shared_group：规则1-3
+    - 无事件组族 _same_event_no_group：规则4-8（市场域/实体锚定/标题相似度）
+
+    规则目录：
     1. 主体(个股/LLM实体)交集非空 且 事件组交集非空 → 同主体同事件
        （"寒武纪股权激励大消息" vs "寒武纪:2026年限制性股票激励计划(草案)"）
     2. 核心金额交集非空 且 事件组交集非空 → 同事件不同措辞同金额
@@ -896,7 +969,7 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     3. 主体交集为空 但事件组交集非空 且 归一化标题最长公共子串≥5 →
        多源同事件报道（"恩智浦洽谈收购Ambarella" vs "安霸股价因传恩智浦洽谈收购而飙升"）
     4. 双方均无事件组（普通流水）且标题字符集 Jaccard≥0.6 → 同一条目的改写
-    5. 双方均无事件组 且 归一化标题 LCS 覆盖较短标题≥55% → 同事件
+    5. 双方均无事件组 且 归一化标题 LCS 覆盖较短标题≥55%（同实体/同金额放宽至35%）→ 同事件
        （板块/产业资讯兜底：存储ETF纳入、券商研报等 events/entities/numbers 全空，
         Jaccard 因长标题被稀释到 0.4 拦不住，实证花旗研报×2、长鑫ETF×2 同轮双推）
        —— LCS 兜底前先做方向对立守卫，防止涨/跌相反但句式相近的报道被误合并
@@ -908,158 +981,159 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
        （2026-08-04 00:32 纳指三推实证：美股涨幅扩大纳指涨超2 / 纳指涨200现报… /
         纳指涨超2 Meta涨超6 无时段词，Jaccard 0.20~0.33、LCS 占比 0.25~0.46，
         但均含"纳指"且方向一致）
+    （板块行情/宏观数据/央行政策/实体锚定等增量规则见各规则函数内注释）
     """
-    ent_a = set(_as_list(sig_a.get("stocks"))) | set(_as_list(sig_a.get("entities")))
-    ent_b = set(_as_list(sig_b.get("stocks"))) | set(_as_list(sig_b.get("entities")))
-    # 2026-08-14 修复：过滤市场状态类事件组（"行情下跌"由 content 关键词规则提取，
-    # 属市场状态描述而非事件动词）。否则非空 events 使"共享事件组"分支
-    # （shared_ev=∅）与"双方均无事件组"分支（not ev_a 不成立）同时失效，
-    # 同事件多源报道无法合并（日本央行加息三连推实证）。
-    ev_a = {e for e in set(_as_list(sig_a.get("events"))) if e not in _MARKET_STATE_EVENTS}
-    ev_b = {e for e in set(_as_list(sig_b.get("events"))) if e not in _MARKET_STATE_EVENTS}
-    num_a = set(_as_list(sig_a.get("numbers")))
-    num_b = set(_as_list(sig_b.get("numbers")))
-    shared_ev = ev_a & ev_b
-    # 2026-08-11 修复：实体模糊重叠（"索尼"⊂"索尼半导体解决方案公司"），
-    # 此前仅精确相等，跨源同事件（索尼×台积电合资）48h 内三推实证
-    ent_overlap = _entity_overlap(ent_a, ent_b)
-
-    if shared_ev and ent_overlap:
-        # 2026-08-11 修复（误并实证）：共享事件组 + 实体模糊重叠 直接合并会把
-        # "期货早报…连续21月增持黄金"（事件组=增持）与"多重稳市信号释放…"
-        # （content 含"增持"事件组）误并为同事件——两者标题零共享。
-        # 守卫：标题需共享 ≥3 字连续子串、字符集 Jaccard ≥0.15、或共享高置信
-        # 事件短语锚（寒武纪股权激励类：同个股+同事件组+标题同主题 仍合并）。
-        ta0 = str(sig_a.get("title_norm", "") or "")
-        tb0 = str(sig_b.get("title_norm", "") or "")
-        if ta0 and tb0:
-            title_ok = (
-                _lcs_len(ta0, tb0) >= 3
-                or len(set(ta0) & set(tb0)) / len(set(ta0) | set(tb0)) >= 0.15
-                or any(p in ta0 and p in tb0 for p in _EVENT_PHRASE_ANCHORS)
-            )
-            if title_ok:
-                return True
-        elif ta0 or tb0:
-            return True
-        return False
-    if shared_ev and (num_a & num_b):
-        return True
-    if shared_ev and not ent_overlap:
-        if _lcs_len(sig_a.get("title_norm", ""), sig_b.get("title_norm", "")) >= 5:
-            return True
-    if not ev_a and not ev_b:
-        ta = str(sig_a.get("title_norm", "") or "")
-        tb = str(sig_b.get("title_norm", "") or "")
-        if ta and tb:
-            if _title_direction_conflict(ta, tb):
-                return False
-            # 市场开收盘/复盘类快讯：同时段组 + 同市场域 → 同事件（多源措辞差异大）
-            if _session_group(ta, tb) is not None and _market_domain_overlap(ta, tb):
-                return True
-            # 盘中行情动态（涨超/现报/涨幅扩大等）：同市场域 + 共享市场指数词
-            # + 时段不冲突（防 午评 vs 收盘 因共享指数词误并）→ 同事件
-            if (not _session_conflict(ta, tb) and _market_domain_overlap(ta, tb)
-                    and _shared_index_token(ta, tb)):
-                return True
-            # 2026-08-12 修复（22:01 同轮双推实证）：美股盘初"光通信/存储普涨"
-            # 多源报道 entities 各抽各的、无共享时段/指数词、LCS 仅"光通信"3字——
-            # 既有分支全部兜不住。新增 sectors 交集合并：均无事件组 + 板块交集
-            # + 同市场域 + 任一含行情措辞（方向一致已在入口守卫）。
-            # 误并评估：sectors 不同（涨价逻辑 vs 行情情绪）通常交集为空；
-            # 交集非空且同域时，少推一条比重复推送更符合用户口径。
-            sec_a = set(_as_list(sig_a.get("sectors")))
-            sec_b = set(_as_list(sig_b.get("sectors")))
-            if (sec_a & sec_b) and _market_domain_overlap(ta, tb):
-                if any(w in ta for w in _MARKET_MOVE_WORDS) or any(w in tb for w in _MARKET_MOVE_WORDS):
-                    return True
-            # 2026-08-12 修复（21:31 vs 22:01 跨轮重复实证）：同一宏观数据事件
-            # （CPI符合预期美股高开 / 通胀温和美股盘初纳指涨）48h 内推两次。
-            # 双方均含宏观数据词 + 同市场域 → 同事件（方向一致已在入口守卫）。
-            # 市场域守卫防不同国家 CPI 误并（德国/意大利 CPI 标题无美股域词）。
-            if _market_domain_overlap(ta, tb):
-                mac_a = any(w in ta for w in _MACRO_EVENT_WORDS)
-                mac_b = any(w in tb for w in _MACRO_EVENT_WORDS)
-                if mac_a and mac_b:
-                    return True
-            # 2026-08-14 修复（日本央行加息三连推实证）：宏观流动性/货币政策事件
-            # 多源报道措辞差异大（"最快可能在9月加息" vs "加息或提速美元对日元急跌
-            # …流动性冲击"），LCS 仅 4 字、jaccard 0.15~0.20、无事件组/板块交集，
-            # 且三条均 market 级（_topic_saturated 豁免），既有分支全部兜不住。
-            # 新增：共享同一央行实体 + 标题均含宏观政策词 + 政策方向不冲突 → 同事件。
-            # 守卫：①同一央行实体（防日本央行 vs 美联储误并）；②方向守卫（防
-            # "考虑加息 vs 考虑降息"）；③标题均含政策词（防仅共享"日本央行"实体
-            # 的两条无关央行新闻被误并）。
-            if _central_bank_shared(ent_a, ent_b):
-                if _policy_direction_conflict(ta, tb):
-                    return False
-                if (any(w in ta for w in _MACRO_POLICY_EVENT_WORDS)
-                        and any(w in tb for w in _MACRO_POLICY_EVENT_WORDS)):
-                    return True
-            jaccard = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
-            if jaccard >= 0.6:
-                return True
-            # 2026-08-11 修复：同实体 + 共享事件短语 → 同事件（跨日报道实体顺序相反、
-            # 措辞差异大，LCS 兜不住：索尼×台积电合资三推实证）。金额守卫：
-            # 双方金额均明确且无交集 → 不同事件（防"50亿建厂 vs 10亿回购"误并漏推）。
-            if ent_overlap and not _title_direction_conflict(ta, tb):
-                if (num_a and num_b) and not (num_a & num_b):
-                    return False
-                if any(p in ta and p in tb for p in _EVENT_PHRASE_ANCHORS):
-                    return True
-                # 2026-08-13 修复：同实体 + 无事件组 + 同板块（sectors 交集≥2 词）
-                # + 标题共享≥2字 → 同事件（四川算力政策同轮双推实证："建强成都平原
-                # 算力核心区" vs "布局万卡级以上智算集群" 同实体同板块、无共享锚、
-                # LCS 仅 2 字，既有分支全兜不住）。
-                # 守卫：金额冲突已排除；sectors 交集≥2 防"英伟达AI芯片 vs 英伟达AI服务器"
-                # 仅共享宽泛"AI"被误并（漏推守卫）。
-                # 2026-08-13 二轮：sectors 用 _sectors_overlap（子串包含）替代精确交集，
-                # 修复 LLM 抽板块"AI算力"vs"AI/算力"不一致导致的漏合并（上海算力补贴×2）。
-                if len(_sectors_overlap(sec_a, sec_b)) >= 2 and _lcs_len(ta, tb) >= 2:
-                    return True
-                # 2026-08-25 审核实证：同实体兄弟报道（字节豆包×2/小米玄戒×2/华为
-                # 发布会×2）措辞差异大、无事件组/板块交集/LCS 不足，同轮重复推送。
-                # 判据：实体重叠 + 剔除实体词后标题仍共享连续内容；共享≥6字专有
-                # 主题词，或同板块时共享≥2字。避免"国际标准/美加贸易"4字通用短语
-                # 把固态电池/磁性元件、关税抬升/谈判破裂两对不同事件误并。
-                sa = _strip_entities(ta, ent_a); sb = _strip_entities(tb, ent_b)
-                if sa and sb:
-                    s_lcs = _lcs_len(sa, sb)
-                    # 共享连续段 ≥6（专有主题词，如"发布豆包工作"）；或同板块 + ≥2
-                    #（玄戒/华为发布会类）。纯 ≥4 兜底会误并两对不同事件——
-                    # "固态电池国际标准" vs "磁性元件国际标准"（共享"国际标准"4字）、
-                    # "关税抬升至50" vs "美加贸易谈判破裂"（共享"美加贸易"4字）。
-                    if s_lcs >= 6 or (len(_sectors_overlap(sec_a, sec_b)) >= 1 and s_lcs >= 2):
-                        return True
-            shorter = min(len(ta), len(tb))
-            if shorter >= 8:
-                # 2026-08-11 修复：同主体(实体模糊重叠)或同金额时放宽标题相似阈值——
-                # 跨日报道措辞差异大（"拟合资建厂" vs "批准成立合资企业"），
-                # 但主体+金额一致，放宽 LCS 即可合并，防 48h 内重复推送
-                # （韩国5万亿基金×2、索尼台积电合资×3 实证）。
-                # 放宽仅对"同实体/同金额"生效：SK海力士不同事件（扩产 vs 股东回报）
-                # 标题无共享长段，仍不会被误并（漏推守卫）。
-                same_anchor = ent_overlap or bool(num_a & num_b)
-                # 误并守卫（2026-08-11 实证）："央行授权德银" vs "央行十五五规划"
-                # 仅因实体名"中国人民银行"重复出现，LCS 子序列虚高至 0.52 被误并。
-                # 同锚放宽前要求：剔除实体词后标题仍有 ≥3 字连续共享内容，
-                # 即两条报道除主体外确实描述同一件事。
-                if same_anchor:
-                    strip_a = _strip_entities(ta, ent_a)
-                    strip_b = _strip_entities(tb, ent_b)
-                    if strip_a and strip_b and _lcs_len(strip_a, strip_b) < 3:
-                        return False
-                # 连续子串兜底（比例足够高 → 同事件）
-                if _lcs_len(ta, tb) / shorter >= (0.35 if same_anchor else 0.55):
-                    return True
-                # 子序列兜底：允许单字替换（"存储ETF" vs "内存ETF"）
-                # 仅在匹配长度绝对充足且占比高时启用，避免日常流水误并
-                sub = _lcs_subseq_len(ta, tb)
-                sub_min = 10 if same_anchor else 12
-                sub_ratio = 0.45 if same_anchor else 0.6
-                if sub >= sub_min and sub / shorter >= sub_ratio:
-                    return True
+    ctx = _same_event_ctx(sig_a, sig_b)
+    if ctx.shared_ev:
+        return _same_event_shared_group(ctx)
+    if not ctx.ev_a and not ctx.ev_b:
+        return _same_event_no_group(ctx)
     return False
+
+
+def _same_event_no_group(ctx: _SameEventCtx) -> bool:
+    """规则4-8：双方均无事件组（普通流水/板块资讯/行情快讯）时的合并判定"""
+    ta, tb = ctx.ta, ctx.tb
+    if not (ta and tb):
+        return False
+    if _title_direction_conflict(ta, tb):
+        return False
+    r = _same_event_market_rules(ctx)
+    if r is not None:
+        return r
+    # 规则4：标题字符集 Jaccard≥0.6 → 同一条目的改写
+    if len(set(ta) & set(tb)) / len(set(ta) | set(tb)) >= 0.6:
+        return True
+    r = _same_event_entity_anchor_rules(ctx)
+    if r is not None:
+        return r
+    return _same_event_title_similarity(ctx)
+
+
+def _same_event_market_rules(ctx: _SameEventCtx) -> bool | None:
+    """市场域规则族：时段组/指数词/板块行情/宏观数据/央行政策类多源快讯合并
+
+    返回 True=同事件 / False=方向对立终止（不再走后续规则）/ None=无判定。
+    """
+    ta, tb = ctx.ta, ctx.tb
+    # 市场开收盘/复盘类快讯：同时段组 + 同市场域 → 同事件（多源措辞差异大）
+    if _session_group(ta, tb) is not None and _market_domain_overlap(ta, tb):
+        return True
+    # 盘中行情动态（涨超/现报/涨幅扩大等）：同市场域 + 共享市场指数词
+    # + 时段不冲突（防 午评 vs 收盘 因共享指数词误并）→ 同事件
+    if (not _session_conflict(ta, tb) and _market_domain_overlap(ta, tb)
+            and _shared_index_token(ta, tb)):
+        return True
+    # 2026-08-12 修复（22:01 同轮双推实证）：美股盘初"光通信/存储普涨"
+    # 多源报道 entities 各抽各的、无共享时段/指数词、LCS 仅"光通信"3字——
+    # 既有分支全部兜不住。新增 sectors 交集合并：均无事件组 + 板块交集
+    # + 同市场域 + 任一含行情措辞（方向一致已在入口守卫）。
+    # 误并评估：sectors 不同（涨价逻辑 vs 行情情绪）通常交集为空；
+    # 交集非空且同域时，少推一条比重复推送更符合用户口径。
+    if (ctx.sec_a & ctx.sec_b) and _market_domain_overlap(ta, tb):
+        if any(w in ta for w in _MARKET_MOVE_WORDS) or any(w in tb for w in _MARKET_MOVE_WORDS):
+            return True
+    # 2026-08-12 修复（21:31 vs 22:01 跨轮重复实证）：同一宏观数据事件
+    # （CPI符合预期美股高开 / 通胀温和美股盘初纳指涨）48h 内推两次。
+    # 双方均含宏观数据词 + 同市场域 → 同事件（方向一致已在入口守卫）。
+    # 市场域守卫防不同国家 CPI 误并（德国/意大利 CPI 标题无美股域词）。
+    if _market_domain_overlap(ta, tb) and \
+            any(w in ta for w in _MACRO_EVENT_WORDS) and \
+            any(w in tb for w in _MACRO_EVENT_WORDS):
+        return True
+    # 2026-08-14 修复（日本央行加息三连推实证）：宏观流动性/货币政策事件
+    # 多源报道措辞差异大（"最快可能在9月加息" vs "加息或提速美元对日元急跌
+    # …流动性冲击"），LCS 仅 4 字、jaccard 0.15~0.20、无事件组/板块交集，
+    # 且三条均 market 级（_topic_saturated 豁免），既有分支全部兜不住。
+    # 新增：共享同一央行实体 + 标题均含宏观政策词 + 政策方向不冲突 → 同事件。
+    # 守卫：①同一央行实体（防日本央行 vs 美联储误并）；②方向守卫（防
+    # "考虑加息 vs 考虑降息"）；③标题均含政策词（防仅共享"日本央行"实体
+    # 的两条无关央行新闻被误并）。
+    if _central_bank_shared(ctx.ent_a, ctx.ent_b):
+        if _policy_direction_conflict(ta, tb):
+            return False
+        if (any(w in ta for w in _MACRO_POLICY_EVENT_WORDS)
+                and any(w in tb for w in _MACRO_POLICY_EVENT_WORDS)):
+            return True
+    return None
+
+
+def _same_event_entity_anchor_rules(ctx: _SameEventCtx) -> bool | None:
+    """实体锚定规则族：同实体（模糊重叠）+ 金额/短语锚/板块/剔除实体后共享内容
+
+    返回 True=同事件 / False=金额冲突终止 / None=无判定。
+    """
+    ta, tb = ctx.ta, ctx.tb
+    if not (ctx.ent_overlap and not _title_direction_conflict(ta, tb)):
+        return None
+    # 2026-08-11 修复：同实体 + 共享事件短语 → 同事件（跨日报道实体顺序相反、
+    # 措辞差异大，LCS 兜不住：索尼×台积电合资三推实证）。金额守卫：
+    # 双方金额均明确且无交集 → 不同事件（防"50亿建厂 vs 10亿回购"误并漏推）。
+    if (ctx.num_a and ctx.num_b) and not (ctx.num_a & ctx.num_b):
+        return False
+    if any(p in ta and p in tb for p in _EVENT_PHRASE_ANCHORS):
+        return True
+    # 2026-08-13 修复：同实体 + 无事件组 + 同板块（sectors 交集≥2 词）
+    # + 标题共享≥2字 → 同事件（四川算力政策同轮双推实证："建强成都平原
+    # 算力核心区" vs "布局万卡级以上智算集群" 同实体同板块、无共享锚、
+    # LCS 仅 2 字，既有分支全兜不住）。
+    # 守卫：金额冲突已排除；sectors 交集≥2 防"英伟达AI芯片 vs 英伟达AI服务器"
+    # 仅共享宽泛"AI"被误并（漏推守卫）。
+    # 2026-08-13 二轮：sectors 用 _sectors_overlap（子串包含）替代精确交集，
+    # 修复 LLM 抽板块"AI算力"vs"AI/算力"不一致导致的漏合并（上海算力补贴×2）。
+    if len(_sectors_overlap(ctx.sec_a, ctx.sec_b)) >= 2 and _lcs_len(ta, tb) >= 2:
+        return True
+    # 2026-08-25 审核实证：同实体兄弟报道（字节豆包×2/小米玄戒×2/华为
+    # 发布会×2）措辞差异大、无事件组/板块交集/LCS 不足，同轮重复推送。
+    # 判据：实体重叠 + 剔除实体词后标题仍共享连续内容；共享≥6字专有
+    # 主题词，或同板块时共享≥2字。避免"国际标准/美加贸易"4字通用短语
+    # 把固态电池/磁性元件、关税抬升/谈判破裂两对不同事件误并。
+    sa = _strip_entities(ta, ctx.ent_a)
+    sb = _strip_entities(tb, ctx.ent_b)
+    if sa and sb:
+        s_lcs = _lcs_len(sa, sb)
+        # 共享连续段 ≥6（专有主题词，如"发布豆包工作"）；或同板块 + ≥2
+        #（玄戒/华为发布会类）。纯 ≥4 兜底会误并两对不同事件——
+        # "固态电池国际标准" vs "磁性元件国际标准"（共享"国际标准"4字）、
+        # "关税抬升至50" vs "美加贸易谈判破裂"（共享"美加贸易"4字）。
+        if s_lcs >= 6 or (len(_sectors_overlap(ctx.sec_a, ctx.sec_b)) >= 1 and s_lcs >= 2):
+            return True
+    return None
+
+
+def _same_event_title_similarity(ctx: _SameEventCtx) -> bool:
+    """标题相似度兜底：LCS 连续子串与子序列阈值，同实体/同金额放宽阈值
+
+    2026-08-11 修复：同主体(实体模糊重叠)或同金额时放宽标题相似阈值——
+    跨日报道措辞差异大（"拟合资建厂" vs "批准成立合资企业"），
+    但主体+金额一致，放宽 LCS 即可合并，防 48h 内重复推送
+    （韩国5万亿基金×2、索尼台积电合资×3 实证）。
+    放宽仅对"同实体/同金额"生效：SK海力士不同事件（扩产 vs 股东回报）
+    标题无共享长段，仍不会被误并（漏推守卫）。
+    """
+    ta, tb = ctx.ta, ctx.tb
+    shorter = min(len(ta), len(tb))
+    if shorter < 8:
+        return False
+    same_anchor = ctx.ent_overlap or bool(ctx.num_a & ctx.num_b)
+    # 误并守卫（2026-08-11 实证）："央行授权德银" vs "央行十五五规划"
+    # 仅因实体名"中国人民银行"重复出现，LCS 子序列虚高至 0.52 被误并。
+    # 同锚放宽前要求：剔除实体词后标题仍有 ≥3 字连续共享内容，
+    # 即两条报道除主体外确实描述同一件事。
+    if same_anchor:
+        strip_a = _strip_entities(ta, ctx.ent_a)
+        strip_b = _strip_entities(tb, ctx.ent_b)
+        if strip_a and strip_b and _lcs_len(strip_a, strip_b) < 3:
+            return False
+    # 连续子串兜底（比例足够高 → 同事件）
+    if _lcs_len(ta, tb) / shorter >= (0.35 if same_anchor else 0.55):
+        return True
+    # 子序列兜底：允许单字替换（"存储ETF" vs "内存ETF"）
+    # 仅在匹配长度绝对充足且占比高时启用，避免日常流水误并
+    sub = _lcs_subseq_len(ta, tb)
+    sub_min = 10 if same_anchor else 12
+    sub_ratio = 0.45 if same_anchor else 0.6
+    return sub >= sub_min and sub / shorter >= sub_ratio
 
 
 # ============================================================
