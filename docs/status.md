@@ -16,7 +16,7 @@
 - 工程审查（2026-08-22 第三轮）：Gist 读-改-写、config.py import 副作用、run_once 挂起条目三处均已防御到位。
 - **SNA-01 已合入 main（commit 8a25a47）**：399006 日线 / 旭创日线 / 创业板50 PE 三链 Tushare Pro 优先通道，token 缺失/失效自动降级免费源（当前无 token，生产行为与此前一致）；验收①-④达成，⑤一致性抽查待 token（ND-002）。
 - **SNA-04 已合入 main（commit b2391c1）**：`_is_same_event` 行为等价重构（174 行深嵌套 → 6 个规则族函数），203 去重专项测试全绿。
-- **SNA-02 代码+测试完成（待 commit）**：期货基差 新浪→中金所、资金流 东财→Tushare 聚合双降级链（`scripts/factor_collector.py`），15 专项 mock 测试全绿；Tushare 资金流通道待 token 云端生效。
+- **SNA-02 已合入 main（commit 0579220）**：期货基差 新浪→中金所、资金流 东财→Tushare 聚合双降级链（`scripts/factor_collector.py`），15 专项 mock 测试 + 910 unit 全绿；Tushare 资金流通道待 token 云端生效。
 - 数据源现状：免费 HTTP 抓取为主 + Tushare 优先通道（待 token 激活）；东财 push2his 已被反爬（实证 RemoteDisconnected）。
 
 ## 未提交工作（保护项）
@@ -25,7 +25,7 @@
 
 ## 唯一 NEXT
 
-**SNA-02 集成收尾**：commit + 自 review 后合入（Integrator 角色），随后排期 SNA-03（外盘双源）或 SNA-05（数据源健康度告警）。领取入口见 `docs/task-board.md`。
+**排期下一数据源加固任务**：SNA-05（数据源健康度告警，SNA-01/02 落地后最有价值的收尾）或 SNA-03（外盘双源），由用户指定优先级；或提供 Tushare token（ND-002）解锁云端付费通道。领取入口见 `docs/task-board.md`。
 
 ## 待用户决策
 
