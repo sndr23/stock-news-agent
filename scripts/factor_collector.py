@@ -463,8 +463,8 @@ def fetch_fx() -> dict:
     return result
 
 
-def fetch_index_futures() -> dict:
-    """新浪股指期货主力连续 → {期货代码: {price, prev_settle}}"""
+def _fetch_futures_sina() -> dict:
+    """新浪股指期货主力连续实时 → {期货代码: {price, prev_settle}}（SNA-02 主链）"""
     result = {}
     codes = ",".join(f["sina"] for f in FUTURES.values())
     text = _http_get("http://hq.sinajs.cn/list=" + codes, headers={"Referer": "http://finance.sina.com.cn", **_HEADERS}, encoding="gbk")
@@ -489,6 +489,69 @@ def fetch_index_futures() -> dict:
                     }
                 except (ValueError, IndexError):
                     continue
+    return result
+
+
+def _fetch_futures_cffex() -> dict:
+    """中金所官网每日行情（akshare futures_hist_daily_cffex）→ 主力合约行情（SNA-02 降级源）。
+
+    当日盘中数据可用（实时更新，2026-08-27 实证与新浪实时/主力连续三源吻合：
+    IF2609 close=4604.8 / vol=52955）；主力 = 同品种 volume 最大合约。
+    非交易日/盘前当日为空 → 回看最近 3 个自然日。返回 {期货代码: {price, prev_settle}}。
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return {}
+    raw = None
+    for back in range(0, 4):
+        d = datetime.now() - timedelta(days=back)
+        try:
+            df = ak.futures_hist_daily_cffex(date=d.strftime("%Y%m%d"))
+        except Exception as e:
+            logger.warning("中金所期货源 %s 失败(%s)", d.strftime("%Y%m%d"), type(e).__name__)
+            return {}
+        if df is not None and not df.empty:
+            raw = df
+            break
+        time.sleep(0.2)
+    if raw is None or raw.empty or "variety" not in raw.columns:
+        return {}
+    out = {}
+    try:
+        # 同品种 volume 最大 = 主力（实证：IF 主力 IF2609 与新浪 nf_IF0 成交量一致）
+        main = raw.sort_values("volume", ascending=False).drop_duplicates("variety")
+        for _, r in main.iterrows():
+            code = str(r.get("variety") or "").strip()
+            if code not in FUTURES:
+                continue
+            price = float(r.get("close") or 0)
+            if price <= 0:
+                continue
+            out[code] = {"price": price, "prev_settle": float(r.get("pre_settle") or 0)}
+    except (TypeError, ValueError) as e:
+        logger.warning("中金所期货数据解析失败(%s)", type(e).__name__)
+        return {}
+    return out
+
+
+def fetch_index_futures() -> dict:
+    """股指期货主力行情 → {期货代码: {price, prev_settle}}。
+
+    降级链（SNA-02，防单源失效）：新浪实时（主链）→ 中金所官网（补齐缺失/兜底）。
+    新浪结果优先保留，中金所仅 setdefault 补缺；全失败 → {}（修正层贴水因子
+    自动缺省降 0，缺一维缩一维，永不无信号）。
+    """
+    result = _fetch_futures_sina()
+    if len(result) >= len(FUTURES):
+        return result
+    if result:
+        logger.warning("新浪期货源部分缺失(%s)，中金所补齐", ",".join(result))
+    cffex = _fetch_futures_cffex()
+    for code, v in cffex.items():
+        result.setdefault(code, v)
+    if not result:
+        logger.warning("期货源全部失效（新浪+中金所），基差维度缺省")
     return result
 
 
@@ -560,8 +623,8 @@ def fetch_stock_quotes(symbols: list) -> dict:
     return result
 
 
-def fetch_market_flows() -> dict:
-    """东财资金流（P1-3）：两市主力净流入（当日累计）+ 融资余额及日变化（T-1）
+def _fetch_flows_em() -> dict:
+    """东财资金流（P1-3 主链）：两市主力净流入（当日累计）+ 融资余额及日变化（T-1）
 
     返回 {"main_net_yi": float, "margin_yi": float, "margin_chg_yi": float}；
     任一数据源失败时对应字段缺省（互不影响，资金流是增强维度不 fail-stop）。
@@ -599,6 +662,84 @@ def fetch_market_flows() -> dict:
                     (float(rows[0].get("RZYE", 0) or 0) - float(rows[1].get("RZYE", 0) or 0)) / 1e8, 1)
         except (ValueError, TypeError):
             logger.warning("融资余额解析失败（跳过该维度）")
+    return out
+
+
+def _fetch_main_net_tushare():
+    """Tushare 两市主力净流入聚合（SNA-02 东财替代通道，token 时启用）。
+
+    优先 moneyflow_dc（东财口径主力净流入，按 trade_date 全市场返回，聚合即两市值，
+    单位元）；接口/字段不可用时退 moneyflow（自有口径：大单+超大单净额合成主力，
+    单位万元）。日频 T-1（当日盘中无数据）——降级语义：资金流因子从"当日盘中
+    累计"变为"T-1 全天"，修正层可接受（增强维度）。单页 limit 覆盖全市场
+    （约 5400 只），最多翻 3 页防截断；返回亿元 float 或 None。
+    """
+    try:
+        from src.strategy.data import _tushare_client
+    except ImportError:
+        return None
+    pro = _tushare_client()
+    if pro is None:
+        return None
+    for back in range(1, 4):
+        d = (datetime.now() - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            # 通道一：moneyflow_dc 全市场主力净流入（元）聚合
+            total = None
+            page = 0
+            while page < 3:
+                raw = pro.moneyflow_dc(trade_date=d, limit=6000, offset=page * 6000)
+                if raw is None or raw.empty:
+                    break
+                col = next((c for c in raw.columns if str(c).lower() == "net_amount_main"), None)
+                if col is not None:
+                    total = (total or 0.0) + raw[col].astype(float).sum()
+                page += 1
+                if len(raw) < 6000:
+                    break
+            if total:
+                return round(total / 1e8, 1)
+            # 通道二：moneyflow 大单+超大单净额合成（万元）
+            total = 0.0
+            got = False
+            page = 0
+            while page < 3:
+                raw = pro.moneyflow(trade_date=d, limit=6000, offset=page * 6000)
+                if raw is None or raw.empty:
+                    break
+                cols = {str(c).lower(): c for c in raw.columns}
+                need = {"buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"}
+                if not need <= set(cols):
+                    break
+                lg = (raw[cols["buy_lg_amount"]].astype(float) - raw[cols["sell_lg_amount"]].astype(float)).sum()
+                elg = (raw[cols["buy_elg_amount"]].astype(float) - raw[cols["sell_elg_amount"]].astype(float)).sum()
+                total += lg + elg
+                got = True
+                page += 1
+                if len(raw) < 6000:
+                    break
+            if got and total:
+                return round(total / 10000, 1)  # 万元 → 亿
+        except Exception as e:
+            logger.warning("Tushare 资金流 %s 失败(%s)", d, type(e).__name__)
+            return None
+    return None
+
+
+def fetch_market_flows() -> dict:
+    """资金流聚合（SNA-02 降级链）：东财（主链）→ Tushare 聚合（token 时）。
+
+    东财 main_net_yi 失败时走 Tushare 日频 T-1 聚合（标注 main_net_source=
+    "tushare_t1" 区分当日盘中口径）；margin 维度仅东财单源（展示字段，
+    缺省不伤信号）。全失败 → {}（修正层资金流因子自动缺省降 0）。
+    """
+    out = _fetch_flows_em()
+    if "main_net_yi" not in out:
+        logger.warning("东财主力资金流失效，尝试 Tushare 聚合通道")
+        v = _fetch_main_net_tushare()
+        if v is not None:
+            out["main_net_yi"] = v
+            out["main_net_source"] = "tushare_t1"
     return out
 
 
@@ -1932,6 +2073,8 @@ def build_snapshot(tech: dict, basis: dict, fx: dict, risk_state: str,
             "margin_yi": _to_float(flows.get("margin_yi")),
             "margin_chg_yi": _to_float(flows.get("margin_chg_yi")),
         }
+        if flows.get("main_net_source"):
+            out["flows"]["main_net_source"] = flows["main_net_source"]
     # P3（2026-08-19）：外盘/宽度/波动率/风格紧凑键
     if global_quotes:
         out["global"] = {

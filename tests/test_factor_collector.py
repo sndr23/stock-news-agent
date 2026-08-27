@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -312,3 +313,265 @@ def test_filter_by_cooldown():
     assert len(filter_by_cooldown([{"key": "k1", "title": "x"}], state)) == 0
     # 新 key：放行
     assert len(filter_by_cooldown([{"key": "k2", "title": "y"}], state)) == 1
+
+
+# ============================================================
+# SNA-02 数据源加固：期货基差 + 资金流替代通道（全 mock，零网络）
+# ============================================================
+
+def _sina_fut_text(mapping):
+    """构造新浪股指期货返回文本 {sina_code: (昨结算, 最新价)}（parts[0]/parts[3]）"""
+    lines = []
+    for code, (ps, p) in mapping.items():
+        parts = [str(ps), "0", "0", str(p), "0", "0"]
+        lines.append(f'var hq_str_{code}="' + ",".join(parts) + '"')
+    return ";".join(lines) + ";"
+
+
+def _patch_http(monkeypatch, routes):
+    """按 URL 子串路由的 _http_get 替身：{子串: 文本}，未命中返回空串。
+    返回 calls 列表记录实际请求过的 URL（断言降级链触达顺序用）。"""
+    import factor_collector as fc
+    calls = []
+
+    def fake(url, **kw):
+        calls.append(url)
+        for key, text in routes.items():
+            if key in url:
+                return text
+        return ""
+
+    monkeypatch.setattr(fc, "_http_get", fake)
+    return calls
+
+
+def _patch_cffex(monkeypatch, ret):
+    """中金所 akshare 替身：futures_hist_daily_cffex 可编程返回/抛错。"""
+    import akshare
+    calls = []
+
+    def fake(date):
+        calls.append(date)
+        if isinstance(ret, Exception):
+            raise ret
+        return ret
+
+    monkeypatch.setattr(akshare, "futures_hist_daily_cffex", fake)
+    return calls
+
+
+def _cffex_df():
+    """中金所行情 DataFrame：IF 两个合约（IF2609 主力 vol 最大）+ IC/IM/IH 各一"""
+    return pd.DataFrame({
+        "variety": ["IF", "IF", "IC", "IM", "IH"],
+        "volume": [52955.0, 100.0, 8000.0, 12000.0, 9000.0],
+        "close": [4604.8, 4590.0, 6800.0, 7250.0, 2940.0],
+        "pre_settle": [4590.0, 4580.0, 6790.0, 7240.0, 2935.0],
+    })
+
+
+class _FakeFlowPro:
+    """Tushare 资金流替身：moneyflow_dc / moneyflow 可编程返回/抛错"""
+
+    def __init__(self, dc_ret=None, mf_ret=None):
+        self.dc_ret = dc_ret
+        self.mf_ret = mf_ret
+        self.calls = []
+
+    def moneyflow_dc(self, **kw):
+        self.calls.append(("dc", kw))
+        if isinstance(self.dc_ret, Exception):
+            raise self.dc_ret
+        return self.dc_ret
+
+    def moneyflow(self, **kw):
+        self.calls.append(("mf", kw))
+        if isinstance(self.mf_ret, Exception):
+            raise self.mf_ret
+        return self.mf_ret
+
+
+# ---------------- 期货降级链 fetch_index_futures ----------------
+
+def test_futures_sina_full_skips_cffex(monkeypatch):
+    """新浪全量返回 → 不触达中金所（主链优先，省降级开销）"""
+    import factor_collector as fc
+    full = {"nf_IF0": (4480, 4500), "nf_IC0": (6790, 6810),
+            "nf_IM0": (7280, 7300), "nf_IH0": (2950, 2960)}
+    _patch_http(monkeypatch, {"hq.sinajs.cn": _sina_fut_text(full)})
+    cffex_calls = _patch_cffex(monkeypatch, _cffex_df())
+    out = fc.fetch_index_futures()
+    assert len(out) == 4 and out["IF"]["price"] == 4500.0
+    assert not cffex_calls, "新浪全量时不应触达中金所"
+
+
+def test_futures_sina_partial_cffex_fills_gap(monkeypatch):
+    """新浪部分缺失（IF/IC 在，IM/IH 缺）→ 中金所补齐缺失项，新浪已有值不被覆盖"""
+    import factor_collector as fc
+    partial = {"nf_IF0": (4480, 4500), "nf_IC0": (6790, 6810)}
+    _patch_http(monkeypatch, {"hq.sinajs.cn": _sina_fut_text(partial)})
+    _patch_cffex(monkeypatch, _cffex_df())
+    out = fc.fetch_index_futures()
+    assert len(out) == 4
+    assert out["IF"]["price"] == 4500.0        # 新浪值保留（中金所 4604.8 不覆盖）
+    assert out["IC"]["price"] == 6810.0        # 新浪值保留
+    assert out["IM"]["price"] == 7250.0        # 中金所补齐
+    assert out["IH"]["price"] == 2940.0        # 中金所补齐
+
+
+def test_futures_sina_dead_cffex_rescues(monkeypatch):
+    """新浪全失败 → 中金所兜底；主力合约 = 同品种 volume 最大"""
+    import factor_collector as fc
+    _patch_http(monkeypatch, {})
+    _patch_cffex(monkeypatch, _cffex_df())
+    out = fc.fetch_index_futures()
+    assert out["IF"]["price"] == 4604.8   # vol=52955 的 IF2609 主力，非 4590
+    assert out["IF"]["prev_settle"] == 4590.0
+    assert out["IC"]["price"] == 6800.0
+
+
+def test_futures_all_dead_returns_empty(monkeypatch):
+    """双链全失败 → {} 不抛错（修正层基差因子缺省降 0，永不无信号）"""
+    import factor_collector as fc
+    _patch_http(monkeypatch, {})
+    _patch_cffex(monkeypatch, RuntimeError("cffex down"))
+    assert fc.fetch_index_futures() == {}
+
+
+def test_futures_cffex_empty_lookback_then_give_up(monkeypatch):
+    """中金所连续 4 日空表（非交易日）→ 放弃返回 {}，不抛错"""
+    import factor_collector as fc
+    monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+    calls = _patch_cffex(monkeypatch, pd.DataFrame())
+    _patch_http(monkeypatch, {})
+    assert fc._fetch_futures_cffex() == {}
+    assert len(calls) == 4, "应回看最近 3 个自然日后放弃"
+
+
+def test_futures_cffex_direct_main_contract(monkeypatch):
+    """_fetch_futures_cffex 主力识别：drop_duplicates(variety) 前按 volume 降序"""
+    import factor_collector as fc
+    _patch_cffex(monkeypatch, _cffex_df())
+    out = fc._fetch_futures_cffex()
+    assert set(out) == {"IF", "IC", "IM", "IH"}
+    assert out["IF"]["price"] == 4604.8 and out["IC"]["prev_settle"] == 6790.0
+
+
+def test_futures_sina_parse_fields(monkeypatch):
+    """_fetch_futures_sina 字段解析：parts[0]=昨结算 / parts[3]=最新价"""
+    import factor_collector as fc
+    _patch_http(monkeypatch, {"hq.sinajs.cn": _sina_fut_text({"nf_IF0": (4480.0, 4500.5)})})
+    out = fc._fetch_futures_sina()
+    assert out == {"IF": {"price": 4500.5, "prev_settle": 4480.0}}
+
+
+# ---------------- 资金流降级链 fetch_market_flows ----------------
+
+def _em_full_text():
+    """东财全量文本：主力净流入 150 亿 + 融资余额 20000 亿/日增 100 亿"""
+    import json
+    return {
+        "push2.eastmoney.com": json.dumps({
+            "data": {"klines": ["2026-08-27,15000000000,1,2,3,4,5"]}}),
+        "datacenter-web.eastmoney.com": json.dumps({
+            "result": {"data": [
+                {"RZYE": 200000000000}, {"RZYE": 199000000000}]}}),
+    }
+
+
+def test_flows_em_ok_skips_tushare(monkeypatch):
+    """东财主链成功 → 不触达 Tushare，无 main_net_source 标注（当日盘中口径）"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    _patch_http(monkeypatch, _em_full_text())
+    pro = _FakeFlowPro()
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: pro)
+    out = fc.fetch_market_flows()
+    assert out["main_net_yi"] == 150.0
+    assert out["margin_yi"] == 2000.0
+    assert out["margin_chg_yi"] == 10.0
+    assert "main_net_source" not in out
+    assert not pro.calls, "东财成功时不应触达 Tushare"
+
+
+def test_flows_em_dead_tushare_dc_rescues(monkeypatch):
+    """东财失败 → Tushare moneyflow_dc 聚合兜底，标注 tushare_t1 口径"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    _patch_http(monkeypatch, {})
+    pro = _FakeFlowPro(dc_ret=pd.DataFrame({"net_amount_main": [2e9, 3e9]}))
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: pro)
+    out = fc.fetch_market_flows()
+    assert out["main_net_yi"] == 50.0          # 5e9 元 → 50 亿
+    assert out["main_net_source"] == "tushare_t1"
+    assert pro.calls and pro.calls[0][0] == "dc"
+
+
+def test_flows_dc_dead_moneyflow_channel(monkeypatch):
+    """moneyflow_dc 不可用（无 net_amount_main 列）→ moneyflow 合成通道（万元→亿）"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    pro = _FakeFlowPro(
+        dc_ret=pd.DataFrame({"foo": [1.0]}),
+        mf_ret=pd.DataFrame({
+            "buy_lg_amount": [1e6], "sell_lg_amount": [0.5e6],
+            "buy_elg_amount": [2e6], "sell_elg_amount": [0.5e6]}))
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: pro)
+    v = fc._fetch_main_net_tushare()
+    # lg=+0.5e6, elg=+1.5e6 → 2e6 万元 = 200 亿
+    assert v == 200.0
+    assert [c[0] for c in pro.calls] == ["dc", "mf"]
+
+
+def test_flows_tushare_exception_returns_none(monkeypatch):
+    """Tushare 接口抛错 → None（上层放弃降级，返回 {} 不抛错）"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    pro = _FakeFlowPro(dc_ret=RuntimeError("api err"))
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: pro)
+    assert fc._fetch_main_net_tushare() is None
+
+
+def test_flows_no_token_no_rescue(monkeypatch):
+    """东财失败 + Tushare 无 token → main_net 缺省；margin 维度独立保留"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    import json
+    _patch_http(monkeypatch, {
+        "push2.eastmoney.com": "",  # 主力净流入失败
+        "datacenter-web.eastmoney.com": json.dumps({
+            "result": {"data": [
+                {"RZYE": 200000000000}, {"RZYE": 199000000000}]}}),
+    })
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: None)
+    out = fc.fetch_market_flows()
+    assert "main_net_yi" not in out
+    assert out["margin_yi"] == 2000.0, "margin 仅东财单源，独立失败互不影响"
+
+
+def test_flows_all_dead_returns_empty(monkeypatch):
+    """双链全失败 → {}（修正层资金流因子缺省降 0，永不无信号）"""
+    import factor_collector as fc
+    from src.strategy import data as sdata
+    _patch_http(monkeypatch, {})
+    monkeypatch.setattr(sdata, "_tushare_client", lambda: None)
+    assert fc.fetch_market_flows() == {}
+
+
+# ---------------- 快照透传 main_net_source ----------------
+
+def test_snapshot_carries_main_net_source():
+    """build_snapshot 透传 main_net_source=tushare_t1（口径审计：T-1 vs 当日盘中）"""
+    from factor_collector import build_snapshot
+    snap = build_snapshot({}, {}, {}, "neutral", flows={
+        "main_net_yi": 50.0, "main_net_source": "tushare_t1"})
+    assert snap["flows"]["main_net_yi"] == 50.0
+    assert snap["flows"]["main_net_source"] == "tushare_t1"
+
+
+def test_snapshot_no_source_key_when_em():
+    """东财口径（无标注）→ 快照不含 main_net_source 键（向后兼容旧读取方）"""
+    from factor_collector import build_snapshot
+    snap = build_snapshot({}, {}, {}, "neutral", flows={"main_net_yi": 150.0})
+    assert snap["flows"]["main_net_yi"] == 150.0
+    assert "main_net_source" not in snap["flows"]
