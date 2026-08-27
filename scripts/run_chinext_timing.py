@@ -584,9 +584,19 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
                  f"｜估值{sig['value_erp']:+.2f}"
                  f"｜落袋{_fmt(sig['pullback_52w'], sig['dd60'])}")
     # 旭创从修正行移除，改由下方"旭创确认"行承载（避免 -0.10 与明细 -0.14 重复且打架）
+    # 数据健康度（2026-08-27）：快照源缺失时该子项降级 0，+0.00 无法区分"真实中性"
+    # vs"没数据"——源头缺失标注(缺)。快照整体停更由下方 ⚠ 行告警覆盖，不重复标。
+    raw_h = None if ctx.get("snapshot_stale") else _shadow_raw(ctx)
+
+    def _h(label: str, val, key: str) -> str:
+        tag = "(缺)" if (raw_h is not None and raw_h.get(key) is None) else ""
+        return f"{label}{val:+.2f}{tag}"
+
     lines.append("  修正："
-                 f"贴水{mods['basis']:+.2f}｜资金{mods['flow']:+.2f}"
-                 f"｜情绪{mods['mood']:+.2f}｜资讯{mods['news']:+.2f}"
+                 f"{_h('贴水', mods['basis'], 'basis_min_ap')}"
+                 f"｜{_h('资金', mods['flow'], 'main_net')}"
+                 f"｜{_h('情绪', mods['mood'], 'down_pct')}"
+                 f"｜资讯{mods['news']:+.2f}"
                  f"｜缠论{mods['chan'].get('score', 0.0):+.2f}")
     lines.append("  注：X/Y＝该因子主信号/副信号（双口径），单值因子仅取主信号。")
     stock_detail = (mods.get("stock") or {}).get("detail", "")

@@ -792,3 +792,46 @@ def test_render_report_has_commit_and_cap_note():
     assert "（代码 " in txt, "报告应携带代码版本号"
     assert "未实际生效" in txt, "档位未越封顶线时应澄清风控非空仓主因"
     assert "硬风控仅限上限" in txt
+
+
+def test_render_report_mods_health_marker():
+    """2026-08-27 数据健康度：快照源缺失时修正行标注(缺)，区分"真实中性"与"降级0"。
+
+    背景：08-27 推送资金/情绪恒 +0.00，无从判断是快照缺失还是真中性；
+    且快照整体缺失（ts 空）时 stale 告警也不触发——双盲。标注后一眼可辨。
+    """
+    rct = _import_rct()
+    res = {
+        "score": -0.41,
+        "core": {"score": -0.42, "signals": {
+            "trend_ma20_60": -1.0, "trend_momentum_60": -0.79,
+            "volprice_quadrant": 0.2, "volprice_amihud": 0.51,
+            "vol_regime": -0.58, "vol_term": 0.2, "value_erp": 0.0,
+            "pullback_52w": -0.82, "dd60": -1.0}},
+        "mods": {"basis": 0.0, "flow": 0.0, "mood": 0.0, "news": 0.0,
+                 "chan": {"score": 0.0, "detail": "缠论:中性"},
+                 "stock": {"score": 0.0, "detail": "跳过"}},
+        "caps": {"cap": 1.0, "triggers": []},
+    }
+    dec = {"position": 0.0, "changed": False, "direction": "hold", "note": []}
+
+    # 快照整体缺失 → 三项全标(缺)
+    ctx = {"intraday": 1.7, "day_amount_ratio": 0.0, "overseas_drop": 0.0}
+    txt = rct.render_report("2026-08-27", res, ctx, dec, prev_pos=0.0)
+    for k in ("贴水+0.00(缺)", "资金+0.00(缺)", "情绪+0.00(缺)"):
+        assert k in txt, f"缺源应标注: {k}"
+
+    # 快照齐全 → 无(缺)标注（真实中性）
+    ctx_full = {"intraday": 1.7, "day_amount_ratio": 0.0, "overseas_drop": 0.0,
+                "snapshot": {"basis": {"IC": {"annual_pct": -5.0}},
+                             "flows": {"main_net_yi": -10.0},
+                             "breadth": {"down_pct": 50.0}}}
+    txt2 = rct.render_report("2026-08-27", res, ctx_full, dec, prev_pos=0.0)
+    assert "(缺)" not in txt2
+
+    # 快照停更（stale）→ 修正行不标(缺)（⚠ 整体告警行已覆盖，避免双重标注）
+    ctx_stale = {"intraday": 1.7, "day_amount_ratio": 0.0,
+                 "overseas_drop": 0.0, "snapshot_stale": True,
+                 "snapshot": {}}
+    txt3 = rct.render_report("2026-08-27", res, ctx_stale, dec, prev_pos=0.0)
+    assert "(缺)" not in txt3
