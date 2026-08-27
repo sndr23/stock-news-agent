@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import time
 from dataclasses import dataclass, field
@@ -457,6 +458,152 @@ def load_index_daily_full(symbol: str = "399006", start: str = "20220101") -> pd
         return pd.DataFrame()
     _cache_set(key, df)
     return df
+
+
+# ---------------- Tushare Pro 付费优先通道（SNA-01，2026-08-27） ----------------
+
+_TSU_PRO = None          # 进程级单例（含负缓存：验活失败后不再重试）
+_TSU_TRIED = False
+
+
+def _tushare_client():
+    """Tushare 客户端（进程级单例）。token 缺失/包未装/初始化或验活失败 → None。
+
+    调用方无条件降级免费源，永不抛错（免费源永不删除纪律）。验活用一次
+    轻量 trade_cal 查询，防过期 token 潜伏到取数时才炸。云端 token 由
+    Actions secrets 注入 TUSHARE_TOKEN（workflow 接线待 token 提供后做）。
+    """
+    global _TSU_PRO, _TSU_TRIED
+    if _TSU_TRIED:
+        return _TSU_PRO
+    _TSU_TRIED = True
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return None
+    try:
+        import tushare as ts
+        pro = ts.pro_api(token)
+        pro.query("trade_cal", exchange="SSE", limit=1)
+    except Exception as e:
+        logger.warning("Tushare 不可用（降级免费源）: %s", type(e).__name__)
+        _TSU_PRO = None
+        return None
+    _TSU_PRO = pro
+    return pro
+
+
+def _tsu_code(symbol: str) -> str:
+    """内部 6 位代码 → tushare ts_code（000/950 开头→SH 上证系，其余→SZ 深市系）。"""
+    return f"{symbol}.SH" if symbol.startswith(("000", "950")) else f"{symbol}.SZ"
+
+
+def _fetch_index_tushare(symbol: str, years: int = 12) -> Optional[pd.DataFrame]:
+    """Tushare 指数日线（SNA-01 付费优先通道）。
+
+    返回与 load_index_sina 同构：index=date, columns=[close, amount, high, low]。
+    amount 口径取 tushare vol（手）——与项目既有约定一致（新浪链 volume→amount、
+    腾讯链 amount=手，量价维度只做窗口内分位/比值，量纲无关）。三源各自
+    整段缓存（key 隔离），不跨源增量混拼。SNA-01⑤ 一致性抽查将实证两源
+    close 对齐率与 vol 比率。
+    """
+    pro = _tushare_client()
+    if pro is None:
+        return None
+    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
+    try:
+        raw = pro.index_daily(ts_code=_tsu_code(symbol), start_date=start)
+    except Exception as e:
+        logger.warning("Tushare 指数 %s 失败(%s)，降级免费源", symbol, type(e).__name__)
+        return None
+    if raw is None or raw.empty:
+        return None
+    # tushare index_daily 原生含 amount(千元) 列；按口径约定量纲列取 vol(手)，
+    # 先丢弃原生 amount，否则 rename 后列名重复 → df["amount"] 成 DataFrame → to_numeric 炸
+    df = raw.drop(columns=["amount"], errors="ignore").rename(
+        columns={"trade_date": "date", "vol": "amount"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["close"]).sort_values("date").set_index("date")
+    keep = ["close", "amount"] + [c for c in ("high", "low") if c in df.columns]
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[~df.index.duplicated(keep="last")]
+    return df[keep] if not df.empty else None
+
+
+def _fetch_stock_tushare(code: str, start: str) -> Optional[pd.DataFrame]:
+    """Tushare 个股日线（前复权，SNA-01）。pro_bar adj='qfq' 与新浪
+    stock_zh_a_daily(adjust="qfq") 口径对齐（旭创侧趋势/动量因子对复权敏感）。
+
+    返回 index=date, columns=[open, close, high, low, volume, amount]（turnover
+    新浪专有，Tushare 无对应列——旭创链路只用 close/趋势/动量，不受影响）。
+    volume 单位手、amount 单位千元（与新浪 元 不同，但个股侧无量价因子）。
+    """
+    pro = _tushare_client()
+    if pro is None:
+        return None
+    end = datetime.now().strftime("%Y%m%d")
+    try:
+        import tushare as ts
+        raw = ts.pro_bar(ts_code=_tsu_code(code), adj="qfq",
+                         start_date=start, end_date=end, api=pro)
+    except Exception as e:
+        logger.warning("Tushare 个股 %s 失败(%s)，降级新浪", code, type(e).__name__)
+        return None
+    if raw is None or raw.empty:
+        return None
+    df = raw.rename(columns={"trade_date": "date", "vol": "volume"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["close"]).sort_values("date").set_index("date")
+    keep = [c for c in ("open", "close", "high", "low", "volume", "amount")
+            if c in df.columns]
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[~df.index.duplicated(keep="last")]
+    return df[keep] if not df.empty else None
+
+
+def _fresh_by_last_bar(cached: pd.DataFrame, max_lag_days: int = 1) -> bool:
+    """缓存新鲜度按末根 bar 日期判定（与 load_index_sina 2026-08-25 修复同口径）：
+    末根不早于"昨天"即新鲜。Tushare 盘中只返回 ≤昨日完整收盘，天然满足。"""
+    if cached is None or cached.empty:
+        return False
+    last_bar = pd.Timestamp(cached.index.max()).date()
+    return last_bar >= datetime.now().date() - timedelta(days=max_lag_days)
+
+
+def load_index_primary(symbol: str = "399006", datalen: int = 3000) -> pd.DataFrame:
+    """指数日线全量优先链（SNA-01）：Tushare（token 配置时）→ 新浪全量 → 东财短链。
+
+    三源整段返回、独立缓存 key（index_tsu_/index_sina_full_/index_full_），
+    绝不跨源增量混拼——防单位口径跳变污染量价分位窗口。任一源失败静默
+    降级，永不抛错（缺一维缩一维，永不无信号）。
+    """
+    if _tushare_client() is not None:
+        key = f"index_tsu_{symbol}"
+        cached = _cache_get(key)   # 永久缓存，新鲜度由末根 bar 判定
+        if cached is not None and not cached.empty and _fresh_by_last_bar(cached):
+            return cached
+        df = _fetch_index_tushare(symbol, years=max(3, datalen // 220))
+        if df is not None and not df.empty:
+            _cache_set(key, df)
+            return df
+        logger.warning("Tushare 指数通道失效，%s 降级新浪链", symbol)
+    return load_index_sina(symbol, datalen)
+
+
+def load_stock_primary(symbol: str = "300308", start: str = "20140101") -> pd.DataFrame:
+    """个股日线优先链（SNA-01）：Tushare qfq（token 配置时）→ 新浪 → 空。"""
+    if _tushare_client() is not None:
+        key = f"stock_tsu_{symbol}"
+        cached = _cache_get(key)
+        if cached is not None and not cached.empty and _fresh_by_last_bar(cached):
+            return cached
+        df = _fetch_stock_tushare(symbol, start)
+        if df is not None and not df.empty:
+            _cache_set(key, df)
+            return df
+        logger.warning("Tushare 个股通道失效，%s 降级新浪", symbol)
+    return load_stock_sina(symbol, start)
 
 
 def load_panels(codes: List[str], start: str = "20190101",

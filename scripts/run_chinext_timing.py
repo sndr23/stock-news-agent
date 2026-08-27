@@ -39,7 +39,8 @@ from src.strategy import chan_light as ch  # noqa: E402
 from src.strategy import index_pe as ipe  # noqa: E402
 from src.strategy import news_link as nl  # noqa: E402
 from src.strategy import overseas as ovs  # noqa: E402
-from src.strategy.data import (load_index_daily_full, load_index_sina,
+from src.strategy.data import (load_index_daily_full, load_index_primary,
+                               load_index_sina, load_stock_primary,
                                load_stock_sina)  # noqa: E402
 from src.strategy.fund_data import get_quotes  # noqa: E402
 
@@ -177,7 +178,7 @@ def gather_context(df) -> dict:
     # 当日实时涨跌幅单独注入 stock_ctx，14:45 旭创当日走势才真正进入双确认。
     stock_ctx = None
     try:
-        sdf = load_stock_sina(SYMBOL_STOCK)
+        sdf = load_stock_primary(SYMBOL_STOCK)
         if sdf is not None and not sdf.empty:
             scloses_full = sdf["close"].tolist()
             sdates = [d.strftime("%Y-%m-%d") for d in sdf.index]
@@ -778,8 +779,8 @@ def main():
                     help="忽略同日去重，强制推送（手动复验用，如周六再验一次）")
     args = ap.parse_args()
 
-    # 历史源：新浪全量（12年，绕代理）优先，东财增量链回退
-    df = load_index_sina(SYMBOL)
+    # 历史源：SNA-01 优先链 Tushare(token配置时)→新浪全量(12年，绕代理)→东财增量回退
+    df = load_index_primary(SYMBOL)
     if df is None or df.empty:
         df = load_index_daily_full(SYMBOL, "20200101")
     if df is None or df.empty:

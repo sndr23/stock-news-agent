@@ -623,6 +623,7 @@ def test_gather_context_drops_intraday_partial(monkeypatch):
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
     monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
     monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
+    monkeypatch.setattr(rct, "load_stock_primary", lambda *a, **k: None)
     monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
 
     # 情形 A：末根为当日（partial）→ 剔除后最后一根应为 08-21（周五）

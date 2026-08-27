@@ -54,9 +54,11 @@ def _patch_all(monkeypatch, push_ok: bool = True):
     """把 main() 依赖的 数据层/推送/状态 全部替换为可控替身。"""
     monkeypatch.setattr(rct, "datetime", _FakeDT)
     monkeypatch.setattr(rct, "load_index_sina", lambda *a, **k: _make_df())
+    monkeypatch.setattr(rct, "load_index_primary", lambda *a, **k: _make_df())
     monkeypatch.setattr(rct, "load_index_daily_full", lambda *a, **k: _make_df())
     monkeypatch.setattr(rct, "get_quotes", lambda *a, **k: {})
     monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
+    monkeypatch.setattr(rct, "load_stock_primary", lambda *a, **k: None)
     monkeypatch.setattr(rct.nl, "load_factor_state", lambda: {})
     monkeypatch.setattr(rct.nl, "load_citic_pos_state", lambda: {})
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})

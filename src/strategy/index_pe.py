@@ -19,6 +19,8 @@ import logging
 from pathlib import Path
 from typing import Optional, Sequence, Dict
 
+import pandas as pd
+
 logger = logging.getLogger("index_pe")
 
 PE_CACHE_RELPATH = "strategy_cache/cy50_pe_cache.json"
@@ -60,6 +62,41 @@ def align_pe_by_dates(pe_map: Dict[str, float], dates: Sequence[str]) -> list:
     return out
 
 
+def _fetch_pe_tushare() -> Dict[str, float]:
+    """Tushare 创业板50 PE（SNA-01 备份通道，2026-08-27）。
+
+    仅当乐咕失败且本地缓存缺失时兜底——不作主源：index_dailybasic 的 pe 为
+    整体法口径，与乐咕"滚动市盈率TTM"存在系统性偏差；估值滤波用 500 日
+    滚动分位（对常数倍率不变），但口径切换仍可能移位分位，主源保持乐咕
+    以稳定回测口径（SNA-01 验收⑤ 将实证两源比率后评估是否转正）。
+    日期键统一 YYYY-MM-DD（tushare 原生 YYYYMMDD，不转换则永不 align）。
+    """
+    try:
+        from src.strategy.data import _tushare_client
+    except ImportError:
+        return {}
+    pro = _tushare_client()
+    if pro is None:
+        return {}
+    try:
+        raw = pro.index_dailybasic(ts_code="399673.SZ", fields="trade_date,pe")
+    except Exception as e:
+        logger.warning("Tushare 创业板50 PE 失败: %s", type(e).__name__)
+        return {}
+    if raw is None or raw.empty:
+        return {}
+    rows: Dict[str, float] = {}
+    for _, r in raw.iterrows():
+        try:
+            pe = float(r.get("pe"))
+            date = pd.Timestamp(str(r["trade_date"])).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        if pe > 0:
+            rows[date] = round(pe, 3)
+    return rows
+
+
 def load_cy50_pe(cache_dir: Optional[Path] = None) -> Dict[str, float]:
     """拉取创业板50 TTM 滚动市盈率历史，带本地缓存。返回 {date_str: pe}。"""
     cache = (cache_dir or Path("data")) / PE_CACHE_RELPATH
@@ -96,6 +133,9 @@ def load_cy50_pe(cache_dir: Optional[Path] = None) -> Dict[str, float]:
     except Exception as e:
         logger.warning("PE 解析失败（估值降级为0）: %s", type(e).__name__)
         return {}
+    if not rows:
+        # SNA-01 备份链：乐咕失败 → Tushare（token 配置时）兜底，仍失败才降级 value=0
+        rows = _fetch_pe_tushare()
     if not rows:
         logger.warning("PE 序列为空（估值降级为0）")
         return {}
