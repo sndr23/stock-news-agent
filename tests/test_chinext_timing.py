@@ -450,6 +450,80 @@ def test_update_shadow_history_accepts_res_top_level():
     assert h["sox"] == -0.04           # 外盘实值
 
 
+def test_update_shadow_history_audit_fields():
+    """2026-08-27 审计扩展：commit 溯源/仓位轨迹/盘中涨幅/风控状态/缠论结构/分维归因。
+
+    背景：08-27 实证——综合分 -0.41 空仓但盘中 +1.7%，回撤规则显示新旧版本不一致
+    （远端未部署），事后想验证"低分+盘中大涨后 N 日表现"却缺字段。补齐后
+    shadow_history 可直接回答信号审计四问，不另起口径。
+    """
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import update_shadow_history as ush
+
+    res = {"core": {"score": -0.42, "signals": {
+                "trend_ma20_60": -1.0, "volprice_quadrant": 0.2,
+                "vol_regime": -0.58, "pullback_52w": -0.82, "dd60": -1.0}},
+           "mods": {"basis": -0.04, "flow": 0.0, "mood": 0.0, "news": 0.03,
+                    "chan": {"score": -0.04, "bustop": True, "last_signal": "B2"},
+                    "stock": {"score": 0.0}},
+           "score": -0.41,
+           "caps": {"cap": 0.6, "triggers": ["距60日高点回撤-21.9%封顶6成"]}}
+    ctx = {"closes": [100.0, 101.0], "dates": ["2026-08-26", "2026-08-27"],
+           "overseas_drop": 0.0, "intraday": 1.7}
+    state = {"history": []}
+    ush(state, ctx, "2026-08-27", res["score"], res, 0.0, 0.0)
+    h = state["history"][-1]
+    assert h["commit"], "commit 溯源字段非空（git 或 unknown 兜底）"
+    assert h["prev_pos"] == 0.0 and h["position"] == 0.0
+    assert h["intraday_pct"] == 1.7
+    assert h["cap"] == 0.6
+    assert h["cap_triggers"] == ["距60日高点回撤-21.9%封顶6成"]
+    assert h["chan_bustop"] is True
+    assert h["chan_last_signal"] == "B2"
+    assert h["sig"]["dd60"] == -1.0 and h["sig"]["trend_ma20_60"] == -1.0
+
+    # 旧签名（6 参）兼容：prev_pos 缺省 None 不抛错
+    state2 = {"history": []}
+    ush(state2, ctx, "2026-08-27", res["score"], res, 0.0)
+    assert state2["history"][-1]["prev_pos"] is None
+
+
+def test_shadow_probes_recorded():
+    """P3 影子探针：rebound/low_repair 只记录不改仓位，条件边界正确。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import _shadow_probes
+
+    # 深回撤序列：60 日高点 100 → 现价 78（dd=-22%）
+    closes = ([100.0] * 55) + [90.0, 85.0, 80.0, 79.0, 78.0]
+    res_vp_pos = {"core": {"signals": {"volprice_quadrant": 0.5}},
+                  "mods": {"chan": {"bustop": False}}}
+    ctx = {"closes": closes, "intraday": 1.7}
+    p = _shadow_probes(ctx, res_vp_pos)
+    assert p["deep_dd"] is True
+    # closes[-5:] = [90,85,80,79,78] 均值 82.4 > 现价 78 → 价在5日线下方，非低位修复
+    assert p["low_repair"] is False
+    # rebound：深回撤+盘中1.7%+量价正+无顶背驰 → True
+    assert p["rebound"] is True
+
+    # 顶背驰在场 → rebound 熄火（风控优先，与 P1 修复同语义）
+    res_bustop = {"core": {"signals": {"volprice_quadrant": 0.5}},
+                  "mods": {"chan": {"bustop": True}}}
+    assert _shadow_probes(ctx, res_bustop)["rebound"] is False
+
+    # 无深回撤 → 两探针全 False（条件前置不满足）
+    ctx_up = {"closes": [100.0 + i for i in range(60)], "intraday": 1.7}
+    p2 = _shadow_probes(ctx_up, res_vp_pos)
+    assert p2["deep_dd"] is False and p2["rebound"] is False and p2["low_repair"] is False
+
+
 def test_shadow_raw_captures_main_net_yi():
     """回归：_shadow_raw 必须读取快照键 main_net_yi（曾误读 main_net 致资金流原始值恒 None，
     资金维原始 IC 验门静默失效）；缺源一律置 None 且键恒存在（与"缺源降级0"解耦）。"""

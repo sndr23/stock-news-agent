@@ -387,12 +387,15 @@ def score_all(ctx: dict) -> dict:
 # ---------------- 影子验证记录 ----------------
 
 def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
-                          mods: dict, position: float) -> None:
+                          mods: dict, position: float,
+                          prev_pos: float = None) -> None:
     """补填历史多期前瞻 + 追加今日记录（各维分数 vs 1/3/5/10日前瞻 → 后续算 IC）。
 
     前瞻字段推进（字段存的是 index 偏移，计算时统一换算）：
       fwd3_off / fwd5_off / fwd10_off = 距完成记录日的交易日数，
       当前值 None=该期尚未来临；shadow_ic 据此换算实际前瞻收益。
+    prev_pos（2026-08-27 审计扩展）：决策前仓位，与 position 组成仓位轨迹；
+    缺省 None 不影响旧调用（兼容测试旧签名）。
     """
     # 兼容两种入参：res 顶层（main() 传入）或 res["mods"]：basis/flow/mood/news/chan/stock
     # 在 mods 子字典，core 在 res 顶层（score_all 返回 res={core,mods,score,caps}）。
@@ -400,10 +403,14 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
     # 且 stock/chan 取顶层恒 None → 恒 0（假数据）。统一解构修复。
     res = mods  # main 传入的是 res（score_all 的完整返回）
     m = res.get("mods") or res
-    core_s = (res.get("core") or m.get("core") or {}).get("score", 0.0)
+    core_d = res.get("core") or m.get("core") or {}
+    core_s = core_d.get("score", 0.0)
+    sig_all = core_d.get("signals") or {}
+    caps_d = res.get("caps") or m.get("caps") or {}
+    chan_d_dict = m.get("chan") or {}
     ovs_drop = ctx.get("overseas_drop") or 0.0
     stock_d = (m.get("stock") or {}).get("score", 0.0)
-    chan_d = (m.get("chan") or {}).get("score", 0.0)
+    chan_d = chan_d_dict.get("score", 0.0)
     hist = state.setdefault("history", [])
     closes, dates = ctx["closes"], ctx["dates"]
     idx = {d: i for i, d in enumerate(dates)}
@@ -436,8 +443,51 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                  "r3": None, "r5": None, "r10": None,
                  # 原始输入（验门增益：离散档分对 Spearman IC 分辨力弱，补原始量可直接做
                  # 原始 IC / 分层 IC，不依赖档位；snapshot 缺失的指标记 None）
-                 "raw": _shadow_raw(ctx)})
+                 "raw": _shadow_raw(ctx),
+                 # 审计扩展（2026-08-27）：回答"信号对不对/版本对不对/风控有没有效"——
+                 # ① commit 溯源（分清信号问题 vs 远端未部署）② prev→final 仓位轨迹
+                 # ③ 盘中涨幅（"低分但盘中大涨"后 N 日表现的提问依据）④ 风控状态与
+                 # 触发项（深回撤区空仓是保护还是错过）⑤ 缠论结构原始状态（顶背驰后
+                 # 1/3/5/10 日验证）⑥ 核心五维主信号值（分维度归因，不用只看总 core）
+                 "commit": _git_commit(), "prev_pos": prev_pos,
+                 "intraday_pct": ctx.get("intraday"),
+                 "cap": caps_d.get("cap"), "cap_triggers": caps_d.get("triggers") or [],
+                 "chan_bustop": bool(chan_d_dict.get("bustop")),
+                 "chan_last_signal": chan_d_dict.get("last_signal"),
+                 "sig": {k: sig_all.get(k) for k in
+                         ("trend_ma20_60", "volprice_quadrant", "vol_regime",
+                          "pullback_52w", "dd60")},
+                 "probe": _shadow_probes(ctx, res)})
     state["history"] = hist[-HISTORY_LIMIT:]
+
+
+def _shadow_probes(ctx: dict, res: dict) -> dict:
+    """影子规则候选探针（2026-08-27 P3）：只记录，不改仓位，不改分数。
+
+    三个候选规则在改真实仓位线之前必须先积累样本验证（|IC|≥0.05 且 ≥10 样本）：
+    ① rebound：深回撤区 + 盘中涨幅>1.5% + 量价主信号为正 + 无顶背驰——
+       "低分空仓但盘中大涨"的反弹确认探针（当前系统对深回撤后强反弹是否过于迟钝）。
+    ② low_repair：深回撤区 + 收盘站回5日线——把"深回撤"拆成"下跌延续 vs 低位修复"
+       两态的探针（低位修复期深回撤可能不再是看空信号）。
+    ③ bustop 否决统计由已有 chan_bustop 字段承载（顶背驰后 1/3/5/10 日 vs 非顶背驰组）。
+    布尔标记 × 已有 next_ret/r3/r5/r10 → 事后分两组对比前瞻收益即可，零侵入。
+    """
+    closes = ctx.get("closes") or []
+    intraday = float(ctx.get("intraday") or 0.0)
+    sig = ((res.get("core") or {}).get("signals") or {})
+    bustop = bool(((res.get("mods") or {}).get("chan") or {}).get("bustop"))
+    deep_dd = False
+    if len(closes) >= 60:
+        dd = closes[-1] / max(closes[-60:]) - 1.0
+        deep_dd = dd <= -0.12
+    ma5 = (sum(closes[-5:]) / 5.0) if len(closes) >= 5 else None
+    try:
+        vp = float(sig.get("volprice_quadrant") or 0.0)
+    except (TypeError, ValueError):
+        vp = 0.0
+    return {"deep_dd": deep_dd,
+            "rebound": bool(deep_dd and intraday > 1.5 and vp > 0 and not bustop),
+            "low_repair": bool(deep_dd and ma5 is not None and closes[-1] > ma5)}
 
 
 def _shadow_raw(ctx: dict) -> dict:
@@ -786,7 +836,8 @@ def main():
         if push_report(report, f"创业板仓位信号 {today[5:]}"):
             state.update({"last_date": today, "position": dec["position"],
                           "pending": dec["pending"], "last_score": res["score"]})
-            update_shadow_history(state, ctx, today, res["score"], res, dec["position"])
+            update_shadow_history(state, ctx, today, res["score"], res,
+                                  dec["position"], prev_pos)
             save_state(state)
             logger.info("已推送并写状态（仓位 %.0f）", dec["position"])
         else:
