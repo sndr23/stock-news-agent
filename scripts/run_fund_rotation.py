@@ -26,10 +26,31 @@ import pandas as pd  # noqa: E402
 from src.strategy import fund_data as fd  # noqa: E402
 from src.strategy import fund_rotation as fr  # noqa: E402
 from src.strategy import news_link as nlink  # noqa: E402
-from src.tools.push import push_report  # noqa: E402
+from src.tools.push import push_via_pushplus, push_via_wecom  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("fund_rotation")
+
+
+def push_report(content: str, title: str) -> bool:
+    """推送出口（与 run_chinext_timing.push_report 同模式：PushPlus → 企微）。
+
+    此前直接 `from src.tools.push import push_report`（该名字不存在），
+    --push 一执行必 ImportError，脚本从未成功推送过。"""
+    token = os.getenv("PUSHPLUS_TOKEN")
+    webhook = os.getenv("WECOM_WEBHOOK")
+    if token:
+        r = push_via_pushplus(token, title, content)
+        if r.get("code") == 200:
+            return True
+        logger.warning("PushPlus 失败: %s", r)
+    if webhook:
+        r = push_via_wecom(webhook, title, content)
+        if r.get("errcode") == 0:
+            return True
+        logger.warning("企业微信失败: %s", r)
+    logger.error("无可用推送后端或全部失败")
+    return False
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "fund_portfolio.json"
 
