@@ -637,3 +637,84 @@ def test_layer_ic_monotonic_and_insufficient():
     small = hist[:5]
     lay2 = ct.layer_ic(small, "raw.basis_min_ap")
     assert lay2["ok"] is False
+
+
+# ---------------- 顶背驰优先（2026-08-27）+ 报告溯源 ----------------
+
+def _import_rct():
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    import run_chinext_timing as rct
+    return rct
+
+
+def test_chan_bustop_overrides_bullish_proxies():
+    """2026-08-27 实证：顶背驰+B2+笔向上+upper 净 +0.01（买侧代理分抵消否决级）。
+
+    修复后：bustop 时买点降级观察不加分，且保底 chan 分 ≤ -0.04——
+    顶背驰是卖侧否决信号，不得被同源买侧代理拉回正值。
+    """
+    rct = _import_rct()
+    ctx = {"highs": [1.0] * 40, "lows": [0.9] * 40, "closes": [1.0] * 40}
+    fake = {"bustop": True, "last_signal": "B2", "bi_dir": "up",
+            "zone": "upper", "trend_ok": True, "divergence": "top"}
+    orig = rct.ch.chan_state
+
+    def _fake(hh, ll, cc):
+        return fake
+    rct.ch.chan_state = _fake
+    try:
+        out = rct._chan_signal(ctx)
+    finally:
+        rct.ch.chan_state = orig
+    assert out["score"] <= -0.04, "顶背驰下缠论分必须为负（否决保底）"
+    assert "降级观察" in out["detail"], "B2 应标注降级观察而非直接给买侧加分"
+    assert "顶背驰" in out["detail"]
+
+
+def test_chan_b2_without_bustop_unchanged():
+    """无顶背驰时 B2 买侧加分路径保持原状（回归保护）。"""
+    rct = _import_rct()
+    ctx = {"highs": [1.0] * 40, "lows": [0.9] * 40, "closes": [1.0] * 40}
+    fake = {"bustop": False, "last_signal": "B2", "bi_dir": "up",
+            "zone": "upper", "trend_ok": True, "divergence": "none"}
+    orig = rct.ch.chan_state
+
+    def _fake(hh, ll, cc):
+        return fake
+    rct.ch.chan_state = _fake
+    try:
+        out = rct._chan_signal(ctx)
+    finally:
+        rct.ch.chan_state = orig
+    # 0.02(B2) + 0.03(笔向上) + 0.02(upper) = +0.07
+    assert out["score"] == 0.07
+    assert "降级观察" not in out["detail"]
+
+
+def test_render_report_has_commit_and_cap_note():
+    """报告含代码版本（分清信号问题 vs 远端未部署）与非生效风控澄清行。"""
+    rct = _import_rct()
+    res = {
+        "score": -0.41,
+        "core": {"score": -0.42, "signals": {
+            "trend_ma20_60": -1.0, "trend_momentum_60": -0.79,
+            "volprice_quadrant": 0.2, "volprice_amihud": 0.51,
+            "vol_regime": -0.58, "vol_term": 0.2, "value_erp": 0.0,
+            "pullback_52w": -0.82, "dd60": -1.0}},
+        "mods": {"basis": -0.04, "flow": 0.0, "mood": 0.0, "news": 0.03,
+                 "chan": {"score": -0.04, "bustop": True, "bi_dir": "up",
+                          "zone": "upper", "last_signal": "B2",
+                          "detail": "缠论:顶背驰,B2降级观察,笔向上"},
+                 "stock": {"score": 0.0, "detail": "跳过"}},
+        "caps": {"cap": 0.3, "triggers": ["距60日高点回撤-21.9%封顶3成"]},
+    }
+    ctx = {"intraday": 1.7, "day_amount_ratio": 0.0, "overseas_drop": 0.0}
+    dec = {"position": 0.0, "changed": False, "direction": "hold", "note": []}
+    txt = rct.render_report("2026-08-27", res, ctx, dec, prev_pos=0.0)
+    assert "（代码 " in txt, "报告应携带代码版本号"
+    assert "未实际生效" in txt, "档位未越封顶线时应澄清风控非空仓主因"
+    assert "硬风控仅限上限" in txt

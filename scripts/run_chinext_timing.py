@@ -299,16 +299,25 @@ def _chan_signal(ctx: dict) -> dict:
         return {"score": 0.0, "bustop": False, "bi_dir": "-", "zone": "-",
                 "last_signal": "-", "detail": "缠论：计算失败跳过"}
     s, parts = 0.0, []
-    if cs.get("bustop"):
+    bustop = bool(cs.get("bustop"))
+    if bustop:
         s -= 0.06; parts.append("顶背驰")
     if cs.get("last_signal") in ("S1", "S2", "S3"):
         s -= 0.02; parts.append(cs["last_signal"])
     if cs.get("last_signal") in ("B1", "B2", "B3"):
-        s += 0.02; parts.append(cs["last_signal"])
+        # 顶背驰优先：买点候选降级为观察，不再贡献正分（2026-08-27 实证：
+        # 顶背驰+B2+笔向上+upper 净 +0.01——同源买侧代理分抵消否决级 -0.06）
+        if bustop:
+            parts.append(f"{cs['last_signal']}降级观察")
+        else:
+            s += 0.02; parts.append(cs["last_signal"])
     if cs.get("trend_ok"):
         s += 0.03; parts.append("笔向上")
     if cs.get("zone") == "upper":
         s += 0.02
+    if bustop:
+        # 否决保底：买侧代理分（笔向上/upper）不得把顶背驰拉回正值
+        s = min(s, -0.04)
     return {"score": round(ct.clamp(s, -0.08, 0.08), 3),
             "bustop": bool(cs.get("bustop")), "bi_dir": cs.get("bi_dir", "-"),
             "zone": cs.get("zone", "-"), "last_signal": cs.get("last_signal", "-"),
@@ -478,6 +487,18 @@ def _shadow_raw(ctx: dict) -> dict:
 
 # ---------------- 报告 ----------------
 
+def _git_commit() -> str:
+    """当前代码版本（推送报告溯源：分清"信号问题"还是"远端未部署"）。"""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5,
+                             cwd=str(PROJECT_ROOT))
+        return (out.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) -> str:
     core, caps = res["core"], res["caps"]
     mods = res["mods"]
@@ -533,6 +554,12 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
         lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子用昨日完整量）")
     if caps["triggers"]:
         lines.append("■ 硬风控：" + "；".join(caps["triggers"]))
+        # 澄清主因：档位基准未越封顶线时，硬风控只是背景约束而非空仓/降档主因
+        # （2026-08-27 实证：综合分 -0.41 已低于空仓线，回撤封顶 3 成未被触发执行，
+        # 但并排展示易被误读为"空仓是风控逼的"）
+        if tier_target <= float(caps.get("cap") or 1.0):
+            lines.append(f"  （注：本次仓位由综合分 {res['score']:+.2f} 对档位线决定，"
+                         f"硬风控仅限上限未实际生效）")
     else:
         lines.append("■ 硬风控：无触发")
     if ctx.get("snapshot_stale"):
@@ -542,7 +569,8 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
         lines.append("■ " + "；".join(dec["note"]))
     lines.append("")
     lines.append("档位线：≥+0.40满仓｜≥-0.15九成｜≥-0.30战略六成底仓｜更低空仓")
-    lines.append("升档需连续2日确认，降档当日生效；15:00 前下单有效。仅供参考。")
+    lines.append(f"升档需连续2日确认，降档当日生效；15:00 前下单有效。仅供参考。"
+                 f"（代码 {_git_commit()}）")
     return "\n".join(lines)
 
 
