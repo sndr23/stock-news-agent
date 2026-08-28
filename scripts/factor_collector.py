@@ -55,7 +55,7 @@ load_dotenv(PROJECT_ROOT / ".ENV")
 
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试，复用现有出口）
 from src.strategy.data_freshness import BJT, is_recent_data_date
-from src.strategy.state_io import atomic_write_json, get_gist_config
+from src.strategy.state_io import atomic_write_json, get_gist_config, patch_gist_file
 from src.strategy.data_freshness import _is_workday
 
 logger = logging.getLogger("factor_collector")
@@ -2149,27 +2149,16 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
 
 
 def _gist_save_factor(token: str, gist_id: str, state: dict) -> None:
-    """写回 Gist factor_state.json（整文件原子替换）"""
-    url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "stock-news-agent-factor",
-    }
-    payload = {"files": {FACTOR_STATE_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}}
-    last_error = None
-    for attempt in range(3):
-        try:
-            resp = requests.patch(url, json=payload, headers=headers, timeout=20)
-            resp.raise_for_status()
-            return
-        except Exception as e:
-            last_error = e
-            if attempt < 2:
-                # 指数退避（2s/4s）：短时 rate limit 窗口可被重试跨过
-                logger.warning(f"Gist 写入第{attempt + 1}次失败: {e}, {2 ** (attempt + 1)}s 后重试")
-                time.sleep(2 ** (attempt + 1))
-    raise RuntimeError(f"Gist factor_state.json 写入失败（已重试2次）: {last_error}")
+    """写回 Gist factor_state.json（ETag 乐观锁，防并发写-写覆盖）。
+
+    2026-08-29 P0-2：改用 state_io.patch_gist_file——先 GET 取 ETag，
+    PATCH 带 If-Match；冲突（412）则放弃写入并报错，不覆盖其他写端的更新。
+    """
+    patch_gist_file(
+        FACTOR_STATE_FILENAME,
+        json.dumps(state, ensure_ascii=False, indent=2),
+        token, gist_id,
+    )
 
 
 def _load_state() -> dict:

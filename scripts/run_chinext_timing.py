@@ -46,7 +46,8 @@ from src.strategy.data import (load_index_daily_full, load_index_sina,
                                load_stock_sina)  # noqa: E402
 from src.strategy.fund_data import get_quotes  # noqa: E402
 from src.strategy.data_freshness import BJT, _is_workday  # noqa: E402
-from src.strategy.state_io import atomic_write_json, get_gist_config  # noqa: E402
+from src.strategy.state_io import (atomic_write_json, get_gist_config,  # noqa: E402
+                                   patch_gist_file)
 
 TIMING_STATE_FILENAME = "chinext_timing_state.json"
 _LOCAL_STATE_PATH = PROJECT_ROOT / "logs" / TIMING_STATE_FILENAME
@@ -111,25 +112,20 @@ def save_state(state: dict) -> bool:
         return False
     if not (token and gist_id):
         return True  # 本地已写，无 Gist 配置（本地模式）
-    import requests
-    url = f"https://api.github.com/gists/{gist_id}"
-    headers = {"Authorization": f"token {token}",
-               "Accept": "application/vnd.github+json",
-               "User-Agent": "stock-news-agent-chinext-timing"}
-    payload = {"files": {TIMING_STATE_FILENAME: {
-        "content": json.dumps(state, ensure_ascii=False, indent=1)}}}
-    import time
-    for attempt in range(3):
-        try:
-            resp = requests.patch(url, json=payload, headers=headers, timeout=20)
-            resp.raise_for_status()
-            return True
-        except Exception as e:
-            if attempt == 2:
-                logger.warning("Gist 状态写入失败（本地已保底）: %s", e)
-            else:
-                time.sleep(2 ** (attempt + 1))
-    return False
+    # 2026-08-29 P0-2：ETag 乐观锁写入（先 GET 取 ETag，PATCH 带 If-Match）；
+    # 冲突 412 → 放弃写入，不覆盖其他写端更新。择时为 14:45 单写端，
+    # 但影子 history 是长期累积资产，仍需防并发覆盖。
+    try:
+        patch_gist_file(
+            TIMING_STATE_FILENAME,
+            json.dumps(state, ensure_ascii=False, indent=1),
+            token, gist_id,
+        )
+        return True
+    except Exception as e:
+        # 本地已保底写入，云端失败不阻断本次运行（保持原降级语义）
+        logger.warning("Gist 状态写入失败（本地已保底）: %s", e)
+        return False
 
 
 # ---------------- 数据聚合 ----------------

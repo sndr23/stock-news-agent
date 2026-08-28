@@ -117,7 +117,7 @@ from src.tools.calculators import (
     _has_tech_keyword,                # 科技硬件词匹配（词边界感知，大额经营事件直通用）
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
-from src.strategy.state_io import atomic_write_json, get_gist_config
+from src.strategy.state_io import atomic_write_json, get_gist_config, patch_gist_file
 from src.strategy.data_freshness import _is_workday
 # LLM 调用与 JSON 修复（2026-08-06 起从共享模块导入，不再依赖废弃的批处理管线 nodes.py）
 from src.llm_client import _call_llm_api, _repair_json
@@ -1230,35 +1230,18 @@ def _gist_load(token: str, gist_id: str) -> dict:
 
 
 def _gist_save(token: str, gist_id: str, state: dict) -> None:
-    """将状态写回 Gist（整文件原子替换，配合 workflow concurrency 防并发）"""
-    import requests
-    # 与读取一致追加时间戳参数，避免命中 CDN 缓存返回旧元数据
-    url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "stock-news-agent-realtime",
-    }
-    payload = {
-        "files": {
-            GIST_STATE_FILENAME: {
-                "content": json.dumps(state, ensure_ascii=False, indent=2),
-            }
-        }
-    }
-    # 瞬时网络错误重试（失败会导致已推送标记未落盘 → 下轮重复推送）
-    last_error = None
-    for attempt in range(3):
-        try:
-            resp = requests.patch(url, json=payload, headers=headers, timeout=20)
-            resp.raise_for_status()
-            return
-        except Exception as e:
-            last_error = e
-            if attempt < 2:
-                logger.warning(f"Gist 写入第{attempt + 1}次失败: {e}, 1s 后重试")
-                time.sleep(1)
-    raise RuntimeError(f"Gist 状态写入失败（已重试2次）: {last_error}")
+    """将状态写回 Gist（ETag 乐观锁，防并发写-写覆盖）。
+
+    2026-08-29 P0-2：改用 state_io.patch_gist_file——先 GET 取 ETag，
+    PATCH 时带 If-Match；若期间被其他写端更新过（412）则放弃写入并报错，
+    宁可本轮状态未落盘，也不覆盖他人更新（2026-08-13 曾因此冲掉 4759 条去重记录）。
+    只提交 real_time_state.json 单文件，不整包回写，避免波及其他状态文件。
+    """
+    patch_gist_file(
+        GIST_STATE_FILENAME,
+        json.dumps(state, ensure_ascii=False, indent=2),
+        token, gist_id,
+    )
 
 
 def load_state() -> dict:
