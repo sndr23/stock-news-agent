@@ -13,7 +13,12 @@
 - 严格回测（v5.1 d日快照 + T.35/P.25）：策略累计 **+156.0%**，年化 **+8.1%**，夏普 **0.60**，最大回撤 **-42.5%**，卡玛 0.19；买入持有 +170.1%/-69.7%；平均仓位 40%，换仓 352 次。
 - 官方 walk-forward OOS（v5.1 d日快照 + T.35/P.25）：复合累计 **+89.5%**，年化 +7.4%，夏普 0.54，最大回撤 **-27.0%**，卡玛 0.27；买入持有 +111.2%/-57.0%；卡玛差距 -0.08 过拟合检测通过。
 - **关键发现（口径×权重耦合，ND-004 依据）**：d 日快照已含当日涨跌，趋势因子时效性已够，T.50 提权反而追当日涨跌（OOS +83.8%）；落袋（反向离场）在快照口径下更有价值，T.35/P.25 OOS +96.8%（固定参数）/官方口径 +89.5%。趋势 ≤0.45 全区间优于 0.50。训练段动态寻优跨折漂移（+74.6%），劣于固定权重。详见 `docs/策略缺陷实验报告_20260828.md` 第七章。
-- 测试门禁：本轮最终结果为 `1094 passed, 21 deselected`，执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
+- 测试门禁：本轮最终结果为 **1097 passed, 21 deselected**（新增 3 个 ETag 乐观锁用例），执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
+- **生产级审查 P0 批次（2026-08-29 凌晨）**：
+  - **P0-0 生产可用性（严重缺陷已修）**：`src/strategy/data_freshness.py`、`src/strategy/state_io.py` 此前**从未提交且未被 .gitignore 排除**，而 `data.py`/`index_pe.py`/`overseas.py`/`news_link.py`/`factor_collector.py` 均依赖二者——任何 git clone 环境（含 CI）都会 ImportError。已补提交（commit `fc9ee7c`）+ 10 个新增测试 + 3 篇文档。
+  - **P0-1 技术债已清理**：原 56 文件未提交（+4680/-1495）+ 48 未跟踪 → 已拆为 5 个语义 commit（`fc9ee7c` 生产可用性 / `b2490b2` 择时 v5.1 / `d742742` 数据源加固 / `bac8493` 测试 / `87c4842` 文档）。仅保留保护项未提交：`scripts/_*.py` 临时研究脚本、`_jetson_state.json`、`tmp_csindex.html`、`findings.md`、`progress.md`（其他 Agent 工作笔记）。**未 push**（待用户决定）。
+  - **P0-2 Gist 写入原子性已修**（commit `ccbe890`）：新增 `state_io.patch_gist_file()`——GET 取 ETag、PATCH 带 `If-Match`、冲突 412 则放弃写入并报错（fail-safe，绝不覆盖他人更新）、只提交目标文件不整包回写。已接入三个写端：real_time_push（30min，历史事故端）、factor_collector（15min）、run_chinext_timing（14:45）。低频端（中信 17:00、周六回测）留作收尾。
+  - **P0-3 修正层 IC 验门：脚本就绪，数据不足**。验门脚本 `scripts/_exp_modifier_ic.py` 已可用（各修正项 vs next_ret/r3/r5/r10 的 Spearman IC，门槛 |IC|≥0.05 且样本≥10）。但云端影子 history **仅 5 条**（2026-08-24~28，系统 08-22 上线以来全部交易日），`next_ret` 仅 3 条有效、`r3/r5/r10` 全部未到期 → **不作任何结论**，各修正项维持原样。约需 5 个交易日（≈09-04）达 10 条门槛后可出结论。
 - **周末日期敏感测试已修复（2026-08-29）**：`test_collect_writes_snapshot_state_not_push`、`test_stock_sina_rejects_history_that_is_short_after_partial_bar` 此前每逢周六/日必挂——`_install_collect_deps` 未 mock `_is_workday`（周末被判非交易日跳过），且个股历史用例的"末根=当日 partial"依赖 `datetime.now()`。修复：前者在 deps stub 中默认 mock 为交易日（非交易日用例自行覆盖），后者把数据层时钟固定到数据末根日期。修复后周六运行亦 `1094 passed` 全绿。
 - 工程审查（2026-08-22 第三轮）：Gist 读-改-写、config.py import 副作用、run_once 挂起条目三处均已防御到位。
 - **免费数据源口径已确认**：399006 日线、旭创日线使用新浪免费接口及既有东财/腾讯回退链；创业板50 PE 只使用乐咕免费源，失败或过期时估值维度降为 0；外盘 SOX/NDX/INX 使用新浪封装 → Yahoo Chart → Stooq CSV 的独立回退链，失败或过期时逐序列降级；不依赖任何付费源 token。
