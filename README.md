@@ -33,9 +33,9 @@
 | `src/tools/push.py` | PushPlus/企业微信/WxPusher 三后端 + 重试 | ✅ |
 | `src/llm_client.py` | LLM 调用与 JSON 容错解析（共享客户端） | ✅ 2026-08-06 抽取 |
 | `scripts/factor_collector.py` | 量化因子采集/方向合成/异动推送（P0–P12，含 IC 验证） | ✅ 生产（realtime-factor） |
-| `scripts/signal_backtest.py` | 已推事件信号质量回测（后 1/3/5 日一致性 + 分层 IC；sector 事件经 A 股实体代理映射） | ✅ 生产（signal-backtest） |
+| `scripts/signal_backtest.py` | 已推事件信号质量回测（后 1/3/5/10 日一致性 + 分层 IC；sector 事件经 A 股实体代理映射） | ✅ 生产（signal-backtest） |
 | `scripts/push_citic_futures_pos.py` | 中信期货 IF/IH/IC/IM 净持仓日报（全合约聚合口径，Gist 去重） | ✅ 生产（citic-pos-push） |
-| `scripts/run_chinext_timing.py` | **创业板仓位择时**（核心工具）：核心层10因子+缠论+旭创双确认+外盘辅助确认 → 目标仓位推送 | ✅ 生产（chinext-timing，每日14:45） |
+| `scripts/run_chinext_timing.py` | **创业板仓位择时**（核心工具）：核心层9个注册因子（8个有效）+缠论+旭创双确认+外盘辅助确认 → 目标仓位推送 | ✅ 生产（chinext-timing，每日14:45） |
 | `src/strategy/chinext_*.py` | 创业板择时系统模块（见下节） | ✅ 2026-08-22 新增 |
 | `src/strategy/fund_rotation.py` | 基金轮动辅助（独立功能） | ✅ 本地 |
 | `archive/选股策略层_20260822/` | ~~机构式多因子选股框架~~（已归档停用，见下节） | ⛔ 2026-08-22 归档 |
@@ -48,7 +48,7 @@
 
 ```
 核心层（可回测，权重100%基准）
-  趋势0.45 + 量价0.20 + 波动0.20 + 估值0.10 + 落袋0.15
+  趋势0.35 + 量价0.20 + 波动0.20 + 估值0.10 + 落袋0.15
   全部由 399006 日线计算，12 年历史可回测验证
   → 修正层（±0.30封顶）：贴水/资金/情绪/资讯 + 缠论结构 + 旭创双确认
   → 硬风控（最高优先级）：回撤/波动分位/risk_off/深贴水/盘中急跌/缠论顶背驰/外盘辅助确认
@@ -59,9 +59,16 @@
 - **外盘辅助确认**：SOX/纳指/标普隔夜急跌 + 盘中承压 → 封顶（不独立触发，避免反向押注）
 - **验门纪律**：因子进核心层必须 |IC|≥0.05 且样本≥10；已关闭估值/事件/两融/外盘打分等不达标因子
 - **入口**：`python scripts/run_chinext_timing.py --dry-run`（打印）/ `--push`（推送）/ `--backtest`（回测）
-- **回测**（生产配置，2026-08-22 纠错口径）：2014-07~2026-08 累计 **+188.8%**（持有 +171.3%），夏普 0.60，卡玛 0.22；基线（无 ERP 估值滤波）+291.9%
-- **回测审慎解读**：超额主要来自熊市低仓位（平均仓位约 52%）而非方向预测；权重/阈值均属同一样本 in-sample 寻优，存在过拟合风险，数字宜看"上限口径"
+- **严格回测**（截至 2026-08-27 的完整历史窗口，使用 d-1 最近完整收盘信息）：策略累计 **+105.3%**，年化 +6.2%，夏普 0.46，最大回撤 -42.1%；买入持有 +170.1%，最大回撤 -69.7%。平均仓位 44%，换仓 353 次。
+- **首轮 walk-forward OOS**（训练3年/测试1年，9折，测试段 2017-04-28~2026-05-18）：无成本复合累计 +64.6%，年化 +5.7%，夏普 0.41，最大回撤 -27.8%；买入持有 +111.2%，年化 +8.7%，最大回撤 -57.0%。按单次换仓成本 0.3% 重跑，OOS 复合累计降至 +19.0%，年化 +2.0%，夏普 0.20，最大回撤 -38.3%。跨折最优参数在标准/宽松档位线与 ERP 过滤组合之间漂移，**不将 OOS 选出的参数接入生产**。
+- **回测审慎解读**：严格信息集下暂无跑赢买入持有的证据。旧文档中的 +188.8%/+291.9% 属于历史宽松信息集或旧配置口径，只能作为历史对照，不能作为当前生产表现或验收基线；权重/阈值仍有同样本寻优和过拟合风险。
 - **详细说明**：见 [docs/创业板择时系统说明_20260822.md](docs/创业板择时系统说明_20260822.md)
+
+### 数据源健康度
+
+`realtime-factor.yml` 使用 `python scripts/factor_collector.py --collect` 持续更新因子快照。各最终数据维度连续失败 3 轮时发送一次免费数据源健康告警，源恢复后重新计数；普通因子异动推送仍保持关闭。`--dry-run` 只读，不写状态、不推送。
+
+外盘辅助确认使用独立免费回退链：`akshare` 新浪封装 → Yahoo Chart → Stooq CSV。SOX、NDX、标普三个序列独立校验末根新鲜度，任一源不可达、返回异常或过期时该序列为空，不使用旧值，也不阻断核心信号。Yahoo/Stooq 免费接口无 SLA，具体网络环境可能遇到限流或浏览器验证。
 
 ## 选股策略层（已归档，2026-08-22 停用）
 
@@ -73,7 +80,7 @@
 |---|---|---|
 | 08:45 | 盘前简报 | market-brief |
 | 盘中×N | 实时资讯（每30分钟） | realtime-push |
-| 盘中×N | 因子采集（盘中15分钟） | realtime-factor |
+| 盘中×N | 因子采集（盘中15分钟；GitHub schedule 14:15 兜底） | realtime-factor |
 | **14:45** | **创业板仓位信号** | **chinext-timing** |
 | 15:10 | 盘后复盘 | market-brief |
 | 17:00 | 中信持仓日报 | citic-pos-push |
@@ -91,6 +98,10 @@
 - **词边界匹配**：ST/IPO 等英文缩写词边界感知，防 STorage/nAMD 误命中（2026-08-06）
 - **红涨绿跌**：A 股惯例配色 + emoji 表达方向
 
+> 准点调度说明：realtime-factor 以 cron-job.org 为主触发，GitHub schedule 在 14:15 提供因子采集
+> 兜底；chinext-timing 继续只由 cron-job.org 在 14:45 准点触发。创业板信号不能提前 schedule，
+> 否则会先写入 `last_date`，抢跑并抑制正常的 14:45 信号；外部服务失联时需人工恢复或手动触发。
+
 ## 工程审查台账（2026-08-22 第三轮核查结论）
 
 | 项 | 结论 | 现状 |
@@ -104,7 +115,7 @@
 ## 测试
 
 ```bash
-python -m pytest tests/ -q -m "unit"   # 760+ 纯单元测试（mock，无网络，约 40s）
+python -m pytest tests/ -q -m "unit" -p no:cacheprovider   # 当前 1093 个纯单元测试（mock，无网络）
 ```
 
 CI 已接入测试门禁（`-m unit`），防止重构/依赖升级回归。
@@ -115,7 +126,7 @@ CI 已接入测试门禁（`-m unit`），防止重构/依赖升级回归。
 
 ## 环境变量
 
-见 `.ENV` 模板与部署文档：`OPENROUTER_API_KEY`（LLM 判定）、`PUSHPLUS_TOKEN`/`WECOM_WEBHOOK`（推送）、`GIST_TOKEN`/`GIST_ID`（云端状态）、`RT_PUSH_MODE`（strict/standard/loose）、`RT_ALWAYS_ON`、`RT_MAX_CANDIDATES`、`RT_POLL_SECONDS`。
+见 `.ENV` 模板与部署文档：`OPENROUTER_API_KEY`（LLM 判定）、`PUSHPLUS_TOKEN`/`WECOM_WEBHOOK`（推送）、`GIST_TOKEN`/`GIST_ID`（云端状态，必须同时配置；只配置一个会拒绝运行）、`RT_PUSH_MODE`（strict/standard/loose）、`RT_ALWAYS_ON`、`RT_MAX_CANDIDATES`、`RT_POLL_SECONDS`。
 
 ## 分析报告
 
