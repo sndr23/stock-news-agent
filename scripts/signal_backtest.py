@@ -3,7 +3,7 @@
 信号有效性回测（signal_backtest.py）—— P2-3（2026-08-19）
 ====================================================
 定位：追踪工具的"可信度基石"。用 pushed_events 历史 + 行情数据统计
-"推送方向 vs 后 1/3/5 日行情一致率"，按范围/方向/板块分组，
+"推送方向 vs 后 1/3/5/10 日行情一致率"，按范围/方向/板块分组，
 产出信号质量报告，直接指导推送阈值与 LLM prompt 调优。
 
 数据流（只读，不写任何状态）：
@@ -34,7 +34,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +46,7 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".ENV")
 
 from src.tools.push import push_via_wecom, push_via_pushplus
+from src.strategy.state_io import get_gist_config
 
 logger = logging.getLogger("signal_backtest")
 
@@ -53,7 +54,8 @@ REALTIME_STATE_FILENAME = "real_time_state.json"
 _REALTIME_STATE_PATH = PROJECT_ROOT / "logs" / "real_time_state.json"
 REPORT_PATH = PROJECT_ROOT / "logs" / "signal_quality_report.md"
 
-HORIZONS = (1, 3, 5)          # 后 N 个交易日
+BJT = timezone(timedelta(hours=8))
+HORIZONS = (1, 3, 5, 10)      # 后 N 个交易日
 MIN_GROUP_SAMPLE = 10          # 分组比率门槛
 DEFAULT_DAYS = 60              # 默认回测窗口
 MARKET_INDEX = {"name": "上证指数", "symbol": "sh000001"}
@@ -154,7 +156,8 @@ def compute_layer_ic(direction_history: dict, index_closes: list = None) -> dict
             "high_low": round(ls, 3),            # 最高档绝对收益（>0 = 高层有正收益）
             "verdict": _layer_verdict(mono, len(by_level), ls - lo),
         }
-    return {"n": n, "layers": layers, "updated": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    return {"n": n, "layers": layers,
+            "updated": datetime.now(BJT).strftime("%Y-%m-%d %H:%M")}
 
 
 def _layer_verdict(mono: float, n_levels: int, spread: float = 0.0) -> str:
@@ -192,10 +195,8 @@ def _http_get(url: str, params: dict = None, encoding: str = None) -> str:
 
 
 def _load_realtime_state() -> dict:
-    """已推事件状态：云端 Gist 优先，本地降级；失败返回 {}"""
-    state = {}
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    """已推事件状态（配置 Gist 时云端唯一来源）；失败返回 {}"""
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
         try:
             url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
@@ -207,14 +208,15 @@ def _load_realtime_state() -> dict:
             fobj = (resp.json().get("files") or {}).get(REALTIME_STATE_FILENAME)
             if fobj is not None:
                 state = json.loads(fobj.get("content") or "{}")
+                return state if isinstance(state, dict) else {}
         except Exception as e:
-            logger.warning(f"Gist 状态读取失败，降级本地: {e}")
-    if not state:
-        try:
-            state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-    return state
+            logger.warning(f"Gist 状态读取失败，回测统计降级为空: {e}")
+        return {}
+    try:
+        state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _fetch_kline(symbol: str, lmt: int = 120) -> list:
@@ -288,7 +290,8 @@ def _forward_returns(klines: list, event_date: str) -> dict:
     """事件日基准收盘价 + 后 N 日收益（%）。
 
     事件日非交易日（周末/停牌）→ 用其后第一个交易日收盘为基准。
-    返回 {"base": close, "ret_1": %, "ret_3": %, "ret_5": %}，不足 N 日者缺键。
+    返回 {"base": close, "ret_1": %, "ret_3": %, "ret_5": %, "ret_10": %}，
+    不足 N 日者缺键。
     """
     dates = [k["date"] for k in klines]
     idx = None
@@ -309,7 +312,7 @@ def _forward_returns(klines: list, event_date: str) -> dict:
 
 def backtest(events: list, days: int = DEFAULT_DAYS) -> dict:
     """对已推事件做方向一致率回测 → 聚合结果 dict"""
-    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    since = (datetime.now(BJT) - timedelta(days=days)).strftime("%Y-%m-%d")
     in_window = [e for e in events if str(e.get("t", ""))[:10] >= since]
     symbol_cache = {}
     kline_cache = {}
@@ -355,7 +358,8 @@ def backtest(events: list, days: int = DEFAULT_DAYS) -> dict:
         rec = {
             "t": t, "title": title[:40], "target": target_name, "symbol": symbol,
             "group": group, "dir": dir_raw, "sectors": [str(s) for s in (e.get("sectors") or [])][:3],
-            **{k: fr.get(k) for k in ("entry_date", "ret_1", "ret_3", "ret_5")},
+            **{k: fr.get(k) for k in
+               ("entry_date", "ret_1", "ret_3", "ret_5", "ret_10")},
         }
         for n in HORIZONS:
             ret = fr.get(f"ret_{n}")
@@ -483,14 +487,15 @@ def compute_factor_ic(direction_history: dict, index_closes: list = None) -> dic
         "n": n,
         "ic": ic,
         "weights": weights,
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "updated": datetime.now(BJT).strftime("%Y-%m-%d %H:%M"),
     }
 
 
 def compute_winrate(days: int = 30) -> dict:
     """近 N 天已推事件方向一致率（P4-1：供方向信号卡片标注可信度）
 
-    返回 {"n": 可评估条数, "hit_1": %, "hit_3": %, "hit_5": %}（不足的 horizon 为 None）；
+    返回 {"n": 可评估条数, "hit_1": %, "hit_3": %, "hit_5": %, "hit_10": %}
+    （不足的 horizon 为 None）；
     无事件/无行情 → {"n": 0}。调用方（factor_collector）对 n<10 不展示。
     """
     state = _load_realtime_state()
@@ -523,7 +528,7 @@ def _rate_line(agg: dict, label: str) -> str:
 
 
 def build_report(summary: dict) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M")
     s = summary
     lines = ["# 信号质量回测报告", f"生成时间: {now}", ""]
     lines.append(f"**样本范围**: 近 {s['window_days']} 天已推事件 {s['events_total']} 条，"
@@ -577,14 +582,14 @@ def build_report(summary: dict) -> str:
     lines.append("")
     rows = sorted(s["details"], key=lambda r: r["t"], reverse=True)[:20]
     if rows:
-        lines.append("| 时间 | 方向 | 标的 | 后1日 | 后3日 | 后5日 | 标题 |")
+        lines.append("| 时间 | 方向 | 标的 | 后1日 | 后3日 | 后5日 | 后10日 | 标题 |")
         lines.append("|---|---|---|---|---|---|---|")
         for r in rows:
             def _cell(n):
                 v = r.get(f"ret_{n}")
                 return f"{v:+.1f}%" if isinstance(v, (int, float)) else "—"
             lines.append(f"| {r['t'][5:16]} | {r['group']} | {r['target']} "
-                         f"| {_cell(1)} | {_cell(3)} | {_cell(5)} | {r['title']} |")
+                         f"| {_cell(1)} | {_cell(3)} | {_cell(5)} | {_cell(10)} | {r['title']} |")
     else:
         lines.append("- 无可评估明细")
     lines.append("")

@@ -6,7 +6,7 @@ walk-forward 样本外验证（walk_forward_validation.py）
 in-sample 寻优，本脚本做时间序列滚动切分，让训练段定参、测试段评估。
 
 切分（默认）：训练 3 年 / 测试 1 年，逐年滚动。每折：
-  1) 训练段：候选参数网格（档位线 × ERP 滤波）逐一回测，按卡玛选最优；
+  1) 训练段：候选参数网格（标准/宽松档位线 × ERP 滤波）逐一回测，按卡玛选最优；
   2) 测试段：用训练段选出的最优参数评估（含 60 日 warmup 前缀）；
   3) 记录该折测试段指标。
 
@@ -34,6 +34,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
+
+def _configure_stdout() -> None:
+    """Windows 控制台无法编码诊断符号时，替换而不是中断验证。"""
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 import pandas as pd
 
 from scripts.run_chinext_timing import backtest_metrics
@@ -45,7 +57,8 @@ TRADING_DAYS = 244
 # 候选参数网格（训练段寻优空间，务必保持小——每折跑 网格数 次回测）
 TIER_CANDIDATES = {
     "标准": ct.TIERS,                                   # (0.40,1.0),(-0.15,0.9),(-0.30,0.6)
-    "保守": ((0.35, 1.0), (-0.10, 0.9), (-0.25, 0.6)),  # 更易满仓/更早降档
+    # 该组阈值更低，实际更容易升到高仓位，命名为“宽松”避免误导。
+    "宽松": ((0.35, 1.0), (-0.10, 0.9), (-0.25, 0.6)),
 }
 ERP_CANDIDATES = (False, True)   # 是否启用"估值极贵封顶6成"
 
@@ -90,12 +103,17 @@ def split_folds(dates: pd.DatetimeIndex, train_years: int, test_years: int):
 
 def best_on_train(df: pd.DataFrame, train: tuple, pe_map, fee: float) -> tuple:
     """训练段网格寻优：返回 (最优参数名, (tiers, erp_cap), 训练段卡玛)。"""
-    dft = df.iloc[train[0]:train[1]]
+    train_start, train_end = train
+    # 保留训练段之前的历史供滚动因子 warmup；评估收益只到训练段末端。
+    dft = df.iloc[:train_end]
+    eval_start = max(60, train_start)
+    eval_end = train_end - 1
     best = None
     for tname, tiers in TIER_CANDIDATES.items():
         for erp in ERP_CANDIDATES:
             m = backtest_metrics(dft, fee=fee, pe_map=pe_map,
-                                 tiers=tiers, erp_cap=erp)
+                                 tiers=tiers, erp_cap=erp,
+                                 eval_start=eval_start, eval_end=eval_end)
             key = (tname, erp)
             if best is None or m["calmar"] > best[2]:
                 best = (key, (tiers, erp), m["calmar"])
@@ -103,18 +121,68 @@ def best_on_train(df: pd.DataFrame, train: tuple, pe_map, fee: float) -> tuple:
 
 
 def evaluate_test(df: pd.DataFrame, test: tuple, params, pe_map,
-                  fee: float) -> dict:
-    """测试段评估（含 60 日 warmup 前缀，指标从测试段起点算起）。"""
+                  fee: float, initial_prev: dict = None) -> dict:
+    """测试段评估：全历史计算因子，收益和状态从测试起点开始。"""
     tiers, erp_cap = params
-    lo = max(0, test[0] - 60)
-    dft = df.iloc[lo:test[1]]
-    m = backtest_metrics(dft, fee=fee, pe_map=pe_map,
-                         tiers=tiers, erp_cap=erp_cap)
-    # navs 从 index 60 起（即 test[0]），指标即测试段口径
-    return m
+    test_start, test_end = test
+    if initial_prev is None:
+        # 首折从空仓重放到测试段边界，避免状态机冷启动影响 OOS。
+        boundary = backtest_metrics(
+            df.iloc[:test_start + 1], fee=fee, pe_map=pe_map,
+            tiers=tiers, erp_cap=erp_cap, eval_end=test_start,
+        )
+        initial_prev = boundary["final_state"]
+    # 因子使用完整历史；收益、费用和统计严格限制在测试段。
+    return backtest_metrics(
+        df.iloc[:test_end + 1], fee=fee, pe_map=pe_map,
+        tiers=tiers, erp_cap=erp_cap, eval_start=test_start,
+        eval_end=test_end, initial_prev=initial_prev,
+    )
+
+
+def _curve_stats(returns: list) -> dict:
+    """从按时间拼接的日收益计算净值、年化、夏普和最大回撤。"""
+    nav = 1.0
+    navs = []
+    for ret in returns:
+        nav *= 1.0 + ret
+        navs.append(nav)
+    years = len(navs) / TRADING_DAYS
+    cagr = nav ** (1 / years) - 1 if years > 0 else 0.0
+    equity_curve = [1.0] + navs
+    mdd = min(v / max(equity_curve[:i + 1]) - 1.0
+              for i, v in enumerate(equity_curve)) if navs else 0.0
+    mean = sum(returns) / len(returns) if returns else 0.0
+    variance = (sum((ret - mean) ** 2 for ret in returns) /
+                max(1, len(returns) - 1)) if returns else 0.0
+    sd = variance ** 0.5
+    sharpe = mean / sd * (TRADING_DAYS ** 0.5) if sd > 0 else 0.0
+    return {"total": nav - 1.0, "cagr": cagr, "sharpe": sharpe,
+            "mdd": mdd, "navs": navs}
+
+
+def summarize_oos(rows: list) -> dict:
+    """汇总连续 OOS 测试段，避免用各折简单平均代替整体表现。"""
+    returns = [ret for row in rows for ret in row.get("daily_rets", [])]
+    bh_returns = []
+    for row in rows:
+        navs = row.get("bh_navs", [])
+        previous = 1.0
+        for nav in navs:
+            bh_returns.append(nav / previous - 1.0)
+            previous = nav
+    strategy = _curve_stats(returns)
+    benchmark = _curve_stats(bh_returns)
+    return {**strategy, "bh": benchmark["total"], "bh_cagr": benchmark["cagr"],
+            "bh_sharpe": benchmark["sharpe"], "bh_mdd": benchmark["mdd"],
+            "n_navs": len(returns), "avg_sharpe": (
+                sum(row["sharpe"] for row in rows) / len(rows) if rows else 0.0),
+            "avg_calmar": (
+                sum(row["calmar"] for row in rows) / len(rows) if rows else 0.0)}
 
 
 def main():
+    _configure_stdout()
     ap = argparse.ArgumentParser(description="walk-forward 样本外验证")
     ap.add_argument("--train-years", type=int, default=3)
     ap.add_argument("--test-years", type=int, default=1)
@@ -140,32 +208,44 @@ def main():
     print(f"walk-forward 样本外验证｜训练 {args.train_years} 年 / 测试 {args.test_years} 年"
           f"｜fee={args.fee:.3f}｜共 {len(folds)} 折\n")
     print(f"{'折':<4}{'训练区间':<24}{'测试区间':<24}{'最优参数':<20}"
-          f"{'OOS累计':>9}{'OOS夏普':>8}{'OOS回撤':>9}{'OOS卡玛':>8}")
+          f"{'OOS累计':>9}{'年化':>8}{'夏普':>7}{'回撤':>8}{'卡玛':>7}{'持有':>9}")
 
     oos_rows = []
     params_hist = []
+    running_state = None
+    previous_params = None
     for i, (train, test) in enumerate(folds, 1):
         (tname, erp), _params, train_calmar = best_on_train(
             df, train, pe_map, args.fee)
-        m = evaluate_test(df, test, _params, pe_map, args.fee)
+        params_key = (tname, bool(erp))
+        # 参数切换时旧 pending 不再属于新参数定义；实际仓位保持连续。
+        if running_state is not None and params_key != previous_params:
+            running_state = {"position": running_state.get("position", 0.0),
+                             "pending": None}
+        m = evaluate_test(df, test, _params, pe_map, args.fee,
+                          initial_prev=running_state)
         oos_rows.append(m)
-        params_hist.append(tname)
+        running_state = m["final_state"]
+        previous_params = params_key
+        params_hist.append(params_key)
         ts = df.index[train[0]].date(), df.index[train[1] - 1].date()
         es = df.index[test[0]].date(), df.index[test[1] - 1].date()
         print(f"{i:<4}{str(ts[0])+'~'+str(ts[1]):<24}{str(es[0])+'~'+str(es[1]):<24}"
               f"{tname + ('+ERP' if erp else ''):<20}"
-              f"{m['total'] * 100:>+8.1f}%{m['sharpe']:>8.2f}"
-              f"{m['mdd'] * 100:>8.1f}%{m['calmar']:>8.2f}")
+              f"{m['total'] * 100:>+8.1f}%{m['cagr'] * 100:>+7.1f}%"
+              f"{m['sharpe']:>7.2f}{m['mdd'] * 100:>7.1f}%"
+              f"{m['calmar']:>7.2f}{m['bh'] * 100:>+8.1f}%")
 
-    # 汇总诊断
-    import statistics
-    oos_tot = statistics.mean([m["total"] for m in oos_rows])
-    oos_cal = statistics.mean([m["calmar"] for m in oos_rows])
-    oos_shp = statistics.mean([m["sharpe"] for m in oos_rows])
+    # 汇总诊断：按日收益拼接连续测试段，不把各折指标简单平均当作整体表现。
+    summary = summarize_oos(oos_rows)
     stable = len(set(params_hist)) == 1
     print("\n───── 汇总诊断 ─────")
-    print(f"OOS 平均累计 {oos_tot * 100:+.1f}% ｜ OOS 平均夏普 {oos_shp:.2f} ｜ "
-          f"OOS 平均卡玛 {oos_cal:.2f}")
+    print(f"OOS 复合累计 {summary['total'] * 100:+.1f}% ｜ 年化 {summary['cagr'] * 100:+.1f}% ｜ "
+          f"夏普 {summary['sharpe']:.2f} ｜ 最大回撤 {summary['mdd']:.1%} ｜ "
+          f"卡玛 {summary['cagr'] / abs(summary['mdd']) if summary['mdd'] else 0.0:.2f}")
+    print(f"OOS 买入持有累计 {summary['bh'] * 100:+.1f}% ｜ 年化 {summary['bh_cagr'] * 100:+.1f}% ｜ "
+          f"最大回撤 {summary['bh_mdd']:.1%} ｜ 各折平均夏普 {summary['avg_sharpe']:.2f} ｜ "
+          f"各折平均卡玛 {summary['avg_calmar']:.2f}")
     if stable:
         print(f"最优参数稳定性：全部折一致（{params_hist[0]}）✓")
     else:
@@ -176,12 +256,13 @@ def main():
         m_full = backtest_metrics(df, fee=args.fee, pe_map=pe_map, erp_cap=True)
         print(f"\n全样本 in-sample 对比（默认参数+ERP）：累计 {m_full['total'] * 100:+.1f}% ｜ "
               f"夏普 {m_full['sharpe']:.2f} ｜ 卡玛 {m_full['calmar']:.2f}")
+        oos_cal = summary["cagr"] / abs(summary["mdd"]) if summary["mdd"] else 0.0
         gap = m_full["calmar"] - oos_cal
         verdict = ("⚠ 卡玛差距显著（in-sample 明显好于 OOS）——存在过拟合，"
                    "实盘预期弱于回测" if gap > 0.15 else
                    "OOS 与 in-sample 差距在可接受范围（<0.15 卡玛）")
         print(f"卡玛差距 {gap:+.2f} → {verdict}")
-    print("\n口径：训练段按卡玛选参（档位线×ERP 滤波网格），测试段独立评估；"
+    print("\n口径：训练段按卡玛选参（标准/宽松档位线×ERP 滤波网格），测试段独立评估；"
           "因子只用既往数据、吃次日收益（对齐场外基金 T+1）。")
 
 

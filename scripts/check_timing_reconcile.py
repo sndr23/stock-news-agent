@@ -23,9 +23,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import requests  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+from src.strategy.state_io import get_gist_config  # noqa: E402
 
 TIMING_STATE_FILENAME = "chinext_timing_state.json"
 _LOCAL_STATE_PATH = PROJECT_ROOT / "logs" / TIMING_STATE_FILENAME
+
+
+def _load_local_env() -> None:
+    """加载本地运行配置；已有进程环境变量优先于项目 .ENV。"""
+    load_dotenv(PROJECT_ROOT / ".ENV", override=False)
 
 
 def _read_gist(token: str, gist_id: str):
@@ -39,7 +46,10 @@ def _read_gist(token: str, gist_id: str):
     f = (data.get("files") or {}).get(TIMING_STATE_FILENAME)
     if not f:
         return {}
-    return json.loads(f.get("content") or "{}")
+    state = json.loads(f.get("content") or "{}")
+    if not isinstance(state, dict):
+        raise ValueError("Gist 状态根节点不是对象")
+    return state
 
 
 def _read_local() -> dict:
@@ -57,19 +67,37 @@ def _summary(st: dict, tag: str) -> str:
 
 
 def main():
+    _load_local_env()
     ap = argparse.ArgumentParser(description="创业板仓位信号状态对账（只读，绝不写Gist）")
-    ap.add_argument("--gist-only", action="store_true", help="只读取Gist与本地，不强制本地存在")
+    ap.add_argument("--gist-only", action="store_true", help="只读取并显示Gist状态")
     args = ap.parse_args()
 
-    token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
-    local = _read_local()
+    try:
+        token, gist_id = get_gist_config()
+    except RuntimeError as e:
+        print(f"ABORT：{e}")
+        return
     if not (token and gist_id):
+        if args.gist_only:
+            print("ABORT：--gist-only 需要配置 GIST_TOKEN/GIST_ID")
+            return
+        local = _read_local()
         print("未配置 GIST_TOKEN/GIST_ID，仅本地状态：")
         print("  " + _summary(local, "local"))
         return
 
-    gist = _read_gist(token, gist_id)
+    try:
+        gist = _read_gist(token, gist_id)
+    except Exception as e:
+        print(f"ABORT：云端状态读取失败（{type(e).__name__}）")
+        return
+    if args.gist_only:
+        print(_summary(gist, "gist "))
+        if not gist:
+            print("ABORT：Gist 无此文件，云状态缺失——需检查 chinext-timing workflow 是否成功推送过")
+        return
+
+    local = _read_local()
     print(_summary(local, "local"))
     print(_summary(gist, "gist "))
 

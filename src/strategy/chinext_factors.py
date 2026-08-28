@@ -2,7 +2,8 @@
 """
 创业板择时 · 核心层纯因子计算（chinext_factors.py）
 ====================================================
-v4 方案核心层：10 个可回测因子，全部只依赖 399006 日线（close + amount），
+v4 方案核心层：9 个注册的可回测因子，全部只依赖 399006 日线（close + amount）。
+其中 value_erp 保留为估值字段，但生产核心打分不注入 ERP，因此当前实际参与核心分数的是 8 个因子，
 纯函数、无网络、无状态，可被回测与实时打分共用同一实现（杜绝两套口径）。
 
 与打分层解耦：本模块只产出"因子值（原始刻度 + 方向归一化分）"，不决定仓位。
@@ -16,8 +17,8 @@ v4 方案核心层：10 个可回测因子，全部只依赖 399006 日线（clo
   落袋  ×2 : drawdown_pullback（52周高点接近度/落袋）, drawdown_dd60（60日回撤）
   硬风控     : defensive_state（回撤/波动分位/贴水/盘中急跌 → 仓位封顶）
 
-时空口径：t 日因子值使用 ≤t 收盘（含 t 日当日收盘/盘中快照）：
-  回测 = d 日收盘价出信号、吃 d+1 收益（收盘后决策，信息无未来泄漏）；
+时空口径：实时 t 日因子值可使用 ≤t 的盘中快照，历史回测只使用完整收盘：
+  回测 = 信号日 d 使用截至 d-1 的最近完整收盘数据、吃 d+1 收益；
   实盘 = 14:45 盘中快照替代 d 日收盘（最后一根 bar 为当日实时价）。
 绝不使用 d+1 及以后的数据，杜绝 look-ahead。所有分位用"滚动 1 年（252 交易日）"窗口。
 """
@@ -294,7 +295,7 @@ def defensive_state(close: Sequence[float], vol_pctile: Optional[float] = None,
 def core_signals(close: Sequence[float], amount: Sequence[float],
                  erp_pctile: Optional[Sequence[float]] = None,
                  vol_pctile_override: Optional[float] = None) -> dict:
-    """计算 v4 全部 10 核心因子并列名。返回 {factor_name: [score...]}。
+    """计算 v4 全部 9 个注册核心因子并列名。返回 {factor_name: [score...]}。
     因子维度权重（v4 定稿）：趋势 0.35 量价 0.20 波动 0.20 估值 0.10 落袋 0.15。"""
     return {
         "trend_ma20_60": factor_trend_ma20_60(close),
