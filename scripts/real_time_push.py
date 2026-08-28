@@ -65,6 +65,15 @@ BJT = timezone(timedelta(hours=8))
 logger = logging.getLogger("real_time_push")
 
 
+def _state_timestamp(value: str):
+    """把状态中持久化的北京时间字符串转换为 epoch 秒。"""
+    try:
+        parsed = datetime.strptime(str(value or ""), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=BJT).timestamp()
+
+
 def _as_list(v):
     """LLM 字段类型防御：字符串→单元素列表，杜绝 set()/join 拆字
 
@@ -108,6 +117,8 @@ from src.tools.calculators import (
     _has_tech_keyword,                # 科技硬件词匹配（词边界感知，大额经营事件直通用）
 )  # 多源事件签名
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试）
+from src.strategy.state_io import atomic_write_json, get_gist_config
+from src.strategy.data_freshness import _is_workday
 # LLM 调用与 JSON 修复（2026-08-06 起从共享模块导入，不再依赖废弃的批处理管线 nodes.py）
 from src.llm_client import _call_llm_api, _repair_json
 from src.tools.keyword_tables import (                      # 共享关键词表（单一事实来源）
@@ -804,9 +815,8 @@ def _market_theme_saturated(keys: set, pushed_events: list) -> bool:
     cnt = 0
     for pe in pushed_events:
         t = str(pe.get("t") or "")
-        try:
-            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
-        except Exception:
+        ts = _state_timestamp(t)
+        if ts is None:
             continue
         if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
             continue
@@ -853,9 +863,8 @@ def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     cnt = 0
     for pe in pushed_events:
         t = str(pe.get("t") or "")
-        try:
-            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
-        except Exception:
+        ts = _state_timestamp(t)
+        if ts is None:
             continue
         if now_ts - ts > TOPIC_PUSH_WINDOW_H * 3600:
             continue
@@ -1254,8 +1263,7 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
 
 def load_state() -> dict:
     """加载状态：云端优先 Gist，本地用文件"""
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
 
     if gist_token and gist_id:
         try:
@@ -1268,9 +1276,8 @@ def load_state() -> dict:
             return state
         except Exception as e:
             logger.warning(f"Gist 读取失败: {e}")
-            if _is_ci():
-                # CI 下无法读取状态 → 无法去重 → 宁可报错也不冒险重复推送
-                raise RuntimeError(f"CI 环境 Gist 读取失败，禁止无状态运行: {e}")
+            # Gist 已配置但不可读时，禁止回退旧本地状态，避免重复推送或状态回退。
+            raise RuntimeError(f"Gist 读取失败，禁止无状态运行: {e}")
 
     # 本地文件
     state_path = _state_path()
@@ -1359,8 +1366,7 @@ def _merge_state(local: dict, remote: dict) -> dict:
 
 def save_state(state: dict) -> None:
     """保存状态：云端写 Gist（读-改-写合并防并发覆盖），本地写文件"""
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
 
     _merge_failed = False
     if gist_token and gist_id:
@@ -1427,8 +1433,7 @@ def save_state(state: dict) -> None:
 
     # 无 Gist 配置 或 合并失败降级（本地模式）→ 写本地文件
     state_path = _state_path()
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(state_path, state)
     logger.info(f"状态已保存到本地文件: {state_path.name}（{len(seen)} 个指纹）")
 
 
@@ -1955,13 +1960,12 @@ def _is_tech_by_sectors(sectors) -> bool:
 
 
 def _load_factor_state() -> dict:
-    """读取 factor_collector 的完整因子状态：云端从 Gist 的 factor_state.json 读，本地读文件
+    """读取 factor_collector 的完整因子状态：配置 Gist 时云端唯一来源，否则读本地文件
 
     缺失/解析失败 → {}（联动与市场环境行均为增强功能，失败不影响资讯主流程）。
     云端未跑 factor_collector 时读不到 → 返回空 dict，保证向后兼容。
     """
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
         try:
             import requests
@@ -1974,12 +1978,15 @@ def _load_factor_state() -> dict:
             files = resp.json().get("files") or {}
             fobj = files.get("factor_state.json")
             if fobj is not None:
-                return json.loads(fobj.get("content") or "{}")
+                state = json.loads(fobj.get("content") or "{}")
+                return state if isinstance(state, dict) else {}
         except Exception as e:
-            # 联动是增强功能，读取失败降级本地，不影响资讯主流程
-            logger.debug(f"Gist 因子状态读取失败，降级本地: {e}")
+            # 联动是增强功能，读取失败降级为空，不使用本地旧状态
+            logger.debug(f"Gist 因子状态读取失败，增强联动降级为空: {e}")
+        return {}
     try:
-        return json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(_FACTOR_STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -2358,9 +2365,8 @@ def _opposite_events_note(sig: dict, cur_dir: str, pushed_events: list, hours: i
     for pe in pushed_events:
         if str(pe.get("dir") or "") not in opp:
             continue
-        try:
-            ts = datetime.strptime(str(pe.get("t") or ""), "%Y-%m-%d %H:%M:%S").timestamp()
-        except Exception:
+        ts = _state_timestamp(pe.get("t"))
+        if ts is None:
             continue
         if now_ts - ts > hours * 3600:
             continue
@@ -2407,9 +2413,8 @@ def _related_recent_note(n: dict, pushed_events: list, hours: int = 48) -> list:
                if str(e).strip()]
         if not any(k in text for k in kws):
             continue
-        try:
-            ts = datetime.strptime(str(pe.get("t") or ""), "%Y-%m-%d %H:%M:%S").timestamp()
-        except Exception:
+        ts = _state_timestamp(pe.get("t"))
+        if ts is None:
             continue
         if now_ts - ts > hours * 3600:
             continue
@@ -2588,7 +2593,8 @@ def run_once(dry_run: bool = False) -> dict:
     logger.info(f"增量检测: 新增 {len(new_items)} 条（已见 {len(news_list) - len(new_items)} 条）")
     if not new_items:
         logger.info("无新增资讯，本轮结束")
-        save_state(state)  # 触发窗口清理
+        if not dry_run:
+            save_state(state)  # 触发窗口清理
         return {"fetched": len(news_list), "new": 0, "prefiltered": 0, "pushed": 0, "skipped": 0}
 
     # 3. 规则预筛（重要度评分 或 高信号词命中）
@@ -3238,14 +3244,10 @@ def run_evening_review(dry_run: bool = False) -> dict:
     return stats
 
 
-def _is_trading_day() -> bool:
-    """A股交易日判断（RT_ALWAYS_ON=0 时启用）"""
-    try:
-        import chinese_calendar  # type: ignore
-        from datetime import date
-        return chinese_calendar.is_workday(date.today())
-    except ImportError:
-        return datetime.now(BJT).weekday() < 5
+def _is_trading_day(day=None) -> bool:
+    """A股交易日判断（RT_ALWAYS_ON=0 时启用）。"""
+    from datetime import date
+    return _is_workday(day or datetime.now(BJT).date(), "cn")
 
 
 def main():
@@ -3276,7 +3278,8 @@ def main():
     if args.loop:
         poll_seconds = _env_int("RT_POLL_SECONDS", 120)
         logger.info(f"实时推送守护进程启动，轮询间隔 {poll_seconds}s（Ctrl+C 退出）")
-        if os.getenv("GIST_TOKEN") and os.getenv("GIST_ID"):
+        gist_token, gist_id = get_gist_config()
+        if gist_token and gist_id:
             logger.warning("本地轮询与云端 GitHub Actions 共享同一 Gist 状态。"
                            "若云端定时任务也在运行，建议只保留一个运行端"
                            "（状态已做读-改-写合并，但双端同跑仍浪费 LLM 额度且偶发重复）")
