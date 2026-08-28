@@ -16,17 +16,58 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
-from typing import Optional, Sequence, Dict
+from typing import Dict, Optional, Sequence
 
 import pandas as pd
+
+from src.strategy.data_freshness import is_recent_data_date
 
 logger = logging.getLogger("index_pe")
 
 PE_CACHE_RELPATH = "strategy_cache/cy50_pe_cache.json"
 
 
-def pe_to_cheap_pctile(pe_series: Sequence[float], span: int = 500) -> list:
+def _normalize_date_key(value) -> Optional[str]:
+    """将免费源/缓存中的日期统一为可与指数日线对齐的日期键。"""
+    try:
+        date = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(date):
+        return None
+    return date.strftime("%Y-%m-%d")
+
+
+def _normalize_rows(rows: dict) -> Dict[str, float]:
+    """清理缓存或接口返回的日期键，并丢弃不可解析/非正 PE。"""
+    if not isinstance(rows, dict):
+        return {}
+    normalized = {}
+    for date, value in rows.items():
+        date_key = _normalize_date_key(date)
+        try:
+            pe = float(value)
+        except (TypeError, ValueError):
+            continue
+        if date_key and math.isfinite(pe) and pe > 0:
+            normalized[date_key] = round(pe, 3)
+    return normalized
+
+
+def _cache_is_fresh(rows: Dict[str, float], max_lag_days: int = 3) -> bool:
+    """按 PE 序列末日期判断缓存新鲜度，不能只看文件是否存在。"""
+    if not rows:
+        return False
+    try:
+        last = max(pd.Timestamp(str(d)).normalize() for d in rows)
+    except (TypeError, ValueError):
+        return False
+    return is_recent_data_date(last, max_lag_days=max_lag_days, calendar="cn")
+
+
+def pe_to_cheap_pctile(pe_series: Sequence[Optional[float]], span: int = 500) -> list:
     """滚动市盈率分期 → 便宜度分位 [0,1]。
     用当前 PE 在**过去 span 窗口**的升序分位：PE 高 → 贵（分位高）；
     返回便宜度 cheap = 1 - 分位（cheap 高=便宜→看多，低=贵→看空）。
@@ -34,11 +75,21 @@ def pe_to_cheap_pctile(pe_series: Sequence[float], span: int = 500) -> list:
     out = [0.5] * len(pe_series)
     for i in range(1, len(pe_series)):
         lo = max(0, i - span)
-        w = sorted(float(v) for v in pe_series[lo:i] if v == v)  # 去 NaN
+        w = []
+        for value in pe_series[lo:i]:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value == value and value > 0:  # 缺失值/非有效 PE 不进入分位
+                w.append(value)
         if not w:
             continue
-        cur = pe_series[i]
-        if not cur == cur:  # NaN
+        try:
+            cur = float(pe_series[i])
+        except (TypeError, ValueError):
+            continue
+        if not cur == cur or cur <= 0:  # 缺失值/非有效 PE 保持中性
             continue
         if cur >= w[-1]:
             out[i] = 1.0
@@ -62,56 +113,24 @@ def align_pe_by_dates(pe_map: Dict[str, float], dates: Sequence[str]) -> list:
     return out
 
 
-def _fetch_pe_tushare() -> Dict[str, float]:
-    """Tushare 创业板50 PE（SNA-01 备份通道，2026-08-27）。
-
-    仅当乐咕失败且本地缓存缺失时兜底——不作主源：index_dailybasic 的 pe 为
-    整体法口径，与乐咕"滚动市盈率TTM"存在系统性偏差；估值滤波用 500 日
-    滚动分位（对常数倍率不变），但口径切换仍可能移位分位，主源保持乐咕
-    以稳定回测口径（SNA-01 验收⑤ 将实证两源比率后评估是否转正）。
-    日期键统一 YYYY-MM-DD（tushare 原生 YYYYMMDD，不转换则永不 align）。
-    """
-    try:
-        from src.strategy.data import _tushare_client
-    except ImportError:
-        return {}
-    pro = _tushare_client()
-    if pro is None:
-        return {}
-    try:
-        raw = pro.index_dailybasic(ts_code="399673.SZ", fields="trade_date,pe")
-    except Exception as e:
-        logger.warning("Tushare 创业板50 PE 失败: %s", type(e).__name__)
-        return {}
-    if raw is None or raw.empty:
-        return {}
-    rows: Dict[str, float] = {}
-    for _, r in raw.iterrows():
-        try:
-            pe = float(r.get("pe"))
-            date = pd.Timestamp(str(r["trade_date"])).strftime("%Y-%m-%d")
-        except (TypeError, ValueError):
-            continue
-        if pe > 0:
-            rows[date] = round(pe, 3)
-    return rows
-
-
 def load_cy50_pe(cache_dir: Optional[Path] = None) -> Dict[str, float]:
     """拉取创业板50 TTM 滚动市盈率历史，带本地缓存。返回 {date_str: pe}。"""
     cache = (cache_dir or Path("data")) / PE_CACHE_RELPATH
     if cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
-            if data.get("rows"):
-                logger.info("估值缓存命中 %d 条", len(data["rows"]))
-                return data["rows"]
+            rows = _normalize_rows(data.get("rows") if isinstance(data, dict) else {})
+            if _cache_is_fresh(rows):
+                logger.info("估值缓存命中 %d 条", len(rows))
+                return rows
+            if rows:
+                logger.info("估值缓存末根已过期，重新拉取免费源")
         except (OSError, ValueError) as e:
             logger.warning("估值缓存损坏，重拉: %s", type(e).__name__)
     try:
         import akshare as ak
     except ImportError:
-        logger.warning("akshare 不可用，估值源缺失（降级 value=0）")
+        logger.warning("akshare 不可用，估值降级为0")
         return {}
     try:
         sdf = ak.stock_index_pe_lg(symbol="创业板50")
@@ -121,23 +140,34 @@ def load_cy50_pe(cache_dir: Optional[Path] = None) -> Dict[str, float]:
         return {}
     rows = {}
     try:
+        if sdf is None or sdf.empty:
+            logger.warning("PE 序列为空（估值降级为0）")
+            return {}
+        date_col = next((c for c in ("日期", "date", "Date", "datetime")
+                         if c in sdf.columns), None)
+        pe_col = next((c for c in ("滚动市盈率", "ttmPe", "ttm_pe", "ttmpe",
+                                   "pe_ttm", "PE-TTM", "pe")
+                       if c in sdf.columns), None)
+        if date_col is None or pe_col is None:
+            logger.warning("PE 字段缺失（估值降级为0）")
+            return {}
         for _, r in sdf.iterrows():
-            date = str(r["日期"])
-            pe = r.get("滚动市盈率")
+            date = _normalize_date_key(r[date_col])
+            pe = r.get(pe_col)
             try:
                 pe = float(pe)
             except (TypeError, ValueError):
                 continue
-            if pe > 0:
+            if date and math.isfinite(pe) and pe > 0:
                 rows[date] = round(pe, 3)
     except Exception as e:
         logger.warning("PE 解析失败（估值降级为0）: %s", type(e).__name__)
         return {}
     if not rows:
-        # SNA-01 备份链：乐咕失败 → Tushare（token 配置时）兜底，仍失败才降级 value=0
-        rows = _fetch_pe_tushare()
-    if not rows:
         logger.warning("PE 序列为空（估值降级为0）")
+        return {}
+    if not _cache_is_fresh(rows):
+        logger.warning("创业板50 PE 免费源返回末日已过期（估值降级为0）")
         return {}
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)

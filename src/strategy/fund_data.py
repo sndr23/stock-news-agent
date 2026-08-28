@@ -77,13 +77,19 @@ def get_holdings(fund_code: str, top: int = 10) -> list:
 
 def secid_to_tencent(secid: str) -> str:
     """东财 secid(1.600519/0.000858/116.00700) -> 腾讯代码(sh/sz/hk)。"""
-    market, code = secid.split(".")
-    return {"1": "sh", "0": "sz", "116": "hk"}.get(market, "") + code
+    parts = str(secid or "").split(".")
+    if len(parts) != 2 or not parts[1].strip():
+        return ""
+    market, code = parts
+    prefix = {"1": "sh", "0": "sz", "116": "hk"}.get(market)
+    return (prefix or "") + code if prefix else ""
 
 
 def get_quotes(secids: list, retry: int = 3) -> dict:
     """腾讯 qt.gtimg.cn 批量实时涨跌幅。返回 {证券代码: 涨跌幅%}。"""
     symbols = [s for s in map(secid_to_tencent, secids) if s]
+    if not symbols:
+        return {}
     url = "https://qt.gtimg.cn/q=" + ",".join(symbols)
     for attempt in range(retry):
         try:
@@ -117,30 +123,50 @@ def load_holdings_cached(fund_codes: list, top: int = 10) -> dict:
     cache = {}
     if HOLDINGS_CACHE_PATH.exists():
         try:
-            cache = json.loads(HOLDINGS_CACHE_PATH.read_text(encoding="utf-8"))
+            loaded = json.loads(HOLDINGS_CACHE_PATH.read_text(encoding="utf-8"))
+            cache = loaded if isinstance(loaded, dict) else {}
         except (OSError, ValueError):
             cache = {}
-    fresh = {"_ts": time.time(), "funds": {}}
+    cached_funds = cache.get("funds")
+    if not isinstance(cached_funds, dict):
+        cached_funds = {}
+    try:
+        cache_ts = float(cache.get("_ts") or 0)
+    except (TypeError, ValueError):
+        cache_ts = 0.0
+    now = time.time()
+    fresh = {"_ts": now, "funds": {}}
     out = {}
     for code in fund_codes:
-        entry = (cache.get("funds") or {}).get(code)
-        cached_ok = (entry and entry.get("rows")
-                     and time.time() - float(cache.get("_ts") or 0) < HOLDINGS_CACHE_DAYS * 86400)
+        entry = cached_funds.get(code)
+        cached_rows = entry.get("rows") if isinstance(entry, dict) else None
+        entry_ts = entry.get("_ts") if isinstance(entry, dict) else None
+        try:
+            entry_ts = float(entry_ts) if entry_ts is not None else cache_ts
+        except (TypeError, ValueError):
+            entry_ts = cache_ts
+        cached_ok = (isinstance(cached_rows, list) and bool(cached_rows)
+                     and now - entry_ts < HOLDINGS_CACHE_DAYS * 86400)
         try:
             rows = get_holdings(code, top)
             if rows:
-                fresh["funds"][code] = {"rows": rows}
+                fresh["funds"][code] = {"rows": rows, "_ts": now}
                 out[code] = rows
                 continue
         except Exception as e:
             logger.warning("基金 %s 持仓抓取失败: %s", code, type(e).__name__)
         if cached_ok:
-            fresh["funds"][code] = entry
-            out[code] = entry["rows"]
+            preserved = dict(entry)
+            preserved.setdefault("_ts", entry_ts)
+            fresh["funds"][code] = preserved
+            out[code] = cached_rows
         else:
             out[code] = []
             if entry:
-                fresh["funds"][code] = entry  # 保留旧值供下次降级
+                preserved = dict(entry)
+                # 保留旧值供排障，但固定其原始时间，不能因本轮失败而续期。
+                preserved.setdefault("_ts", entry_ts)
+                fresh["funds"][code] = preserved
     CACHE_DIR.mkdir(exist_ok=True)
     HOLDINGS_CACHE_PATH.write_text(json.dumps(fresh, ensure_ascii=False), encoding="utf-8")
     return out

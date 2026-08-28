@@ -10,12 +10,13 @@ datatypeid: 0=成交量, 1=持买单量(多单), 2=持卖单量(空单)  [官方
 """
 import requests
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import sys
 
 BASE = "http://www.cffex.com.cn/sj/ccpm/{ym}/{d}/{product}.xml"
 PRODUCTS = ["IF", "IH", "IC", "IM"]
 MEMBER = "中信期货"
+BJT = timezone(timedelta(hours=8))
 
 
 def fetch(product, d):
@@ -56,7 +57,7 @@ def trading_days(end, n):
 
 def main():
     # 默认从今天起向前回溯（此前硬编码 2026-08-21 过期后近 N 日数据会缺失）
-    end = date.today()
+    end = datetime.now(BJT).date()
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     days = trading_days(end, n)
 

@@ -13,20 +13,24 @@
 from __future__ import annotations
 
 import logging
+import math
 import pickle
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_PATH = PROJECT_ROOT / "data" / "strategy_cache" / "margin_sse.pkl"
+BJT = timezone(timedelta(hours=8))
 
 
 def _segments(start_year: int = 2014, end_year: Optional[int] = None) -> list:
-    end_year = end_year or datetime.now().year
+    end_year = end_year or datetime.now(BJT).year
     segs = []
     for y in range(start_year, end_year + 1):
         segs.append((f"{y}0101", f"{y}1231"))
@@ -46,7 +50,19 @@ def fetch_margin(force_refresh: bool = False) -> Dict[str, float]:
     if not force_refresh and CACHE_PATH.exists():
         try:
             with open(CACHE_PATH, "rb") as f:
-                return pickle.load(f)
+                cached = pickle.load(f)
+            if isinstance(cached, dict):
+                out = {}
+                for day, value in cached.items():
+                    try:
+                        day = pd.Timestamp(_norm(day)).strftime("%Y-%m-%d")
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0 and math.isfinite(value):
+                        out[day] = value
+                return out
+            raise ValueError("两融缓存根节点不是对象")
         except Exception as e:
             logger.warning("两融缓存读取失败(%s)，重建", e)
     import akshare as ak
@@ -57,7 +73,8 @@ def fetch_margin(force_refresh: bool = False) -> Dict[str, float]:
         except Exception as ex:
             logger.warning("两融 %s~%s 拉取失败(%s)，跳过", s, e, type(ex).__name__)
             continue
-        if df is None or df.empty or "融资余额" not in df.columns:
+        if (not isinstance(df, pd.DataFrame) or df.empty
+                or not {"信用交易日期", "融资余额"}.issubset(df.columns)):
             continue
         for _, r in df.iterrows():
             d = _norm(r["信用交易日期"])
@@ -92,16 +109,24 @@ def build_leverage(margin: Dict[str, float], trading_dates: list,
     for i, d in enumerate(trading_dates):
         ds = _norm(d)
         if ds in margin:
-            last = margin[ds]
+            try:
+                value = float(margin[ds])
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and math.isfinite(value) and value > 0:
+                last = value
         bal[i] = last
     grow = [0.0] * len(trading_dates)
-    for i in range(span, len(trading_dates)):
-        b_now, b_old = bal[i], bal[i - span]
-        if b_now and b_old:
+    for i in range(span + 1, len(trading_dates)):
+        # 两融余额通常在 T+1 披露，t 日只能使用前一交易日及更早数据。
+        b_now, b_old = bal[i - 1], bal[i - 1 - span]
+        if (b_now is not None and b_old is not None
+                and math.isfinite(b_now) and math.isfinite(b_old)
+                and b_now > 0 and b_old > 0):
             grow[i] = b_now / b_old - 1.0
     span252 = 252
     out = [0.0] * len(trading_dates)
-    for i in range(span, len(trading_dates)):
+    for i in range(span + 1, len(trading_dates)):
         lo = max(0, i - span252)
         w = grow[lo:i]  # 不含当前，纯历史
         if len(w) < 30:

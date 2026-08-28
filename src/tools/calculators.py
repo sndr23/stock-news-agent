@@ -24,6 +24,7 @@ import math
 import re
 
 logger = logging.getLogger(__name__)
+BJT = timezone(timedelta(hours=8))
 
 # 关注股票列表缓存
 _watchlist_cache = None
@@ -1653,7 +1654,7 @@ def dedup_and_cap_for_display(ranked_news: list, max_announcements_per_stock: in
 
 
 if __name__ == "__main__":
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
     news = [
         # 国家级政策利好 — 应该最高
         {"title": "央行降准0.5个百分点释放1万亿", "source": "央视新闻",

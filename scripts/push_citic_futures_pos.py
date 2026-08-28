@@ -39,6 +39,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".ENV")
 
 from src.tools.push import push_via_pushplus  # noqa: E402
+from src.strategy.state_io import atomic_write_json, get_gist_config  # noqa: E402
+from src.strategy.data_freshness import BJT, _is_workday  # noqa: E402
 
 logger = logging.getLogger("citic_pos_push")
 logger.setLevel(logging.INFO)
@@ -72,6 +74,11 @@ def fetch_product(product: str, d: date):
     if "<HTML" in upper or "<!DOCTYPE" in upper:
         logger.info(f"{product} {d} 数据未公布（返回错误页，{len(r.text)} 字节），等待重试")
         return None
+    try:
+        parse_xml(r.text)
+    except ValueError as e:
+        logger.warning(f"{product} {d} XML 响应无效（{e}），等待重试")
+        return None
     return r
 
 
@@ -93,26 +100,30 @@ def parse_xml(text: str):
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
-        root = ET.fromstring(_resolve_entities(text))
+        try:
+            root = ET.fromstring(_resolve_entities(text))
+        except ET.ParseError as e:
+            raise ValueError("XML 解析失败") from e
     rows = []
     for data in root.findall("data"):
-        rows.append(
-            {
-                "dtype": data.find("datatypeid").text,
-                "name": data.find("shortname").text,
-                "var": int(data.find("varvolume").text),
-            }
-        )
+        dtype = data.findtext("datatypeid")
+        name = data.findtext("shortname")
+        var = data.findtext("varvolume")
+        if not dtype or not name or var is None:
+            raise ValueError("XML 字段缺失")
+        try:
+            var_value = int(var)
+        except (TypeError, ValueError) as e:
+            raise ValueError("XML 字段非法") from e
+        rows.append({"dtype": dtype, "name": name, "var": var_value})
+    if not rows:
+        raise ValueError("XML 无持仓记录")
     return rows
 
 
 def _is_trading_day(d: date) -> bool:
-    """A股交易日判断（与 real_time_push.py 同口径）"""
-    try:
-        import chinese_calendar  # type: ignore
-        return chinese_calendar.is_workday(d)
-    except ImportError:
-        return d.weekday() < 5
+    """A股交易日判断，与全项目公共日历口径一致。"""
+    return _is_workday(d, "cn")
 
 
 def resolve_target_day() -> date:
@@ -121,7 +132,7 @@ def resolve_target_day() -> date:
     交易日当天数据未公布 → 返回 None（调用方以退出码 2 触发 workflow 重试）；
     非交易日（周末/节假日）→ 回退最近一个已有数据的交易日（Gist 去重兜底跳过）。
     """
-    today = date.today()
+    today = datetime.now(BJT).date()
     if _is_trading_day(today):
         if fetch_product("IF", today) is not None:
             return today
@@ -143,13 +154,21 @@ def compute_daily(d: date) -> dict:
         if resp is None:
             logger.warning(f"{p} {d} 无数据，跳过")
             continue
+        try:
+            rows = parse_xml(resp.text)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"{p} {d} XML 解析失败，跳过: {e}")
+            continue
+        member_rows = [r for r in rows if r["name"].startswith(MEMBER)]
+        if not member_rows or not {r["dtype"] for r in member_rows} >= {"1", "2"}:
+            logger.warning(f"{p} {d} 缺少中信期货多/空持仓记录，跳过")
+            continue
         buy_var = sell_var = 0
-        for r in parse_xml(resp.text):
-            if r["name"].startswith(MEMBER):
-                if r["dtype"] == "1":
-                    buy_var += r["var"]
-                elif r["dtype"] == "2":
-                    sell_var += r["var"]
+        for r in member_rows:
+            if r["dtype"] == "1":
+                buy_var += r["var"]
+            elif r["dtype"] == "2":
+                sell_var += r["var"]
         result[p] = {"buy_var": buy_var, "sell_var": sell_var, "net_var": buy_var - sell_var}
     return result
 
@@ -160,7 +179,7 @@ def compute_recent(end: date, n: int = 5) -> list:
     d = end
     while len(out) < n and d >= end - timedelta(days=30):
         daily = compute_daily(d)
-        if daily:
+        if set(daily) == set(PRODUCTS):
             total = sum(c["net_var"] for c in daily.values())
             out.append({"day": d.strftime("%m-%d"), "total": total, "daily": daily})
         d -= timedelta(days=1)
@@ -171,8 +190,7 @@ def compute_recent(end: date, n: int = 5) -> list:
 # 状态持久化（Gist 云端 / 本地文件）
 # ============================================================
 def _load_state() -> dict:
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
         try:
             url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
@@ -186,21 +204,29 @@ def _load_state() -> dict:
             files = resp.json().get("files") or {}
             fobj = files.get(GIST_STATE_FILENAME)
             if fobj is not None:
-                return json.loads(fobj.get("content") or "{}")
+                content = fobj.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("Gist 状态文件内容为空")
+                state = json.loads(content)
+                if not isinstance(state, dict):
+                    raise ValueError("Gist 状态根节点不是对象")
+                return state
+            # API 成功但文件不存在：允许首次部署从空状态开始，且不回退本地。
             return {}
         except Exception as e:
-            logger.warning(f"Gist 状态读取失败，回退本地: {e}")
+            logger.error(f"Gist 状态读取失败，拒绝回退本地: {e}")
+            raise RuntimeError("Gist 状态读取失败，拒绝回退本地") from e
     if LOCAL_STATE_PATH.exists():
         try:
-            return json.loads(LOCAL_STATE_PATH.read_text(encoding="utf-8"))
+            state = json.loads(LOCAL_STATE_PATH.read_text(encoding="utf-8"))
+            return state if isinstance(state, dict) else {}
         except Exception:
             return {}
     return {}
 
 
-def _save_state(state: dict) -> None:
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+def _save_state(state: dict) -> bool:
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
         try:
             url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
@@ -213,12 +239,12 @@ def _save_state(state: dict) -> None:
             resp = requests.patch(url, json=payload, headers=headers, timeout=20)
             resp.raise_for_status()
             logger.info("状态已写入 Gist")
-            return
+            return True
         except Exception as e:
-            logger.warning(f"Gist 状态写入失败，回退本地: {e}")
-    LOCAL_STATE_PATH.parent.mkdir(exist_ok=True)
-    LOCAL_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.error(f"Gist 状态写入失败，已回退本地: {e}")
+    atomic_write_json(LOCAL_STATE_PATH, state)
     logger.info(f"状态已写入本地 {LOCAL_STATE_PATH}")
+    return False if gist_token and gist_id else True
 
 
 # ============================================================
@@ -273,10 +299,24 @@ def format_message(d: date, daily: dict, recent: list) -> str:
     return "\n".join(lines)
 
 
+def _configure_stdout() -> None:
+    """让 Windows 非 UTF-8 控制台替换无法编码的报告字符，而不是崩溃。"""
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        # pytest/caller 提供的类文件对象可能没有可重配置的底层编码。
+        pass
+
+
 # ============================================================
 # 主流程
 # ============================================================
 def main():
+    _configure_stdout()
     parser = argparse.ArgumentParser(description="中信期货持仓日报推送")
     parser.add_argument("--dry-run", action="store_true", help="只打印不推送")
     parser.add_argument("--date", type=str, default="", help="指定交易日 YYYYMMDD（默认取最近交易日）")
@@ -292,9 +332,10 @@ def main():
             return 2
 
     daily = compute_daily(d)
-    if not daily:
-        logger.error(f"{d} 无任何品种数据，跳过")
-        return 1
+    if set(daily) != set(PRODUCTS):
+        missing = ",".join(p for p in PRODUCTS if p not in daily)
+        logger.warning(f"{d} 持仓数据不完整，缺少: {missing}；退出码 2 等待重试")
+        return 2
 
     # 去重: 每个交易日只推一次
     state = _load_state()
@@ -331,7 +372,9 @@ def main():
     history.append({"day": d.strftime("%Y-%m-%d"),
                     "net": daily_compact})
     state["pos_history"] = history[-90:]  # 保留约 90 个交易日
-    _save_state(state)
+    if _save_state(state) is False:
+        logger.error("日报已推送，但状态未写入 Gist；返回失败以触发重试")
+        return 1
     logger.info(f"推送成功: {title}")
     return 0
 

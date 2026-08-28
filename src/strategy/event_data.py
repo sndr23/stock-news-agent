@@ -20,14 +20,17 @@ from __future__ import annotations
 import logging
 import pickle
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_PATH = PROJECT_ROOT / "data" / "strategy_cache" / "event_yjyg.pkl"
+BJT = timezone(timedelta(hours=8))
 
 # 预告类型 → 方向：正向(预增/略增/扭亏/续盈), 负向(预减/略减/首亏/续亏)
 POSITIVE = ("预增", "略增", "扭亏", "续盈")
@@ -36,7 +39,7 @@ NEGATIVE = ("预减", "略减", "首亏", "续亏")
 
 def _quarter_ends(start_year: int = 2015, end_year: Optional[int] = None) -> list:
     """报告期末（各季真实月末：3/31 6/30 9/30 12/31）。"""
-    end_year = end_year or datetime.now().year
+    end_year = end_year or datetime.now(BJT).year
     out = []
     for y in range(start_year, end_year + 1):
         for m in (("0331", "0630", "0930", "1231")):
@@ -53,13 +56,40 @@ def _direction(yjlx: object) -> int:
     return 0
 
 
+def _normalize_date(value: object) -> Optional[str]:
+    """把接口/缓存/交易日中的日期统一为 YYYY-MM-DD。"""
+    try:
+        date = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(date):
+        return None
+    return date.strftime("%Y-%m-%d")
+
+
 def fetch_events(force_refresh: bool = False) -> List[Tuple[str, str, int]]:
     """拉取全市场业绩预告，过滤创业板，返回 [(公告日期str, 股票代码, 方向±1/0)]。
     逐年逐季拉取，季度失败独立跳过；按(公告日,股票代码)去重，结果带磁盘缓存。"""
     if not force_refresh and CACHE_PATH.exists():
         try:
             with open(CACHE_PATH, "rb") as f:
-                return pickle.load(f)
+                cached = pickle.load(f)
+            if not isinstance(cached, list):
+                raise ValueError("事件缓存根节点不是列表")
+            normalized = []
+            for row in cached:
+                if not isinstance(row, (tuple, list)) or len(row) != 3:
+                    raise ValueError("事件缓存记录结构异常")
+                day = _normalize_date(row[0])
+                code = str(row[1] or "").strip()
+                try:
+                    direction = int(row[2])
+                except (TypeError, ValueError):
+                    raise ValueError("事件方向异常")
+                if not day or not code or direction not in (-1, 0, 1):
+                    raise ValueError("事件缓存字段异常")
+                normalized.append((day, code, direction))
+            return normalized
         except Exception as e:
             logger.warning("事件缓存读取失败(%s)，重建", e)
     import akshare as ak
@@ -70,15 +100,16 @@ def fetch_events(force_refresh: bool = False) -> List[Tuple[str, str, int]]:
         except Exception as e:
             logger.warning("业绩预告 %s 拉取失败(%s)，跳过", q, type(e).__name__)
             continue
-        if df is None or df.empty:
+        if not isinstance(df, pd.DataFrame) or df.empty:
             continue
         if not {"股票代码", "公告日期", "预告类型"}.issubset(df.columns):
             continue
         df = df[df["股票代码"].astype(str).str.startswith(("300", "301"))]
         for _, r in df.iterrows():
-            d = str(r["公告日期"])[:10]
+            d = _normalize_date(r["公告日期"])
             code = str(r["股票代码"])
-            rows.append((d, code, _direction(r["预告类型"])))
+            if d:
+                rows.append((d, code, _direction(r["预告类型"])))
         logger.info("业绩预告 %s 创业板事件 %d 条（累计 %d）", q, len(df), len(rows))
         time.sleep(0.4)
     # 去重：同一公司同公告日仅保最后一条 → (day, code) 唯一；再排序
@@ -108,11 +139,13 @@ def build_sentiment(events: List[Tuple[str, str, int]], trading_dates: list,
     from collections import defaultdict
     event_map: Dict[str, int] = defaultdict(int)
     for _d, _c, s in events:
-        event_map[_d] += s
+        day = _normalize_date(_d)
+        if day:
+            event_map[day] += s
     # 交易日 → 事件净信号序列
     n = len(trading_dates)
     daily = [0.0] * n
-    date_index = {str(d): i for i, d in enumerate(trading_dates)}
+    date_index = {_normalize_date(d): i for i, d in enumerate(trading_dates)}
     for d, net in event_map.items():
         i = date_index.get(d)
         if i is not None:

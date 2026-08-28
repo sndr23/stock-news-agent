@@ -43,6 +43,8 @@ import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -52,6 +54,9 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".ENV")
 
 from src.tools.push import push_via_wecom, push_via_pushplus  # 推送（含重试，复用现有出口）
+from src.strategy.data_freshness import BJT, is_recent_data_date
+from src.strategy.state_io import atomic_write_json, get_gist_config
+from src.strategy.data_freshness import _is_workday
 
 logger = logging.getLogger("factor_collector")
 
@@ -162,6 +167,11 @@ STRONG_DIR_THRESHOLD = 0.67
 # P5-3（2026-08-19）：数据健康度——源成功率 <70% 时信号附警示（机构级清洗 =
 # 不只拿数据，还要知道自己在用什么、缺了什么）
 HEALTH_WARN_RATIO = 0.7
+# 连续免费数据源失败达到该轮数后告警；恢复后计数和告警锁存清零。
+try:
+    DATA_HEALTH_ALERT_ROUNDS = max(1, int(os.getenv("DATA_HEALTH_ALERT_ROUNDS", "3")))
+except (TypeError, ValueError):
+    DATA_HEALTH_ALERT_ROUNDS = 3
 
 STATE_PATH = PROJECT_ROOT / "logs" / "factor_state.json"
 # real_time_push 的状态文件（P0 联动增强：方向信号附最近已推资讯，跨管线引用）
@@ -220,6 +230,181 @@ def _http_get(url: str, params: dict = None, headers: dict = None, encoding: str
         return ""
 
 
+def _finite_float(value, positive: bool = False):
+    """解析有限浮点数；价格类字段可额外要求严格为正。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0):
+        return None
+    return number
+
+
+def _valid_kline_row(row) -> bool:
+    """判断日K行的日期、价格和成交量是否可安全进入因子计算。"""
+    if not isinstance(row, dict):
+        return False
+    try:
+        datetime.strptime(str(row.get("date", ""))[:10], "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    prices = [_finite_float(row.get(key), positive=True)
+              for key in ("open", "close", "high", "low")]
+    volume = _finite_float(row.get("volume"))
+    return all(value is not None for value in prices) and volume is not None and volume >= 0
+
+
+def _valid_minute_row(row) -> bool:
+    """判断分钟K行的时间、价格和成交量是否可安全进入影子因子。"""
+    if not isinstance(row, dict):
+        return False
+    timestamp = str(row.get("time", "")).strip()
+    try:
+        datetime.strptime(timestamp[:12], "%Y%m%d%H%M")
+    except (TypeError, ValueError):
+        return False
+    prices = [_finite_float(row.get(key), positive=True)
+              for key in ("open", "close", "high", "low")]
+    volume = _finite_float(row.get("volume"))
+    return all(value is not None for value in prices) and volume is not None and volume >= 0
+
+
+def _has_required_keys(data: dict, keys) -> bool:
+    """判断结构化增强数据是否包含一组完整且非空的字段。"""
+    return isinstance(data, dict) and all(data.get(key) is not None for key in keys)
+
+
+def _complete_numeric_mapping(data: dict, expected, fields, positive_fields=(),
+                             nonnegative_fields=()) -> bool:
+    """判断行情映射是否覆盖全部对象且每个数值字段都有效。"""
+    if not isinstance(data, dict):
+        return False
+    for name in expected:
+        row = data.get(name)
+        if not isinstance(row, dict):
+            return False
+        for field in fields:
+            value = _finite_float(row.get(field), positive=field in positive_fields)
+            if value is None or (field in nonnegative_fields and value < 0):
+                return False
+    return True
+
+
+def _complete_kline(data: list, minimum: int = 1) -> bool:
+    """判断 K 线是否至少有可安全消费的有效行。"""
+    return (isinstance(data, list) and len(data) >= minimum
+            and all(_valid_kline_row(row) for row in data))
+
+
+def _complete_minute_kline(data: list, minimum: int = 6) -> bool:
+    """判断分钟 K 线是否足以计算短线影子因子。"""
+    return (isinstance(data, list) and len(data) >= minimum
+            and all(_valid_minute_row(row) for row in data))
+
+
+def _complete_breadth(data: dict) -> bool:
+    """判断市场宽度是否包含完整且自洽的计数。"""
+    required = ("adv", "dec", "flat", "down_pct", "limit_up", "limit_down", "big_down")
+    if not _has_required_keys(data, required):
+        return False
+    counts = [_finite_float(data.get(key)) for key in required if key != "down_pct"]
+    down_pct = _finite_float(data.get("down_pct"))
+    return (all(value is not None and value >= 0 and value.is_integer() for value in counts)
+            and down_pct is not None and 0 <= down_pct <= 100)
+
+
+def _complete_flows(data: dict) -> bool:
+    """判断资金流是否同时覆盖主力、融资余额及其日变化。"""
+    if not _has_required_keys(data, ("main_net_yi", "margin_yi", "margin_chg_yi")):
+        return False
+    main_net = _finite_float(data.get("main_net_yi"))
+    margin = _finite_float(data.get("margin_yi"), positive=True)
+    margin_chg = _finite_float(data.get("margin_chg_yi"))
+    return main_net is not None and margin is not None and margin_chg is not None
+
+
+def _complete_volatility(data: dict) -> bool:
+    """判断核心指数波动率是否都完成计算。"""
+    if not isinstance(data, dict):
+        return False
+    for name in CORE_INDEXES:
+        row = data.get(name)
+        if not isinstance(row, dict) or row.get("available") is not True:
+            return False
+        vol20 = _finite_float(row.get("vol20"))
+        pctile = _finite_float(row.get("pctile"))
+        if vol20 is None or vol20 <= 0 or pctile is None or not 0 <= pctile <= 100:
+            return False
+    return True
+
+
+def _complete_sentiment(data: dict) -> bool:
+    """判断涨停情绪是否含有完整且自洽的计数。"""
+    required = ("zt", "zb", "zbr", "max_lbc", "mood")
+    if not _has_required_keys(data, required):
+        return False
+    zt = _finite_float(data.get("zt"))
+    zb = _finite_float(data.get("zb"))
+    zbr = _finite_float(data.get("zbr"))
+    max_lbc = _finite_float(data.get("max_lbc"))
+    return (zt is not None and zt > 0 and zt.is_integer()
+            and zb is not None and zb >= 0 and zb.is_integer()
+            and zbr is not None and 0 <= zbr <= 100
+            and max_lbc is not None and max_lbc >= 0 and max_lbc.is_integer()
+            and bool(str(data.get("mood") or "").strip()))
+
+
+def _complete_sector_flows(data: dict) -> bool:
+    """判断行业资金流 TOP 结果是否是完整的两侧列表。"""
+    if not isinstance(data, dict) or not isinstance(data.get("inflow"), list):
+        return False
+    if not isinstance(data.get("outflow"), list):
+        return False
+    rows = data["inflow"] + data["outflow"]
+    return bool(data["inflow"]) and bool(data["outflow"]) and all(
+        isinstance(row, (list, tuple)) and len(row) == 2
+        and str(row[0]).strip()
+        and _finite_float(row[1]) is not None
+        for row in rows)
+
+
+def _complete_style(data: dict) -> bool:
+    """判断大小盘比价结果是否包含完整数值字段。"""
+    if not _has_required_keys(data, ("ratio", "chg5", "chg20", "trend")):
+        return False
+    ratio = _finite_float(data.get("ratio"), positive=True)
+    chg5 = _finite_float(data.get("chg5"))
+    chg20 = _finite_float(data.get("chg20"))
+    return (ratio is not None and chg5 is not None and chg20 is not None
+            and bool(str(data.get("trend") or "").strip()))
+
+
+def _complete_liquidity(data: dict) -> bool:
+    """判断资金面是否同时覆盖 GC007 和 GC001。"""
+    return _complete_numeric_mapping(
+        data, ("gc007", "gc001"), ("price", "change_pct"),
+        positive_fields=("price",))
+
+
+def _complete_option(data: dict) -> bool:
+    """判断期权 PCR 是否覆盖了接口报告的全部合约。"""
+    if not _has_required_keys(data, ("pcr", "call_vol", "put_vol", "contracts", "total")):
+        return False
+    pcr = _finite_float(data.get("pcr"))
+    call_vol = _finite_float(data.get("call_vol"))
+    put_vol = _finite_float(data.get("put_vol"))
+    contracts = _finite_float(data.get("contracts"))
+    total = _finite_float(data.get("total"))
+    return (pcr is not None and pcr >= 0 and call_vol is not None and call_vol > 0
+            and put_vol is not None and put_vol >= 0
+            and contracts is not None and contracts >= 0 and contracts.is_integer()
+            and total is not None and total > 0 and total.is_integer()
+            and contracts >= total)
+
+
 def fetch_index_quotes() -> dict:
     """腾讯指数实时行情 → {指数名: {price, prev_close, change_pct, amount_wan}}"""
     result = {}
@@ -237,15 +422,19 @@ def fetch_index_quotes() -> dict:
         if len(parts) < 38:
             continue
         name = parts[1]
-        try:
-            result[name] = {
-                "price": float(parts[3]),
-                "prev_close": float(parts[4]),
-                "change_pct": float(parts[32]),
-                "amount_wan": float(parts[37]),  # 成交额（万元）
-            }
-        except (ValueError, IndexError):
+        price = _finite_float(parts[3], positive=True)
+        prev_close = _finite_float(parts[4], positive=True)
+        change_pct = _finite_float(parts[32])
+        amount_wan = _finite_float(parts[37])
+        if (name not in INDEXES or price is None or prev_close is None
+                or change_pct is None or amount_wan is None or amount_wan < 0):
             continue
+        result[name] = {
+            "price": price,
+            "prev_close": prev_close,
+            "change_pct": change_pct,
+            "amount_wan": amount_wan,  # 成交额（万元）
+        }
     return result
 
 
@@ -278,7 +467,7 @@ def _fetch_kline_sina(symbol: str, lmt: int) -> list:
             })
         except (KeyError, ValueError, TypeError):
             continue
-    return out
+    return [row for row in out if _valid_kline_row(row)]
 
 
 def _fetch_kline_tencent(symbol: str, lmt: int) -> list:
@@ -314,7 +503,7 @@ def _fetch_kline_tencent(symbol: str, lmt: int) -> list:
             })
         except (ValueError, TypeError, IndexError):
             continue
-    return out
+    return [row for row in out if _valid_kline_row(row)]
 
 
 def _em_secid(symbol: str) -> str:
@@ -365,8 +554,9 @@ def _fetch_kline_em(symbol: str, lmt: int, adjust: int = 0) -> list:
     if not secid:
         logger.warning(f"东财K线: 无法识别 symbol={symbol}")
         return []
-    today = datetime.now().strftime("%Y%m%d")
-    beg_d = (datetime.now() - timedelta(days=max(lmt * 3, 60))).strftime("%Y%m%d")
+    now_bj = datetime.now(BJT)
+    today = now_bj.strftime("%Y%m%d")
+    beg_d = (now_bj - timedelta(days=max(lmt * 3, 60))).strftime("%Y%m%d")
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56",
@@ -411,6 +601,7 @@ def _fetch_kline_em(symbol: str, lmt: int, adjust: int = 0) -> list:
                 })
             except (ValueError, TypeError):
                 continue
+        out = [row for row in out if _valid_kline_row(row)]
         if out:
             return out[-lmt:]  # 本地截取尾部 N 根（上游忽略 lmt）
         last_err = "no-rows"
@@ -425,14 +616,33 @@ def fetch_index_kline(symbol: str, lmt: int = 65) -> list:
     2026-08-14 东财裸请求被反爬，现按 stock-sdk 治理思路（UA 轮换 + 多主机
     fallback）解锁作为第三冗余，消除新浪/腾讯双点依赖。
     """
-    out = _fetch_kline_sina(symbol, lmt)
-    if not out:
-        logger.warning(f"新浪K线失败，降级腾讯: {symbol}")
-        out = _fetch_kline_tencent(symbol, lmt)
-    if not out:
-        logger.warning(f"腾讯K线失败，降级东财: {symbol}")
-        out = _fetch_kline_em(symbol, lmt)
-    return out
+    candidates = (
+        ("新浪", _fetch_kline_sina),
+        ("腾讯", _fetch_kline_tencent),
+        ("东财", _fetch_kline_em),
+    )
+    # 小窗口调用用于通用行情测试/展示；核心技术面和波动率请求必须保留
+    # 至少 60 根完整日线，否则 MA60、突破和量比会被短响应伪装成可用。
+    minimum = 60 if lmt >= 60 else 1
+    for i, (name, loader) in enumerate(candidates):
+        try:
+            out = loader(symbol, lmt)
+        except Exception as e:
+            logger.warning("%sK线请求异常(%s)，降级下一免费源: %s",
+                           name, type(e).__name__, symbol)
+            out = []
+        if out:
+            last = out[-1].get("date") if isinstance(out[-1], dict) else None
+            if (is_recent_data_date(last, max_lag_days=3, calendar="cn")
+                    and len(out) >= minimum
+                    and all(_valid_kline_row(row) for row in out)):
+                return out
+            logger.warning("%sK线末根 %s 已过期，降级下一免费源: %s",
+                           name, last or "-", symbol)
+        if i < len(candidates) - 1:
+            logger.warning("%sK线失败，降级%s: %s",
+                           name, candidates[i + 1][0], symbol)
+    return []
 
 
 def fetch_fx() -> dict:
@@ -452,14 +662,15 @@ def fetch_fx() -> dict:
         if len(parts) < 12:
             continue
         sym = var.replace("var hq_str_", "").strip()
-        try:
-            result[sym] = {
-                "name": parts[9],
-                "price": float(parts[1]),
-                "change_pct": float(parts[11]),
-            }
-        except (ValueError, IndexError):
+        price = _finite_float(parts[1], positive=True)
+        change_pct = _finite_float(parts[11])
+        if not sym or price is None or change_pct is None:
             continue
+        result[sym] = {
+            "name": parts[9],
+            "price": price,
+            "change_pct": change_pct,
+        }
     return result
 
 
@@ -482,13 +693,14 @@ def _fetch_futures_sina() -> dict:
         sym = var.replace("var hq_str_", "").strip()
         for code, conf in FUTURES.items():
             if conf["sina"] == sym:
-                try:
-                    result[code] = {
-                        "price": float(parts[3]),       # 最新价
-                        "prev_settle": float(parts[0]),  # 昨结算
-                    }
-                except (ValueError, IndexError):
+                price = _finite_float(parts[3], positive=True)
+                prev_settle = _finite_float(parts[0], positive=True)
+                if price is None or prev_settle is None:
                     continue
+                result[code] = {
+                    "price": price,       # 最新价
+                    "prev_settle": prev_settle,  # 昨结算
+                }
     return result
 
 
@@ -505,17 +717,20 @@ def _fetch_futures_cffex() -> dict:
         return {}
     raw = None
     for back in range(0, 4):
-        d = datetime.now() - timedelta(days=back)
+        d = datetime.now(BJT) - timedelta(days=back)
         try:
             df = ak.futures_hist_daily_cffex(date=d.strftime("%Y%m%d"))
         except Exception as e:
             logger.warning("中金所期货源 %s 失败(%s)", d.strftime("%Y%m%d"), type(e).__name__)
-            return {}
-        if df is not None and not df.empty:
+            # 单日接口异常可能是临时网络/限流问题，继续回看后续日期。
+            time.sleep(0.2)
+            continue
+        if (isinstance(df, pd.DataFrame) and not df.empty
+                and {"variety", "volume", "close", "pre_settle"}.issubset(df.columns)):
             raw = df
             break
         time.sleep(0.2)
-    if raw is None or raw.empty or "variety" not in raw.columns:
+    if raw is None:
         return {}
     out = {}
     try:
@@ -525,10 +740,11 @@ def _fetch_futures_cffex() -> dict:
             code = str(r.get("variety") or "").strip()
             if code not in FUTURES:
                 continue
-            price = float(r.get("close") or 0)
-            if price <= 0:
+            price = _finite_float(r.get("close"), positive=True)
+            prev_settle = _finite_float(r.get("pre_settle"), positive=True)
+            if price is None or prev_settle is None:
                 continue
-            out[code] = {"price": price, "prev_settle": float(r.get("pre_settle") or 0)}
+            out[code] = {"price": price, "prev_settle": prev_settle}
     except (TypeError, ValueError) as e:
         logger.warning("中金所期货数据解析失败(%s)", type(e).__name__)
         return {}
@@ -611,15 +827,18 @@ def fetch_stock_quotes(symbols: list) -> dict:
             continue
         # 腾讯 var 名即请求 symbol（如 v_sz300308），比 parts[2]（不带前缀）可靠
         sym = var.replace("v_", "").replace("hq_str_", "").strip()
-        try:
-            result[sym] = {
-                "name": parts[1],
-                "price": float(parts[3]),
-                "prev_close": float(parts[4]),
-                "change_pct": float(parts[32]),
-            }
-        except (ValueError, IndexError):
+        price = _finite_float(parts[3], positive=True)
+        prev_close = _finite_float(parts[4], positive=True)
+        change_pct = _finite_float(parts[32])
+        if (sym not in symbols or not parts[1] or price is None
+                or prev_close is None or change_pct is None):
             continue
+        result[sym] = {
+            "name": parts[1],
+            "price": price,
+            "prev_close": prev_close,
+            "change_pct": change_pct,
+        }
     return result
 
 
@@ -641,9 +860,10 @@ def _fetch_flows_em() -> dict:
         try:
             kl = (json.loads(text).get("data") or {}).get("klines") or []
             if kl:
-                main_net = float(str(kl[-1]).split(",")[1])
-                out["main_net_yi"] = round(main_net / 1e8, 1)
-        except (ValueError, IndexError, TypeError):
+                main_net = _finite_float(str(kl[-1]).split(",")[1])
+                if main_net is not None:
+                    out["main_net_yi"] = round(main_net / 1e8, 1)
+        except (ValueError, IndexError, TypeError, AttributeError):
             logger.warning("主力资金流解析失败（跳过该维度）")
     # 2) 融资余额（RPTA_RZRQ_LSHJ 按日汇总，RZYE=融资余额元，T-1 披露）
     text = _http_get("https://datacenter-web.eastmoney.com/api/data/v1/get", params={
@@ -655,92 +875,28 @@ def _fetch_flows_em() -> dict:
     if text:
         try:
             rows = ((json.loads(text).get("result") or {}).get("data")) or []
-            if rows:
-                out["margin_yi"] = round(float(rows[0].get("RZYE", 0) or 0) / 1e8, 1)
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("融资余额数据为空")
+            latest = _finite_float(rows[0].get("RZYE"), positive=True)
+            if latest is None:
+                raise ValueError("融资余额无效")
+            out["margin_yi"] = round(latest / 1e8, 1)
             if len(rows) >= 2:
-                out["margin_chg_yi"] = round(
-                    (float(rows[0].get("RZYE", 0) or 0) - float(rows[1].get("RZYE", 0) or 0)) / 1e8, 1)
-        except (ValueError, TypeError):
+                previous = _finite_float(rows[1].get("RZYE"), positive=True)
+                if previous is not None:
+                    out["margin_chg_yi"] = round((latest - previous) / 1e8, 1)
+        except (ValueError, TypeError, AttributeError, IndexError):
             logger.warning("融资余额解析失败（跳过该维度）")
     return out
 
 
-def _fetch_main_net_tushare():
-    """Tushare 两市主力净流入聚合（SNA-02 东财替代通道，token 时启用）。
-
-    优先 moneyflow_dc（东财口径主力净流入，按 trade_date 全市场返回，聚合即两市值，
-    单位元）；接口/字段不可用时退 moneyflow（自有口径：大单+超大单净额合成主力，
-    单位万元）。日频 T-1（当日盘中无数据）——降级语义：资金流因子从"当日盘中
-    累计"变为"T-1 全天"，修正层可接受（增强维度）。单页 limit 覆盖全市场
-    （约 5400 只），最多翻 3 页防截断；返回亿元 float 或 None。
-    """
-    try:
-        from src.strategy.data import _tushare_client
-    except ImportError:
-        return None
-    pro = _tushare_client()
-    if pro is None:
-        return None
-    for back in range(1, 4):
-        d = (datetime.now() - timedelta(days=back)).strftime("%Y%m%d")
-        try:
-            # 通道一：moneyflow_dc 全市场主力净流入（元）聚合
-            total = None
-            page = 0
-            while page < 3:
-                raw = pro.moneyflow_dc(trade_date=d, limit=6000, offset=page * 6000)
-                if raw is None or raw.empty:
-                    break
-                col = next((c for c in raw.columns if str(c).lower() == "net_amount_main"), None)
-                if col is not None:
-                    total = (total or 0.0) + raw[col].astype(float).sum()
-                page += 1
-                if len(raw) < 6000:
-                    break
-            if total:
-                return round(total / 1e8, 1)
-            # 通道二：moneyflow 大单+超大单净额合成（万元）
-            total = 0.0
-            got = False
-            page = 0
-            while page < 3:
-                raw = pro.moneyflow(trade_date=d, limit=6000, offset=page * 6000)
-                if raw is None or raw.empty:
-                    break
-                cols = {str(c).lower(): c for c in raw.columns}
-                need = {"buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"}
-                if not need <= set(cols):
-                    break
-                lg = (raw[cols["buy_lg_amount"]].astype(float) - raw[cols["sell_lg_amount"]].astype(float)).sum()
-                elg = (raw[cols["buy_elg_amount"]].astype(float) - raw[cols["sell_elg_amount"]].astype(float)).sum()
-                total += lg + elg
-                got = True
-                page += 1
-                if len(raw) < 6000:
-                    break
-            if got and total:
-                return round(total / 10000, 1)  # 万元 → 亿
-        except Exception as e:
-            logger.warning("Tushare 资金流 %s 失败(%s)", d, type(e).__name__)
-            return None
-    return None
-
-
 def fetch_market_flows() -> dict:
-    """资金流聚合（SNA-02 降级链）：东财（主链）→ Tushare 聚合（token 时）。
+    """东财资金流聚合（免费源）。
 
-    东财 main_net_yi 失败时走 Tushare 日频 T-1 聚合（标注 main_net_source=
-    "tushare_t1" 区分当日盘中口径）；margin 维度仅东财单源（展示字段，
-    缺省不伤信号）。全失败 → {}（修正层资金流因子自动缺省降 0）。
+    主力净流入为当日盘中累计，融资余额及变化为 T-1 披露；任一字段失败
+    都独立缺省，全失败返回 {}，修正层资金流因子自动降为 0。
     """
-    out = _fetch_flows_em()
-    if "main_net_yi" not in out:
-        logger.warning("东财主力资金流失效，尝试 Tushare 聚合通道")
-        v = _fetch_main_net_tushare()
-        if v is not None:
-            out["main_net_yi"] = v
-            out["main_net_source"] = "tushare_t1"
-    return out
+    return _fetch_flows_em()
 
 
 def fetch_global_quotes() -> dict:
@@ -765,10 +921,11 @@ def fetch_global_quotes() -> dict:
             name = rev.get(var.replace("v_", "").lower())
             if not name or len(parts) < 33:
                 continue
-            try:
-                out[name] = {"price": float(parts[3]), "change_pct": float(parts[32])}
-            except (ValueError, IndexError):
+            price = _finite_float(parts[3], positive=True)
+            change_pct = _finite_float(parts[32])
+            if price is None or change_pct is None:
                 continue
+            out[name] = {"price": price, "change_pct": change_pct}
     # P12：东财补充源（腾讯缺失的全球指数，如韩指）；主源空/挂同样兜底，失败不影响主源
     out.update(_fetch_global_quotes_em())
     return out
@@ -789,7 +946,7 @@ def _fetch_global_quotes_em() -> dict:
         return {}
     try:
         diff = ((json.loads(text).get("data") or {}).get("diff")) or []
-    except ValueError:
+    except (ValueError, AttributeError, TypeError):
         return {}
     # f12 为裸代码（无 "100." 市场前缀），取 secid 后段反查名称
     rev = {v.split(".")[-1]: k for k, v in GLOBAL_QUOTES_EM.items()}
@@ -797,9 +954,11 @@ def _fetch_global_quotes_em() -> dict:
     for d in diff:
         name = rev.get(str(d.get("f12") or ""))
         f2, f3 = d.get("f2"), d.get("f3")
-        if not name or not isinstance(f2, (int, float)) or not isinstance(f3, (int, float)):
+        price = _finite_float(f2, positive=True)
+        change_pct = _finite_float(f3)
+        if not name or price is None or change_pct is None:
             continue
-        out[name] = {"price": f2 / 100, "change_pct": f3 / 100}
+        out[name] = {"price": price / 100, "change_pct": change_pct / 100}
     return out
 
 
@@ -817,17 +976,23 @@ def fetch_market_breadth() -> dict:
         return {}
     try:
         fenbu = ((json.loads(text).get("data") or {}).get("fenbu")) or []
-    except ValueError:
+    except (ValueError, AttributeError, TypeError):
+        return {}
+    if not isinstance(fenbu, list):
         return {}
     adv = dec = flat = limit_up = limit_down = big_down = 0
     for item in fenbu:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict) or len(item) != 1:
+            return {}
         for k, v in item.items():
             try:
                 bucket, cnt = int(k), int(v)
             except (TypeError, ValueError):
-                continue
+                return {}
+            if bucket == 0 and str(k).strip() not in ("0", "+0", "-0"):
+                return {}
+            if cnt < 0:
+                return {}
             if bucket > 0:
                 adv += cnt
                 if bucket >= 11:
@@ -876,13 +1041,14 @@ def fetch_zt_sentiment() -> dict:
     低迷（涨停<50）/ 正常。
     """
     for i in range(4):
-        d = (date.today() - timedelta(days=i)).strftime("%Y%m%d")
+        d = (datetime.now(BJT).date() - timedelta(days=i)).strftime("%Y%m%d")
         zt_data = _topic_pool("ZT", d)
         zt = zt_data.get("tc")
         if not isinstance(zt, int) or zt <= 0:
             continue
         zb = _topic_pool("ZB", d).get("tc")
-        zb = zb if isinstance(zb, int) else 0
+        if not isinstance(zb, int) or zb < 0:
+            continue
         lbc_counts = {}
         for item in (zt_data.get("pool") or []):
             if not isinstance(item, dict):
@@ -921,16 +1087,19 @@ def fetch_sector_flows(top_n: int = 3) -> dict:
         return {}
     try:
         rows = (json.loads(text).get("data") or {}).get("diff") or []
-    except ValueError:
+    except (ValueError, AttributeError, TypeError):
+        return {}
+    if not isinstance(rows, list):
         return {}
     vals = []
     for r in rows:
         if not isinstance(r, dict):
-            continue
-        try:
-            vals.append((str(r.get("f14", "") or ""), float(r.get("f62")) / 1e8))
-        except (TypeError, ValueError):
-            continue
+            return {}
+        name = str(r.get("f14", "") or "").strip()
+        flow = _finite_float(r.get("f62"))
+        if not name or flow is None:
+            return {}
+        vals.append((name, flow / 1e8))
     if not vals:
         return {}
     inflow = [(n, round(v, 1)) for n, v in
@@ -958,10 +1127,11 @@ def fetch_liquidity() -> dict:
         p = m.group(1).split("~")
         if len(p) < 33:
             continue
-        try:
-            out[key] = {"price": float(p[3]), "change_pct": float(p[32])}
-        except (ValueError, IndexError):
+        price = _finite_float(p[3], positive=True)
+        change_pct = _finite_float(p[32])
+        if price is None or change_pct is None:
             continue
+        out[key] = {"price": price, "change_pct": change_pct}
     return out
 
 
@@ -984,19 +1154,23 @@ def fetch_option_pcr(max_pages: int = 12) -> dict:
             break
         try:
             data = json.loads(text).get("data") or {}
+            if not isinstance(data, dict):
+                break
             rows = data.get("diff") or []
             total = int(data.get("total") or 0)
-        except ValueError:
+        except (AttributeError, TypeError, ValueError):
             break
-        if not rows:
+        if not isinstance(rows, list) or not rows:
             break
         for r in rows:
             if not isinstance(r, dict):
                 continue
             name = str(r.get("f14", "") or "")
-            try:
-                vol = int(r.get("f5") or 0)
-            except (TypeError, ValueError):
+            vol = _finite_float(r.get("f5"))
+            if not name or vol is None or vol < 0 or not vol.is_integer():
+                continue
+            vol = int(vol)
+            if "沽" not in name and "购" not in name:
                 continue
             contracts += 1
             if "沽" in name:
@@ -1040,10 +1214,12 @@ def fetch_minute_kline(symbol: str = "sh000001", period: str = "m5",
         if not isinstance(r, list) or len(r) < 6:
             continue
         try:
-            out.append({"time": str(r[0]), "open": float(r[1]), "close": float(r[2]),
-                        "high": float(r[3]), "low": float(r[4]), "volume": float(r[5])})
+            row = {"time": str(r[0]), "open": float(r[1]), "close": float(r[2]),
+                   "high": float(r[3]), "low": float(r[4]), "volume": float(r[5])}
         except (ValueError, TypeError):
             continue
+        if _valid_minute_row(row):
+            out.append(row)
     return out
 
 
@@ -1064,7 +1240,7 @@ def _next_expiry_days(today: date = None) -> int:
     临近交割的当月合约基差将在交割日收敛，不具对冲成本代表性。
     用下月交割日（当月+1 的第三个周五）近似主力剩余期限，年化贴水率更贴近中性策略实际口径。
     """
-    today = today or date.today()
+    today = today or datetime.now(BJT).date()
     m = today.month + 1
     y = today.year + (m - 1) // 12
     m = (m - 1) % 12 + 1
@@ -1080,7 +1256,8 @@ def _ma(values: list, n: int) -> float:
 
 def calc_tech_factors(name: str, klines: list, quote: dict) -> dict:
     """技术面因子（指数级）：均线、动量、突破、放量"""
-    if not klines or not quote:
+    if (not quote or not _complete_kline(klines, minimum=60)
+            or _finite_float(quote.get("price"), positive=True) is None):
         return {"name": name, "available": False}
     closes = [k["close"] for k in klines]
     volumes = [k["volume"] for k in klines]
@@ -1192,14 +1369,30 @@ def calc_style_rotation() -> dict:
     """大小盘风格轮动（P3-4）：上证50/中证1000 比价及 5/20 日变化
 
     比价升 → 大盘价值占优（科技成长逆风），降 → 小盘成长占优（自选股顺风）。
-    两指数同一交易日历，收盘价按位对齐；数据不足返回 {}。
+    两指数按交易日期交集对齐；交集不足返回 {}。
     """
     big = fetch_index_kline(INDEXES["上证50"]["sina"], 65)
     small = fetch_index_kline(INDEXES["中证1000"]["sina"], 65)
-    n = min(len(big), len(small))
-    if n < 21:
+    def _close_by_date(rows):
+        out = {}
+        for row in rows or []:
+            if not _valid_kline_row(row):
+                continue
+            day = str(row.get("date", ""))[:10]
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+            except (TypeError, ValueError):
+                continue
+            out[day] = row["close"]
+        return out
+
+    big_by_date = _close_by_date(big)
+    small_by_date = _close_by_date(small)
+    dates = sorted(set(big_by_date) & set(small_by_date))
+    if len(dates) < 21:
         return {}
-    ratios = [big[i]["close"] / small[i]["close"] for i in range(n - 21, n) if small[i]["close"]]
+    ratios = [big_by_date[day] / small_by_date[day] for day in dates[-21:]
+              if small_by_date[day]]
     if len(ratios) < 21:
         return {}
     cur = ratios[-1]
@@ -1341,7 +1534,7 @@ def detect_anomalies(tech: dict, basis: dict, fx: dict, history: dict = None) ->
     signals = []
     history = history or {}
     new_history = {k: list(v) for k, v in history.items()}
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     # 1) 股指期货贴水走扩（中性策略对冲成本上升，量化倾向降仓）
     for code in ("IC", "IM", "IF", "IH"):
         b = basis.get(code)
@@ -1925,6 +2118,7 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
         "User-Agent": "stock-news-agent-factor",
     }
     last_error = None
+    last_success_without_file = False
     for attempt in range(3):
         try:
             resp = requests.get(url, headers=headers, timeout=20)
@@ -1932,18 +2126,26 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
             files = resp.json().get("files") or {}
             fobj = files.get(FACTOR_STATE_FILENAME)
             if fobj is not None:
-                return json.loads(fobj.get("content") or "{}")
+                content = fobj.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("factor_state.json 内容为空")
+                state = json.loads(content)
+                if not isinstance(state, dict):
+                    raise ValueError("factor_state.json 根节点不是对象")
+                return state
+            last_success_without_file = True
         except Exception as e:
             last_error = e
+            last_success_without_file = False
             logger.warning(f"Gist 读取第{attempt + 1}次失败: {e}")
         if attempt < 2:
             # 指数退避（2s/4s）：短时 rate limit 窗口可被重试跨过，防贴水基线归零
             time.sleep(2 ** (attempt + 1))
-    # 首次运行（文件尚未创建）与读取失败都返回空——factor 状态丢失只影响贴水基线
-    # 积累（重新积累即可），不像推送去重基准丢失会造成重复推送，故允许空。
-    if last_error:
-        logger.warning(f"Gist factor_state.json 读取失败，按空状态处理: {last_error}")
-    return {}
+    # 只有 API 成功返回且明确没有该文件时，才允许按首次部署处理为空状态。
+    # 网络、HTTP、JSON 或结构异常不得静默为空，否则后续 _save_state 会覆盖云端历史。
+    if last_success_without_file:
+        return {}
+    raise RuntimeError(f"Gist factor_state.json 读取失败（已重试2次）: {last_error}") from last_error
 
 
 def _gist_save_factor(token: str, gist_id: str, state: dict) -> None:
@@ -1972,34 +2174,33 @@ def _gist_save_factor(token: str, gist_id: str, state: dict) -> None:
 
 def _load_state() -> dict:
     """加载状态：云端优先 Gist（跨容器持久），本地用文件"""
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
-        try:
-            return _gist_load_factor(gist_token, gist_id)
-        except Exception as e:
-            logger.warning(f"Gist 状态加载失败，降级本地: {e}")
+        # 云端状态是跨容器去重/基线的权威来源；读取失败必须停机，
+        # 禁止拿本地旧状态继续运行后再覆盖 Gist。
+        return _gist_load_factor(gist_token, gist_id)
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            return state if isinstance(state, dict) else {}
         except (ValueError, OSError):
             return {}
     return {}
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict) -> bool:
     """保存状态：本地文件总是写（作为日志/降级）；云端同时写 Gist"""
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    gist_token, gist_id = get_gist_config()
+    atomic_write_json(STATE_PATH, state)
     if gist_token and gist_id:
         try:
             _gist_save_factor(gist_token, gist_id, state)
             logger.info("因子状态已保存到 Gist（basis_history/risk_state/cooldown）")
+            return True
         except Exception as e:
-            # factor 状态丢失影响小（基线重新积累），本地已保存，不 fail-stop
-            logger.warning(f"Gist 因子状态写入失败（本地已保存）: {e}")
+            logger.error(f"Gist 因子状态写入失败（本地已保存）: {e}")
+            return False
+    return True
 
 
 def filter_by_cooldown(signals: list, state: dict) -> list:
@@ -2014,6 +2215,92 @@ def filter_by_cooldown(signals: list, state: dict) -> list:
         fresh.append(s)
         cooldown[s["key"]] = now
     return fresh
+
+
+def _rollback_cooldown(state: dict, signals: list, previous: dict) -> None:
+    """推送失败时撤销本轮已预占的冷却时间，保留下一轮重试机会。"""
+    cooldown = state.setdefault("cooldown", {})
+    for signal in signals:
+        key = signal.get("key")
+        if not key:
+            continue
+        if key in previous:
+            cooldown[key] = previous[key]
+        else:
+            cooldown.pop(key, None)
+
+
+def record_source_health(state: dict, sources_ok: dict,
+                         threshold: int = DATA_HEALTH_ALERT_ROUNDS) -> list:
+    """记录各数据维度连续失败次数，返回本轮首次达到阈值的维度名。
+
+    ``sources_ok`` 是当前轮最终结果，不区分内部使用了哪一个免费回退源：
+    只要该维度拿到有效数据就算成功。告警锁存由
+    :func:`mark_source_health_alerted` 在推送成功后设置。
+    """
+    threshold = max(1, int(threshold))
+    health = state.setdefault("source_health", {})
+    alerts = []
+    for name, ok in sources_ok.items():
+        rec = health.setdefault(name, {})
+        if ok:
+            rec["consecutive_failures"] = 0
+            rec["alerted"] = False
+        else:
+            rec["consecutive_failures"] = int(rec.get("consecutive_failures", 0)) + 1
+            rec["alerted"] = bool(rec.get("alerted", False))
+            if rec["consecutive_failures"] >= threshold and not rec["alerted"]:
+                alerts.append(name)
+    return alerts
+
+
+def mark_source_health_alerted(state: dict, names: list) -> None:
+    """仅在健康度告警实际推送成功后锁存指定维度，避免失败后漏报。"""
+    health = state.setdefault("source_health", {})
+    for name in names:
+        rec = health.get(name)
+        if isinstance(rec, dict):
+            rec["alerted"] = True
+
+
+def _push_succeeded(result: dict) -> bool:
+    """兼容 PushPlus 与企业微信的成功响应。"""
+    return isinstance(result, dict) and (
+        result.get("code") == 200 or result.get("errcode") == 0)
+
+
+def _format_source_health_alert(names: list, threshold: int) -> str:
+    """格式化连续免费数据源失败告警。"""
+    rows = "\n".join(f"- {name}：连续失败 {threshold} 轮及以上"
+                      for name in names)
+    return ("## 免费数据源连续失败告警\n\n"
+            "以下数据维度连续未取得有效数据，当前相关增强因子已按缺失降级；"
+            "核心数据不足时不会生成伪信号。\n\n" + rows)
+
+
+def maybe_push_source_health_alert(state: dict, sources_ok: dict,
+                                   allow_alert: bool = False) -> bool:
+    """按当前运行模式记录健康度，并在允许时发送连续失败告警。
+
+    ``allow_alert`` 由 ``--push`` / ``--collect`` 设置；纯 ``--dry-run`` 不
+    修改状态，也不发送告警。``--collect`` 只开启本告警，不开启因子异动推送。
+    返回值表示健康度告警是否实际发送成功。
+    """
+    if not allow_alert:
+        return False
+    alerts = record_source_health(
+        state, sources_ok, threshold=DATA_HEALTH_ALERT_ROUNDS)
+    if not alerts:
+        return False
+    result = do_push(
+        "免费数据源连续失败告警",
+        _format_source_health_alert(alerts, DATA_HEALTH_ALERT_ROUNDS),
+    )
+    if not _push_succeeded(result):
+        logger.warning("数据源健康度告警发送失败，下轮重试")
+        return False
+    mark_source_health_alerted(state, alerts)
+    return True
 
 
 # ============================================================
@@ -2059,7 +2346,7 @@ def build_snapshot(tech: dict, basis: dict, fx: dict, risk_state: str,
                 "change_pct": round(_to_float(f.get("change_pct")), 2),
             }
     out = {
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ts": datetime.now(BJT).strftime("%Y-%m-%d %H:%M"),
         "risk_state": risk_state,
         "indexes": indexes,
         "basis": basis_compact,
@@ -2073,8 +2360,6 @@ def build_snapshot(tech: dict, basis: dict, fx: dict, risk_state: str,
             "margin_yi": _to_float(flows.get("margin_yi")),
             "margin_chg_yi": _to_float(flows.get("margin_chg_yi")),
         }
-        if flows.get("main_net_source"):
-            out["flows"]["main_net_source"] = flows["main_net_source"]
     # P3（2026-08-19）：外盘/宽度/波动率/风格紧凑键
     if global_quotes:
         out["global"] = {
@@ -2141,10 +2426,8 @@ def _to_float(v, default: float = 0.0) -> float:
 
 
 def _load_realtime_state() -> dict:
-    """读 real_time_push 状态（云端 Gist 优先，本地降级）；失败返回 {}"""
-    state = {}
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    """读 real_time_push 状态（配置 Gist 时云端唯一来源）；失败返回 {}"""
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
         try:
             url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
@@ -2156,26 +2439,28 @@ def _load_realtime_state() -> dict:
             fobj = (resp.json().get("files") or {}).get(REALTIME_STATE_FILENAME)
             if fobj is not None:
                 state = json.loads(fobj.get("content") or "{}")
+                return state if isinstance(state, dict) else {}
         except Exception as e:
-            logger.debug(f"Gist 资讯状态读取失败，降级本地: {e}")
-    if not state:
-        try:
-            state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-    return state
+            logger.debug(f"Gist 资讯状态读取失败，增强联动降级为空: {e}")
+        return {}
+    try:
+        state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _pushed_news_rows(hours: int) -> list:
     """近 N 小时已推资讯 [(datetime, title)]，按时间倒序（未推/无标题/时间异常剔除）"""
     state = _load_realtime_state()
-    now = datetime.now()
+    now = datetime.now(BJT)
     rows = []
     for rec in (state.get("seen") or {}).values():
         if not isinstance(rec, dict) or not rec.get("pushed"):
             continue
         try:
-            t = datetime.strptime(str(rec.get("t", "")), "%Y-%m-%d %H:%M:%S")
+            t = datetime.strptime(
+                str(rec.get("t", "")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=BJT)
         except ValueError:
             continue
         if 0 <= (now - t).total_seconds() <= hours * 3600:
@@ -2226,7 +2511,7 @@ def format_snapshot(tech: dict, basis: dict, fx: dict, stocks: dict = None, flow
                     sector_flows: dict = None, liquidity: dict = None,
                     option: dict = None) -> str:
     """因子快照（markdown）"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M")
     lines = [f"## 量化因子快照 {now}", ""]
     # 技术面（指数级）
     lines.append("### 技术面 · 指数级")
@@ -2478,7 +2763,18 @@ def do_push(title: str, content: str) -> dict:
 # ============================================================
 # 主流程
 # ============================================================
+def _is_trading_day(day=None) -> bool:
+    """判断日期是否为 A 股交易日，统一使用北京时间作为默认日期。"""
+    return _is_workday(day or datetime.now(BJT).date(), "cn")
+
+
 def run_once(push: bool, collect: bool = False) -> dict:
+    # --collect 的快照日期会被择时入口严格校验；节假日不应把上一交易日
+    # 的数据写成当天快照，避免采集时间与数据日期脱节。
+    if collect and not _is_trading_day():
+        logger.info("今日非中国交易日，跳过因子快照采集")
+        return {"skipped": True, "reason": "non_trading_day", "pushed": []}
+
     quotes = fetch_index_quotes()
     fx = fetch_fx()
     futures = fetch_index_futures()
@@ -2521,13 +2817,27 @@ def run_once(push: bool, collect: bool = False) -> dict:
     # 机构级清洗的标志：不只拿数据，还知道自己在用什么、缺了什么；
     # 成功率 <70% 时方向信号附警示（自选股不纳入：空名单≠源失败）
     sources_ok = {
-        "指数行情": bool(quotes), "股指期货": bool(futures), "汇率": bool(fx),
-        "指数K线": bool(sh_kline), "资金流": bool(flows), "隔夜外盘": bool(global_quotes),
-        "市场宽度": bool(breadth),
-        "波动率": any(isinstance(v, dict) and v.get("available") for v in vol.values()),
-        "风格轮动": bool(style), "涨停情绪": bool(sentiment), "行业资金流": bool(sector_flows),
-        "资金面利率": bool(liquidity), "期权PCR": bool(option),
-        "分钟K线": bool(minute),
+        "指数行情": _complete_numeric_mapping(
+            quotes, INDEXES.keys(), ("price", "prev_close", "change_pct", "amount_wan"),
+            positive_fields=("price", "prev_close"), nonnegative_fields=("amount_wan",)),
+        "股指期货": _complete_numeric_mapping(
+            futures, FUTURES.keys(), ("price", "prev_settle"),
+            positive_fields=("price", "prev_settle")),
+        "汇率": _complete_numeric_mapping(
+            fx, FX.keys(), ("price", "change_pct"), positive_fields=("price",)),
+        "指数K线": _complete_kline(sh_kline),
+        "资金流": _complete_flows(flows),
+        "隔夜外盘": _complete_numeric_mapping(
+            global_quotes, tuple(GLOBAL_QUOTES) + tuple(GLOBAL_QUOTES_EM),
+            ("price", "change_pct"), positive_fields=("price",)),
+        "市场宽度": _complete_breadth(breadth),
+        "波动率": _complete_volatility(vol),
+        "风格轮动": _complete_style(style),
+        "涨停情绪": _complete_sentiment(sentiment),
+        "行业资金流": _complete_sector_flows(sector_flows),
+        "资金面利率": _complete_liquidity(liquidity),
+        "期权PCR": _complete_option(option),
+        "分钟K线": _complete_minute_kline(minute),
     }
     health = {"ok": sum(sources_ok.values()), "total": len(sources_ok)}
     health["ratio"] = round(health["ok"] / health["total"], 2) if health["total"] else 0.0
@@ -2536,6 +2846,9 @@ def run_once(push: bool, collect: bool = False) -> dict:
           + (f"（缺：{'、'.join(failed)}）" if failed else ""))
 
     state = _load_state()
+    persist = push or collect
+    health_alert_sent = maybe_push_source_health_alert(
+        state, sources_ok, allow_alert=persist)
     signals, new_history = detect_anomalies(tech, basis, fx, state.get("basis_history"))
     # P3：外盘/宽度为市场级风险（隔夜暴跌3%+、跌停潮），纳入 risk_off 口径；
     # P4：炸板潮（炸板率≥50%）同属市场级风险，并入 risk_off；
@@ -2546,6 +2859,7 @@ def run_once(push: bool, collect: bool = False) -> dict:
                + detect_liquidity_anomalies(liquidity))
     risk_state = calc_risk_state(signals)
     signals = signals + detect_flow_anomalies(flows) + detect_option_anomalies(option)
+    cooldown_before = dict(state.get("cooldown") or {})
     fresh = filter_by_cooldown(signals, state) if push else signals
 
     snapshot = format_snapshot(tech, basis, fx, stocks=stocks_tech, flows=flows,
@@ -2568,11 +2882,13 @@ def run_once(push: bool, collect: bool = False) -> dict:
     print(f"[风险状态] {risk_state}")
 
     pushed = []
+    if health_alert_sent:
+        pushed.append("免费数据源连续失败告警")
+        print("\n[推送] 数据源健康度告警已发送")
     # 状态落盘放宽为 persist（push 或 collect）：修复 2026-08-22 停推回归——
     # 原 `if push:` 门控把 build_snapshot/_save_state 一并关进推送分支，云端 --dry-run
     # 空跑不写，快照 4 天停更，择时修正层（贴水/资金/情绪）持续用旧数据。
     # collect=只采集写快照/状态不推送；dry-run=纯只读维持不变。
-    persist = push or collect
     if persist:
         state["basis_history"] = new_history
         state["risk_state"] = risk_state
@@ -2590,12 +2906,17 @@ def run_once(push: bool, collect: bool = False) -> dict:
         if fresh:
             content = "## 量化因子异动告警\n\n" + "\n\n".join(format_alert(s) for s in fresh)
             r = do_push("量化因子异动", content)
-            pushed = [s["title"] for s in fresh]
             print(f"\n[推送] {len(fresh)} 条异动：{pushed} → code={r.get('code', r.get('errcode'))}")
+            if _push_succeeded(r):
+                pushed.extend(s["title"] for s in fresh)
+            else:
+                _rollback_cooldown(state, fresh, cooldown_before)
+                logger.warning("量化因子异动推送失败，下一轮重试")
         else:
             print("\n[推送] 本轮无异动（或均在冷却期）")
         # P1-2：自选股异动单独成卡——每股附近48h相关已推资讯（D2 合并卡片），
         # 冷却 key 独立于指数告警（stock_chg_代码 等），同一股票 6h 内不重推。
+        stock_cooldown_before = dict(state.get("cooldown") or {})
         stock_fresh = filter_by_cooldown(stock_signals, state)
         if stock_fresh:
             parts = []
@@ -2607,8 +2928,12 @@ def run_once(push: bool, collect: bool = False) -> dict:
                 parts.append(block)
             content3 = "## 自选股异动\n\n" + "\n\n".join(parts)
             r3 = do_push("自选股异动", content3)
-            pushed += [s["title"] for s in stock_fresh]
             print(f"\n[推送] 自选股异动 {len(stock_fresh)} 条 → code={r3.get('code', r3.get('errcode'))}")
+            if _push_succeeded(r3):
+                pushed += [s["title"] for s in stock_fresh]
+            else:
+                _rollback_cooldown(state, stock_fresh, stock_cooldown_before)
+                logger.warning("自选股异动推送失败，下一轮重试")
         # 量化方向信号（核心需求"利好买、利空卖，和量化同步"）：多因子合成方向
         # （偏多=利好/偏空=利空/中性），方向改变时推送"量化方向信号"（含各因子利好/利空明细）。
         # 独立冷却（change_cooldown）防盘中方向抖动反复推。
@@ -2634,7 +2959,7 @@ def run_once(push: bool, collect: bool = False) -> dict:
             analysis["ic_n"] = factor_ic.get("n")
         # P4-6：方向历史落盘（每交易日一条，当日盘中多轮覆盖取最新），供后续 IC 回测；
         # 保留最近 120 个交易日（约半年，防 Gist 状态膨胀）
-        day = datetime.now().strftime("%Y-%m-%d")
+        day = datetime.now(BJT).strftime("%Y-%m-%d")
         dhist = state.setdefault("direction_history", {})
         dhist[day] = {
             "dir": analysis["direction"], "score": analysis["score"],
@@ -2651,6 +2976,7 @@ def run_once(push: bool, collect: bool = False) -> dict:
         prev_weak = state.get("weak_direction") or {}
         escalated = (not changed and prev_weak.get("dir") == analysis["direction"]
                      and abs(analysis["score"]) >= STRONG_DIR_THRESHOLD)
+        direction_state_update = True
         if changed or escalated:
             if abs(analysis["score"]) >= STRONG_DIR_THRESHOLD:
                 now_ts = time.time()
@@ -2675,36 +3001,57 @@ def run_once(push: bool, collect: bool = False) -> dict:
                     r4 = do_push("量化方向信号", content)
                     print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}，强信号）"
                           f" → code={r4.get('code', r4.get('errcode'))}")
-                    change_cooldown["direction"] = now_ts
-                    state.pop("weak_direction", None)
+                    if _push_succeeded(r4):
+                        change_cooldown["direction"] = now_ts
+                        state.pop("weak_direction", None)
+                    else:
+                        direction_state_update = False
+                        logger.warning("量化方向信号推送失败，下一轮重试")
             else:
                 state["weak_direction"] = {
                     "dir": analysis["direction"], "score": analysis["score"],
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "ts": datetime.now(BJT).strftime("%Y-%m-%d %H:%M"),
                 }
                 print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}）弱翻转"
                       f"（<{STRONG_DIR_THRESHOLD}），不单独推送，进简报")
-        state["last_direction"] = analysis["direction"]
+        if direction_state_update:
+            state["last_direction"] = analysis["direction"]
     if persist:
-        _save_state(state)
+        if _save_state(state) is False:
+            raise RuntimeError("因子状态写入失败，禁止报告采集成功")
 
     return {"tech": tech, "basis": basis, "fx": fx, "signals": signals, "pushed": pushed}
 
 
+def _configure_stdout() -> None:
+    """让 Windows 非 UTF-8 控制台替换无法编码的报告字符，而不是崩溃。"""
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        # pytest/caller 提供的类文件对象可能没有可重配置的底层编码。
+        pass
+
+
 def _is_trading_time(now: datetime = None) -> bool:
-    """A股交易时段：周一至周五 9:30-11:30 / 13:00-15:00（不含节假日，第一版用 weekday 近似）
+    """A股交易时段：交易日 9:30-11:30 / 13:00-15:00。
 
     实时因子（基差/汇率/量比）在盘中分分钟变化，交易时段必须高频轮询；
-    非交易时段因子静止，降频省资源。
+    非交易时段因子静止，降频省资源。中国节假日通过公共日历判断，
+    依赖缺失时由 ``_is_workday`` 回退到周一至周五。
     """
-    now = now or datetime.now()
-    if now.weekday() >= 5:
+    now = now or datetime.now(BJT)
+    if not _is_workday(now.date(), "cn"):
         return False
     hm = now.hour * 60 + now.minute
     return (9 * 60 + 30 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60)
 
 
 def main():
+    _configure_stdout()
     parser = argparse.ArgumentParser(description="量化因子采集器")
     parser.add_argument("--dry-run", action="store_true", help="只采集+计算+打印，不推送")
     parser.add_argument("--push", action="store_true", help="打印快照；有异动且过冷却则推送")

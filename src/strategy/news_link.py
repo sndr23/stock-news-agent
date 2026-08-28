@@ -20,9 +20,13 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
+
+from src.strategy.state_io import get_gist_config
+
+from .data_freshness import BJT, is_recent_data_date
 
 logger = logging.getLogger("strategy.news_link")
 
@@ -61,31 +65,27 @@ def _http_get_json(url: str, timeout: int = 15) -> dict:
 
 
 def load_realtime_state() -> dict:
-    """读资讯流状态（云端 Gist 优先，失败/无配置降级本地）。只读，永不写回。"""
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+    """读资讯流状态（配置 Gist 时云端唯一来源，否则读本地）。只读。"""
+    gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
-        try:
-            url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-            req = Request(url, headers={"Authorization": f"token {gist_token}",
-                                        "Accept": "application/vnd.github+json",
-                                        "User-Agent": "strategy-news-link"})
-            with urlopen(req, timeout=15) as resp:
-                g = json.loads(resp.read().decode("utf-8"))
-            fobj = (g.get("files") or {}).get(REALTIME_STATE_FILENAME)
-            if fobj is not None:
-                return json.loads(fobj.get("content") or "{}")
-        except Exception as e:
-            logger.warning("Gist 资讯状态读取失败，降级本地: %s", type(e).__name__)
+        # Gist 是跨容器资讯状态的权威来源；失败时禁止使用本地旧事件，
+        # 否则资讯联动可能把旧日事件误算进当日策略上下文。
+        return _read_gist_file(REALTIME_STATE_FILENAME, strict=True)
     try:
-        return json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def load_factor_state() -> dict:
-    """读因子状态（云端 Gist 优先，本地降级）。只读。"""
-    return _read_gist_file(FACTOR_STATE_FILENAME) or _read_local(_FACTOR_STATE_PATH)
+    """读因子状态（配置 Gist 时云端唯一来源，否则读本地）。只读。"""
+    gist_token, gist_id = get_gist_config()
+    if gist_token and gist_id:
+        # Gist 是跨容器状态的权威来源；请求失败或内容损坏时不能拿本地旧快照
+        # 继续运行，否则旧因子可能悄悄改变当日仓位。
+        return _read_gist_file(FACTOR_STATE_FILENAME, strict=True)
+    return _read_local(_FACTOR_STATE_PATH)
 
 
 CITIC_POS_STATE_FILENAME = "citic_pos_state.json"
@@ -93,14 +93,21 @@ _CITIC_POS_STATE_PATH = PROJECT_ROOT / "logs" / "citic_pos_state.json"
 
 
 def load_citic_pos_state() -> dict:
-    """读中信期货净持仓状态（云端 Gist 优先，本地降级）。只读。"""
-    return _read_gist_file(CITIC_POS_STATE_FILENAME) or _read_local(_CITIC_POS_STATE_PATH)
+    """读中信期货净持仓（配置 Gist 时云端唯一来源，否则读本地）。只读。"""
+    gist_token, gist_id = get_gist_config()
+    if gist_token and gist_id:
+        # 同一 Gist 配置下禁止云端失败后混用本地旧持仓。
+        return _read_gist_file(CITIC_POS_STATE_FILENAME, strict=True)
+    return _read_local(_CITIC_POS_STATE_PATH)
 
 
-def _read_gist_file(filename: str) -> dict:
-    """从共用 Gist（GIST_ID）读指定状态文件；失败/无配置返回 {}"""
-    gist_token = os.getenv("GIST_TOKEN", "").strip()
-    gist_id = os.getenv("GIST_ID", "").strip()
+def _read_gist_file(filename: str, strict: bool = False) -> dict:
+    """从共用 Gist 读指定状态文件。
+
+    默认模式供只读增强数据使用，失败/无配置返回空；strict 模式供有写回
+    语义的状态使用，读取异常必须抛出，且成功但缺文件仍明确返回空状态。
+    """
+    gist_token, gist_id = get_gist_config()
     if not (gist_token and gist_id):
         return {}
     try:
@@ -112,27 +119,36 @@ def _read_gist_file(filename: str) -> dict:
             g = json.loads(resp.read().decode("utf-8"))
         fobj = (g.get("files") or {}).get(filename)
         if fobj is not None:
-            return json.loads(fobj.get("content") or "{}")
+            content = fobj.get("content")
+            if strict and (not isinstance(content, str) or not content.strip()):
+                raise ValueError(f"Gist 状态文件 {filename} 内容为空")
+            state = json.loads(content or "{}")
+            if strict and not isinstance(state, dict):
+                raise ValueError(f"Gist 状态文件 {filename} 根节点不是对象")
+            return state
     except Exception as e:
         logger.warning("Gist 状态文件 %s 读取失败: %s", filename, type(e).__name__)
+        if strict:
+            raise RuntimeError(f"Gist 状态文件 {filename} 读取失败，拒绝回退本地") from e
     return {}
 
 
 def _read_local(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def recent_pushed_events(state: dict, hours: float = 48.0) -> list:
     """从资讯流 state 提取近 N 小时已推事件列表（倒序，含 title_norm/dir/stocks/sectors）"""
-    now = datetime.now()
+    now = datetime.now(BJT)
     out = []
     for e in (state.get("pushed_events") or []):
         t = str(e.get("t") or "")
         try:
-            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+            ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BJT)
         except ValueError:
             continue
         if not (0 <= (now - ts).total_seconds() <= hours * 3600):
@@ -159,7 +175,7 @@ def today_news_events(state: dict, today: str = None) -> list:
     按 (日期, 事件签名) 去重（已推送的候选同时在 pushed_events 与 candidate_events，
     并集去重避免重复计权），倒序返回。方向由 dir 字段（LLM 判定）承载。
     """
-    today = today or datetime.now().strftime("%Y-%m-%d")
+    today = today or datetime.now(BJT).strftime("%Y-%m-%d")
     ded = {}
     for e in (*((state.get("pushed_events")) or []),
               *((state.get("candidate_events")) or [])):
@@ -320,7 +336,8 @@ def merge_watchlist_holdings(watchlist: dict, holdings: dict, names: dict) -> di
 
 def macro_exposure(state_factor: dict,
                    base_exposure: float = 1.0,
-                   citic_state: dict = None) -> dict:
+                   citic_state: dict = None,
+                   today: date = None) -> dict:
     """L3 宏观 overlay：读 factor_state 快照 + 中信期货净持仓，产出仓位系数修正。
     返回 {"factor": 修正系数, "reasons": [原因], "exposure": base*factor}。
     约束：只读、向下修正（顶部风险），IC 深度贴水/资金大幅流出/中信大幅加空时减仓。
@@ -348,9 +365,25 @@ def macro_exposure(state_factor: dict,
     elif risk_state:
         reasons.append(f"风险状态：{risk_state}")
 
-    # 中信期货全合约净持仓方向（L3 目标要求 2026-08-21）：取 pos_history 最新一条
+    # 中信日报通常在收盘后才公布，允许使用上一交易日；更早的记录不能继续
+    # 影响基金轮动仓位。按日期挑选最近的新鲜记录，兼容历史列表无序情况。
     citic_hist = (citic_state or {}).get("pos_history") or []
-    citic_latest = citic_hist[-1] if citic_hist else None
+    citic_latest = None
+    citic_stale = bool(citic_hist)
+    today = today or datetime.now(BJT).date()
+    if isinstance(citic_hist, list):
+        fresh = []
+        for item in citic_hist:
+            if not isinstance(item, dict):
+                continue
+            day = str(item.get("day") or "")[:10]
+            if is_recent_data_date(day, max_lag_days=1, calendar="cn", today=today):
+                fresh.append((day, item))
+        if fresh:
+            citic_latest = max(fresh, key=lambda pair: pair[0])[1]
+            citic_stale = False
+    if citic_stale and citic_latest is None:
+        reasons.append("中信持仓数据过期或格式无效，忽略该增强项")
     if citic_latest:
         net = _to_float((citic_latest.get("net") or {}).get("_total"))
         if net is not None:

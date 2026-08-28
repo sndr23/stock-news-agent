@@ -15,13 +15,14 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
 
 from src.strategy import fund_data as fd  # noqa: E402
 from src.strategy import fund_rotation as fr  # noqa: E402
@@ -30,6 +31,12 @@ from src.tools.push import push_via_pushplus, push_via_wecom  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("fund_rotation")
+BJT = timezone(timedelta(hours=8))
+
+
+def _load_local_env() -> None:
+    """加载本地运行配置；已有进程环境变量优先于项目 .ENV。"""
+    load_dotenv(PROJECT_ROOT / ".ENV", override=False)
 
 
 def push_report(content: str, title: str) -> bool:
@@ -109,7 +116,7 @@ def gather_signals(funds: list) -> list:
 def render_report(result: fr.AdviceResult, signals: list,
                   exposure_reasons: list, cfg: dict) -> str:
     """组装推送文本。"""
-    now = datetime.now().strftime("%m-%d %H:%M")
+    now = datetime.now(BJT).strftime("%m-%d %H:%M")
     acts = result.actions
     trade = [a for a in acts if a["action"] in ("买入", "卖出", "加仓", "减仓")]
     head = f"【基金轮动 {now}】"
@@ -148,6 +155,7 @@ def render_report(result: fr.AdviceResult, signals: list,
 
 
 def main():
+    _load_local_env()
     ap = argparse.ArgumentParser(description="基金轮动信号（场外基金手动执行版）")
     ap.add_argument("--dry-run", action="store_true", help="仅打印不推送")
     ap.add_argument("--push", action="store_true", help="推送到微信")
@@ -175,7 +183,7 @@ def main():
     print("\n" + report + "\n")
 
     if args.push:
-        now = datetime.now().strftime("%m-%d")
+        now = datetime.now(BJT).strftime("%m-%d")
         if push_report(report, f"基金轮动信号 {now}"):
             logger.info("已推送")
         else:
