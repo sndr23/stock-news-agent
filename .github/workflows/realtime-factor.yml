@@ -1,10 +1,11 @@
 # filepath: .github/workflows/realtime-factor.yml
-name: 量化因子采集（仅采集，不推送）
+name: 量化因子采集（仅采集，故障告警）
 
 # 2026-08-22 停推：盘中不再推送因子异动到微信（用户决定完全停推）。
+# 仅在免费数据维度连续失败达到阈值时发送健康度告警。
 # 保留采集：factor_state.json 快照（贴水/资金/情绪/risk_state）是创业板择时系统
 # run_chinext_timing.py 修正层的数据源，必须持续更新，否则择时修正层降级为 0。
-# 触发方式（与实时重大资讯推送一致，外部定时服务 + 手动，不用 GitHub 自带 cron）:
+# 触发方式（外部定时服务为主，GitHub schedule 为失联兜底 + 手动）:
 #   1. cron-job.org 按分时段策略 POST 到 Actions API 触发 workflow_dispatch
 #      URL: https://api.github.com/repos/{owner}/{repo}/actions/workflows/realtime-factor.yml/dispatches
 #      Method: POST   Headers: Authorization: Bearer <PAT>、Accept: application/vnd.github+json
@@ -13,8 +14,12 @@ name: 量化因子采集（仅采集，不推送）
 #      - A股盘中（9,10,11,13,14 小时）: 每 15 分钟 —— 基差/汇率/量比盘中分分钟变化
 #      - 其余时段（含美股盘中）: 每 60 分钟 —— 日元/隔夜套息风险低频监测
 #      （美股盘中 A股基差闭市静止，无需高频；总次数 ≈ 20+12 = 32/日，私仓配额友好）
-#   2. 手动 workflow_dispatch 立即执行一轮（验证用）
+#   2. GitHub schedule 每个工作日北京时间 14:15 兜底一次，确保 14:45
+#      创业板信号前至少有一轮快照更新；schedule 可能延迟，不能替代外部准点触发。
+#   3. 手动 workflow_dispatch 立即执行一轮（验证用）
 on:
+  schedule:
+    - cron: "15 6 * * 1-5"   # UTC 06:15 = 北京时间 14:15
   workflow_dispatch:
 
 # 防并发: 与资讯推送(concurrency: realtime-push)独立 group，两者可并行；
@@ -35,6 +40,7 @@ jobs:
       # 状态持久化（必配！云端每次全新容器，贴水基线/risk_state 必须存 Gist 才能跨轮积累）
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
+      DATA_HEALTH_ALERT_ROUNDS: "3"
 
     steps:
       - name: 检出代码
@@ -55,7 +61,8 @@ jobs:
       - name: 运行单元测试门禁
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
 
-      # --collect：只采集+写快照/状态（贴水/资金/情绪/risk_state），不推送。
+      # --collect：采集+写快照/状态（贴水/资金/情绪/risk_state），仅允许健康度故障告警，
+      # 不恢复普通量化因子异动推送。
       # 修复 2026-08-22 回归：原 --dry-run 空跑，快照.ts 停留在 08-21，择时修正层用旧数据。
       - name: 执行因子采集（写快照供择时系统，不推送）
         run: python scripts/factor_collector.py --collect

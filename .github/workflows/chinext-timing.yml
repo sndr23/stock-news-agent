@@ -6,15 +6,16 @@ name: 创业板仓位信号
 # + factor_state 快照（贴水/资金/情绪/宽度/波动分位/risk_state）+ 缠论结构
 # + 消息推送（PushPlus / 企业微信）。状态写入 Gist 跨容器持久化 + 本地降级。
 #
-# ⚠ 调度（2026-08-22 修正）：用 cron-job.org 外部定时服务触发，避免 GitHub 自带 cron
-#   的 5-20 分钟调度延迟——14:45+延迟+依赖安装可能错过 15:00 截单。
+# ⚠ 调度（2026-08-22 修正）：仅由 cron-job.org 准点主触发，不添加提前的 GitHub schedule。
+#   GitHub 自带 cron 有 5-20 分钟调度延迟，不能保证 14:45+依赖安装后仍赶上 15:00 截单；
+#   提前 schedule 会先写入 last_date，抢跑并抑制正常的 14:45 主触发。
 #   配置（与 realtime-push.yml 同机制）：
 #   cron-job.org 每日一次，cron="45 14 * * 1-5"（北京时间 14:45 触发，调度延迟<1 分钟；脚本运行约 1-2 分钟，推送约 14:47 送达，15:00 截单前余量充足）。
 #   URL:  https://api.github.com/repos/{owner}/{repo}/actions/workflows/chinext-timing.yml/dispatches
 #   Method: POST   Headers: Authorization: Bearer <PAT>、Accept: application/vnd.github+json
 #   Body: {"ref": "main"}
 #   首次手动验证：Actions → 创业板仓位信号 → Run workflow → Run
-#   重复 run 由脚本 last_date 去重兜底。
+#   重复 run 由 concurrency + 脚本 last_date 去重兜底；外部调度失联需人工恢复或手动触发。
 on:
   workflow_dispatch:
     inputs:

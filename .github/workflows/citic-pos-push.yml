@@ -62,8 +62,13 @@ jobs:
             python scripts/push_citic_futures_pos.py $FORCE_FLAG && exit 0
             code=$?
             if [ "$code" -eq 2 ]; then
-              echo "第 ${i} 次：持仓排名数据未就绪，10 分钟后重试"
-              sleep 600
+              if [ "$i" -lt 4 ]; then
+                echo "第 ${i} 次：持仓排名数据未就绪，10 分钟后重试"
+                sleep 600
+              else
+                echo "第 ${i} 次：持仓排名数据仍未就绪，立即放弃本次推送"
+                exit 2
+              fi
             else
               exit "$code"
             fi

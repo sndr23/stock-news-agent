@@ -1,50 +1,48 @@
-# Development Plan — SNA-01（P0 数据源加固：Tushare Pro 接入）
+# Development Plan — 免费数据源加固
 
 > 权威职责：当前 READY Task 的详细执行合同。由 Coordinator 与 Worker 共同维护。
-> 状态：**已执行**（commit 8a25a47，2026-08-27；验收①-④达成，⑤一致性抽查待 token——见 ND-002）
-> 注：实际实现中个股链 Tushare 通道放在 `src/strategy/data.py`（`load_stock_primary`，与指数链共用 `_tushare_client` 单例），未动 `fund_data.py`；创业板50 PE 的 Tushare 通道按口径评估定位为**备份源**而非主源（index_dailybasic 整体法 PE 与乐咕 TTM 存在系统性口径差，主源保持乐咕以稳定回测口径，详见 `index_pe.py::_fetch_pe_tushare` docstring）。
+> 状态：**已执行**（2026-08-27；免费数据源链路保留并完成回退验证）
+> 注：生产只使用免费公开接口，不保存、不读取付费数据源 token。
 
 ## 目标
 
-将 399006 日线 / 中际旭创日线 / 创业板50 TTM PE 三个核心数据点从"免费 HTTP 抓取"升级为"付费源（Tushare Pro）优先 → 免费源降级"双通道，免费源永不删除。
+稳定 399006 日线 / 中际旭创日线 / 创业板50 TTM PE 三个核心数据点的免费数据源链路，免费源失败时按既有回退路径运行，缺失增强维度不阻断主信号。
 
 ## 输入
 
 - `docs/数据源加固方案_20260822.md`（P0 章节）
 - 现有 loader：`src/strategy/data.py`（指数日线）、`src/strategy/fund_data.py`（个股）、`src/strategy/index_pe.py`（PE）
-- 环境变量：`TUSHARE_TOKEN`（新）
+- 环境变量：无新增数据源鉴权配置
 
 ## 输出（改动范围）
 
-- `src/strategy/data.py`：`_fetch_index_full_frame` 系列 loader 增加 Tushare 优先通道
-- `src/strategy/fund_data.py`：中际旭创日线 loader 增加 Tushare 优先通道
-- `src/strategy/index_pe.py`：创业板50 TTM PE loader 增加 Tushare `index_dailybasic` 优先通道
-- `tests/**`：新增 mock 测试覆盖双通道与降级
-- `docs/数据源加固方案_20260822.md`：标记 P0 实施状态
+- `src/strategy/data.py`：保留新浪全量/个股、东财和腾讯免费回退链
+- `src/strategy/index_pe.py`：保留乐咕创业板50 TTM PE，失败时估值维度降为 0
+- `scripts/factor_collector.py`：保留新浪→中金所期货链、东财资金流链
+- `tests/**`：覆盖免费源成功、失败和独立维度降级
 
 ## 边界
 
 - **不改业务层**：所有 loader 保持返回同构 DataFrame，调用方零改动。
-- **不改** `requirements.txt` 之外的必要依赖（如 tushare 包需要加，记录在 Task Notes）。
-- **不删免费源**：付费源只是降级链头部。
+- **不改** `requirements.txt` 之外的必要依赖；不引入需要鉴权的行情接口。
+- **不删免费源**：所有免费接口和本地缓存都保留在降级链中。
 - **不进 Git 的**：真实 token（只存环境变量）。
 
 ## Acceptance（DONE 门槛）
 
-1. token 配置时，loader 优先走 Tushare 且返回同构 DataFrame。
-2. token 缺失 / 过期 / 网络失败 → 自动降级免费源，不抛错、不无信号。
-3. 新增 mock 测试覆盖双通道（有 token / 无 token / token 失效）。
+1. 免费源成功时返回现有调用方需要的同构数据。
+2. 免费接口网络失败或返回空数据时按既有回退链运行，不抛错、不无信号。
+3. 主信号数据失败时明确退出，不推送伪造信号；增强维度失败时独立降为 0。
 4. `python -m pytest tests/ -q -m "unit"` 全绿。
-5. 399006 日线一致性抽查：Tushare 与新浪源近 60 日 close 序列对齐（容忍除权/停牌日差异）。
-6. 文档同步：`docs/status.md` NEXT 更新、`docs/task-board.md` SNA-01 → DONE。
+5. 文档同步：免费数据源链路、降级语义和运行状态保持一致。
 
 ## 验证方法
 
 - 单元：`pytest -m unit`
-- 集成抽查：设置测试 token 后 `python -c "from src.strategy.data import *; ..."` 拉取 399006 与新浪对比
-- 回归：择时系统 `python scripts/run_chinext_timing.py --backtest` 数字不低于基线
+- 集成抽查：运行 `python scripts/run_chinext_timing.py --dry-run`，检查 399006、旭创、因子快照和估值缺失时的降级提示
+- 回归：择时系统 `python scripts/run_chinext_timing.py --backtest` 使用 d-1 最近完整收盘信息，输出结果可复现并如实记录；不以历史宽松口径收益作为硬门槛
 
 ## 风险 / 注意
 
-- Tushare 积分制：基础日线接口免费积分足够个人日频使用；token 需用户注册获取。
-- 若用户暂无 token：SNA-01 可拆为"先实现双通道框架 + mock 验证"，真实 token 联调待用户提供（记录 ND 或 Task Notes）。
+- 免费接口存在限流、字段漂移和临时不可达风险，需依赖缓存与多源回退。
+- 估值和资金流属于增强维度，源失败时不改变核心层主信号。

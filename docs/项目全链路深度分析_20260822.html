@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>A股量化监测 Agent 全链路深度分析 · 2026-08-22</title>
+<title>A股量化监测 Agent 全链路深度分析 · 2026-08-28 复核</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -92,12 +92,12 @@
   <div class="kicker">Full-Chain Deep Analysis · 只读审查</div>
   <h1>A股量化监测 Agent 全链路深度分析</h1>
   <div class="sub">多源聚合资讯推送（LLM 判定软信号）+ 创业板单资产择时（量化内核）+ 因子采集/回测/持仓日报 的完整技术体检</div>
-  <div class="meta">审查时间 2026-08-22 20:56 (GMT+8) ｜ 范围 src/ + scripts/ + .github/ + tests/ + logs/ + data/ + archive/ ｜ 无代码改动</div>
+  <div class="meta">复核时间 2026-08-28 (GMT+8) ｜ 范围 src/ + scripts/ + .github/ + tests/ + logs/ + data/ + archive/ ｜ 基于当前工作区与测试结果更新</div>
 </header>
 
 <div class="cards">
   <div class="card"><div class="num" style="color:var(--blue)">15.8k</div><div class="lbl">活跃代码行数</div><div class="hint">real_time_push 3041 行为最大单体</div></div>
-  <div class="card"><div class="num" style="color:var(--green)">856</div><div class="lbl">测试函数 / 41 文件</div><div class="hint">全 mock 无网络，CI 门禁</div></div>
+  <div class="card"><div class="num" style="color:var(--green)">1081</div><div class="lbl">unit 通过 / 21 deselected</div><div class="hint">全 mock 无网络，CI 门禁</div></div>
   <div class="card"><div class="num" style="color:var(--purple)">6</div><div class="lbl">GitHub Actions</div><div class="hint">全部带 concurrency + 测试门禁</div></div>
   <div class="card"><div class="num" style="color:var(--orange)">133</div><div class="lbl">git 提交</div><div class="hint">2026-08 密集迭代</div></div>
   <div class="card"><div class="num" style="color:var(--cyan)">10</div><div class="lbl">新闻/信号源</div><div class="hint">8 新闻 + 龙虎榜/业绩预告</div></div>
@@ -107,7 +107,7 @@
 <h2>一、结论先行</h2>
 
 <div class="lead">
-  <b>本质是两套系统，不是一个"量化程序"。</b>① 事件驱动资讯推送——LLM 判定 + 三层去重 + 微信快讯，是<b>软信号/信息流系统</b>；② 创业板单资产择时——10 因子打分 + 仓位状态机 + 缠论 + 旭创双确认，是<b>真正的量化内核</b>。另有因子采集、信号回测、中信持仓日报、简报等辅助链路。
+  <b>本质是两套系统，不是一个"量化程序"。</b>① 事件驱动资讯推送——LLM 判定 + 三层去重 + 微信快讯，是<b>软信号/信息流系统</b>；② 创业板单资产择时——9 个注册因子（8 个有效）打分 + 仓位状态机 + 缠论 + 旭创双确认，是<b>真正的量化内核</b>。另有因子采集、信号回测、中信持仓日报、简报等辅助链路。
 </div>
 
 <div class="lead">
@@ -115,7 +115,7 @@
 </div>
 
 <div class="lead">
-  <b>最需审慎的是回测数字。</b>择时"生产口径 +188.8% / 基线 +291.9% / 持有 +171.3%"的超额主要来自<b>熊市降仓（平均仓位 53%）而非方向预测能力</b>；降档后 10 日仅 51% 段下跌 ≈ 掷硬币；因子权重经 12 年同一样本 in-sample 寻优。更关键的是<b>回测信息集不对称</b>：docstring 声称"≤d-1 收盘"，实际因子用 <code>close[:i+1]</code>（含当日收盘）当日决策——修正为昨收口径 <code>comp[d-1]</code> 后 +291.93%→+163.69%，<b>跑输买入持有 +171.28%</b>，严格口径下无可验证正向 alpha。
+  <b>最需审慎的是回测数字。</b>当前严格信息集回测为策略累计 <b>+105.3%</b>、年化 <b>+6.2%</b>、夏普 <b>0.46</b>、最大回撤 <b>-42.1%</b>；买入持有 <b>+170.1%</b>、最大回撤 <b>-69.7%</b>。首轮 walk-forward OOS 为策略 <b>+64.6%</b>、年化 <b>+5.7%</b>、夏普 <b>0.41</b>、最大回撤 <b>-27.8%</b>，买入持有 <b>+111.2%</b>；计入单次换仓成本 0.3% 后，OOS 为 <b>+19.0%</b>、年化 <b>+2.0%</b>、夏普 <b>0.20</b>、最大回撤 <b>-38.3%</b>。当前证据支持回撤改善，不支持跑赢买入持有或存在稳定 alpha。旧口径仅作历史对照。
 </div>
 
 <div class="lead">
@@ -123,7 +123,7 @@
 </div>
 
 <div class="lead verdict">
-  <b>工程债与隐藏问题并存（本次审查新发现）：</b>Gist 读-改-写非原子（高）· 择时权重 in-sample（高）· <code>run_fund_rotation.py:29</code> 存在<b>必然 ImportError</b>（<code>push_report</code> 不存在）· <code>decide_position</code> 的 capped 语义误导 · 修正层分项封顶未落实 · 数据源 100% 免费 HTTP 抓取（东财已实证反爬）。
+  <b>当前工程风险集中在状态并发、外部调度和免费源可用性：</b>Gist 读-改-写仍非原子（高）· 外部定时服务与 Actions 最近实际运行记录尚未核验（中）· 数据源全部为免费 HTTP 抓取，东财、Yahoo/Stooq 已有反爬或限流实证（中低）。基金轮动入口、<code>capped</code> 语义和修正层分项封顶问题已修复，不再列为当前故障。
 </div>
 
 <h2>二、系统架构全景</h2>
@@ -169,15 +169,15 @@
 
   <!-- ③ 择时 -->
   <rect x="170" y="380" width="780" height="130" rx="10" fill="#161b22" stroke="#2d333b"/>
-  <text x="190" y="406" fill="#58a6ff" font-size="14" font-weight="700">③ 创业板仓位择时 · run_chinext_timing.py (742 行) — 每日 14:45 推送</text>
-  <text x="190" y="430" fill="#e6edf3" font-size="11.5">核心层 10 因子（趋势0.35/量价0.20/波动0.20/估值0.10/落袋0.15，可回测）</text>
+  <text x="190" y="406" fill="#58a6ff" font-size="14" font-weight="700">③ 创业板仓位择时 · run_chinext_timing.py (约 900 行) — 每日 14:45 推送</text>
+  <text x="190" y="430" fill="#e6edf3" font-size="11.5">核心层 9 个注册/8 个有效因子（趋势0.35/量价0.20/波动0.20/估值0.10/落袋0.15，可回测）</text>
   <text x="190" y="448" fill="#e6edf3" font-size="11.5">+ 修正层(贴水/资金/情绪/资讯/缠论/旭创, ±0.30 封顶)</text>
   <text x="190" y="466" fill="#e6edf3" font-size="11.5">+ 硬风控(回撤/波动分位/risk_off/深贴水/急跌/顶背驰/外盘/ERP极贵封顶)</text>
   <text x="190" y="490" fill="#9da7b3" font-size="11.5">→ 档位状态机 0/60/90/100%：升档连续2日确认 · 降档当日生效 → 微信推送</text>
 
   <!-- ④⑤⑥⑦ -->
   <rect x="60" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
-  <text x="180" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">④ 信号回测(周六) · 后1/3/5日一致率+IC</text>
+  <text x="180" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">④ 信号回测(周六) · 后1/3/5/10日一致率+IC</text>
   <rect x="440" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
   <text x="560" y="547" fill="#9da7b3" font-size="11.5" text-anchor="middle">⑤ 中信持仓日报(17:00) · 全合约聚合</text>
   <rect x="820" y="526" width="240" height="34" rx="8" fill="#1c2330" stroke="#2d333b"/>
@@ -206,7 +206,7 @@
 <table>
   <tr><th>Workflow</th><th>触发方式</th><th>频次</th><th>状态</th><th>备注</th></tr>
   <tr><td><code>realtime-push</code></td><td>cron-job.org POST workflow_dispatch</td><td>盘中每 30 分钟</td><td><span class="tag t-green">生产</span></td><td>不用自带 cron（延迟 5-20min）；私有仓 2000min/月额度接近上限</td></tr>
-  <tr><td><code>realtime-factor</code></td><td>cron-job.org 分时段</td><td>盘中15min/美股30min/其余60min ≈46 次/日</td><td><span class="tag t-blue">仅采集</span></td><td>2026-08-22 起 <code>--dry-run</code> 停推，保 snapshot 供择时</td></tr>
+  <tr><td><code>realtime-factor</code></td><td>cron-job.org 分时段 + GitHub schedule 兜底</td><td>外部分时段采集；工作日 14:15（北京时间）兜底 1 次</td><td><span class="tag t-blue">仅采集</span></td><td>执行 <code>--collect</code> 写 snapshot；普通异动停推，仅保留健康告警</td></tr>
   <tr><td><code>chinext-timing</code></td><td>cron-job.org 每日 14:45</td><td>1 次/日</td><td><span class="tag t-green">生产</span></td><td>jobId=8309384；last_date 去重兜底</td></tr>
   <tr><td><code>citic-pos-push</code></td><td>GitHub cron 17:00</td><td>1 次/日</td><td><span class="tag t-green">生产</span></td><td>数据未就绪退出码2 → 10min×4 重试</td></tr>
   <tr><td><code>market-brief</code></td><td>GitHub cron 08:45 / 15:10</td><td>2 次/日</td><td><span class="tag t-green">生产</span></td><td>对延迟不敏感，可直接用自带 cron</td></tr>
@@ -269,7 +269,7 @@
 <div class="grid3">
   <div class="card">
     <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">核心层（可回测 · 权重 100% 基准）</div>
-    <p style="font-size:12px;margin-top:8px">趋势 0.35 + 量价 0.20 + 波动 0.20 + 估值 0.10 + 落袋 0.15<br>10 因子全部由 399006 日线计算，12 年可回测</p>
+    <p style="font-size:12px;margin-top:8px">趋势 0.35 + 量价 0.20 + 波动 0.20 + 估值 0.10 + 落袋 0.15<br>9 个注册因子（8 个有效）全部由 399006 日线计算，12 年可回测</p>
     <div class="bar"><i style="width:35%;background:#f85149"></i></div>
     <div class="bar"><i style="width:20%;background:#d29922"></i></div>
     <div class="bar"><i style="width:20%;background:#58a6ff"></i></div>
@@ -278,7 +278,7 @@
   </div>
   <div class="card">
     <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">修正层（当日实时 · ±0.30 封顶）</div>
-    <p style="font-size:12px;margin-top:8px">贴水 ±0.06 + 资金 ±0.05 + 情绪 ±0.04 + 资讯 ±0.06<br>+ 缠论 ±0.08 + 旭创双确认 ±0.10<br><span class="tag t-orange">注意</span> 分项上限未落实，仅总 clamp 生效</p>
+    <p style="font-size:12px;margin-top:8px">贴水 ±0.06 + 资金 ±0.05 + 情绪 ±0.04 + 资讯 ±0.06<br>+ 缠论 ±0.08 + 旭创双确认 ±0.10<br><span class="tag t-green">已落实</span> 资金/情绪/资讯分项上限与总 clamp 均生效</p>
   </div>
   <div class="card">
     <div class="lbl" style="font-size:13px;font-weight:700;color:var(--text)">硬风控（最高优先级 · 覆盖一切）</div>
@@ -312,26 +312,25 @@
 <h4>回测口径与数字（必须诚实解读）</h4>
 <table>
   <tr><th>口径</th><th>累计</th><th>夏普</th><th>最大回撤</th><th>卡玛</th><th>解读</th></tr>
-  <tr><td>生产配置（含 ERP 极贵封顶）</td><td><b>+188.8%</b></td><td>0.60</td><td>-42.0%</td><td>0.22</td><td>用户拍板保留的保守变体（牺牲 ~103pp 收益换泡沫期约束）</td></tr>
-  <tr><td>基线（无估值滤波）</td><td>+291.9%</td><td>0.68</td><td>-42.8%</td><td>0.28</td><td>超额主要来自熊市降仓：平均仓位 53%</td></tr>
-  <tr><td>买入持有</td><td>+171.3%</td><td>—</td><td>-69.7%</td><td>0.12</td><td>最实在的改善项是回撤 -69.7% → -42%</td></tr>
+  <tr><td>严格全历史策略</td><td><b>+105.3%</b></td><td>0.46</td><td>-42.1%</td><td>0.15</td><td>跑输买入持有；平均仓位 44%，主要价值仍是控制回撤</td></tr>
+  <tr><td>买入持有</td><td>+170.1%</td><td>—</td><td>-69.7%</td><td>—</td><td>严格信息集基准</td></tr>
 </table>
 <p><b>验门纪律</b>（全项目最"量化"处）：因子进核心层必须 |IC|≥0.05 且样本≥10；已关闭业绩预告（IC=0）、两融、外盘打分（全样本 IC&lt;0.05）、估值打分（样本外负贡献，仅保留极贵封顶滤波）。</p>
 
 <div class="quote">
-  ⚠️ <b>附注 A 勘误</b>：ERP 滤波首版存在<b>语义反转 bug</b>（用便宜度 &gt;0.90 触发 = "便宜时封顶"，与"极贵封顶"相反），虚增收益至 +309.5%。已纠正为便宜度&lt;0.10（500 日顶部 10%）触发。纠正后该滤波为净负贡献，用户拍板保留作保守变体——生产口径以 +188.8% 为准。
+  ⚠️ <b>附注 A 勘误</b>：ERP 滤波首版存在<b>语义反转 bug</b>（用便宜度 &gt;0.90 触发 = "便宜时封顶"，与"极贵封顶"相反），虚增收益至 +309.5%。已纠正为便宜度&lt;0.10（500 日顶部 10%）触发。纠正后的旧配置结果只作历史对照，当前验收以严格信息集结果为准。
 </div>
 
 <div class="quote" style="border-left-color:var(--red)">
-  🔴 <b>回测信息集不对称（本次复核实证）</b>：<code>backtest_metrics</code> docstring 声称"信号日 d 用 ≤d-1 收盘"，但实现为因子 <code>close[:i+1]</code>（<b>含当日收盘</b>，chinext_factors.py:85）+ <code>decide_position(comp[d])</code> 当日决策、吃 d→d+1 收益——回测比实盘 14:45 盘中快照多拿当日收盘。修正为昨收口径 <code>comp[d-1]</code> 后：+291.93%→<b>+163.69%</b>（夏普 0.68→0.51），<b>跑输买入持有 +171.28%</b>——严格口径下无可验证正向 alpha，现有超额数字应视为"上限口径"（2026-08-22 复核量化）。
+  🔴 <b>回测信息集已收口（2026-08-28）</b>：信号日 d 使用截至 d-1 的最近完整收盘数据，收益从 d+1 开始。严格全历史策略 +105.3%（年化 +6.2%、夏普 0.46、最大回撤 -42.1%），买入持有 +170.1%；首轮 OOS 策略 +64.6%（年化 +5.7%、夏普 0.41、最大回撤 -27.8%）对买入持有 +111.2%；计入单次换仓成本 0.3% 后 OOS +19.0%（年化 +2.0%、夏普 0.20、最大回撤 -38.3%）。旧的 +291.9%/+188.8% 结果归档为宽松信息集或旧配置对照，不能证明当前 alpha。
 </div>
 
 <h3>4.4 辅助子系统</h3>
 <table>
   <tr><th>子系统</th><th>要点</th><th>状态</th></tr>
   <tr><td>中信持仓日报</td><td>中金所 ccpm XML，全合约聚合口径（IF/IH/IC/IM 中信净增减合计）；Gist 按 last_pushed_day 去重；pos_history 90 日供 L3 消费（净空&gt;2000 手阈值）</td><td><span class="tag t-green">生产</span></td></tr>
-  <tr><td>信号质量回测</td><td>pushed_events → 后 1/3/5 日一致率 + 分层 IC(P11 Spearman 单调) + 因子 IC(P4-6 平均秩，1 日前瞻，n&lt;20 等权)</td><td><span class="tag t-orange">冷启动</span> 64 条可评估 0 条</td></tr>
-  <tr><td>基金轮动</td><td>8 基金候选池 + MA20×宏观 overlay + 滞回建议（本地独立）</td><td><span class="tag t-red">入口不可用</span> ImportError</td></tr>
+  <tr><td>信号质量回测</td><td>pushed_events → 后 1/3/5/10 日一致率 + 分层 IC(P11 Spearman 单调) + 因子 IC(P4-6 平均秩，1 日前瞻，n&lt;20 等权)</td><td><span class="tag t-orange">冷启动</span> 64 条可评估 0 条</td></tr>
+  <tr><td>基金轮动</td><td>8 基金候选池 + MA20×宏观 overlay + 滞回建议（本地独立）</td><td><span class="tag t-green">可用</span> 推送出口已接线并通过测试</td></tr>
   <tr><td>盘前/盘后简报</td><td>morning=隔夜 Top5+因子环境+自选；evening=已推事件+方向/板块统计</td><td><span class="tag t-green">生产</span></td></tr>
 </table>
 
@@ -339,14 +338,11 @@
 <table>
   <tr><th style="width:90px">级别</th><th>风险</th><th>位置</th></tr>
   <tr><td><span class="risk r-hi">高</span></td><td>Gist 读-改-写<b>非原子</b> + PATCH 无 ETag/If-Match，本地 <code>--loop</code> 与云端双端并发仍存 last-write-wins 覆盖窗口（历史事故：4759 条 seen 被冲）</td><td>save_state / _merge_state</td></tr>
-  <tr><td><span class="risk r-hi">高</span></td><td>择时回测<b>单资产 in-sample 寻优</b>：权重/阈值 12 年同一样本调出，缺严格样本外 walk-forward 验证</td><td>backtest_metrics</td></tr>
-  <tr><td><span class="risk r-hi">高</span></td><td><b>回测信息集不对称（本次复核实证）</b>：docstring 声称"≤d-1"，实现用 <code>close[:i+1]</code>（含当日收盘）+ <code>comp[d]</code> 当日决策；修正为昨收口径 <code>comp[d-1]</code> 后 +291.93%→+163.69%，<b>跑输买入持有 +171.28%</b>，严格口径下无可验证正向 alpha</td><td>chinext_factors.py:85 / backtest_metrics</td></tr>
+  <tr><td><span class="risk r-hi">高</span></td><td>择时回测<b>单资产寻优且当前未证明 alpha</b>：严格全历史策略 +105.3%，跑输买入持有 +170.1%；首轮 OOS +64.6%，仍跑输买入持有 +111.2%；单次换仓成本0.3%后 OOS +19.0%，参数跨折漂移，不能写回生产</td><td>run_chinext_timing.py / walk_forward_validation.py</td></tr>
   <tr><td><span class="risk r-mid">中高</span></td><td>资讯信号有效性<b>冷启动无结论</b>（64 条可评估 0 条），阈值/prompt 调优缺量化反馈闭环</td><td>signal_backtest</td></tr>
   <tr><td><span class="risk r-mid">中</span></td><td><code>_is_same_event</code> 13 分支/160 行复杂度过高，"打地鼠式"守卫，任一误判 → 漏推/重复推</td><td>real_time_push L803-962</td></tr>
-  <tr><td><span class="risk r-mid">中</span></td><td><b>run_fund_rotation.py ImportError</b>：<code>from src.tools.push import push_report</code> 函数不存在 → 入口必崩（本次新发现）</td><td>run_fund_rotation.py:29</td></tr>
-  <tr><td><span class="risk r-mid">中</span></td><td><code>decide_position</code> 的 capped 语义错误：检测"滞回带保档"而非"风控封顶"，风控降档时备注误导（功能正确）</td><td>chinext_timing</td></tr>
-  <tr><td><span class="risk r-mid">中</span></td><td>修正层分项封顶未落实（注释 ±0.05/0.04/0.06 vs 实际 ±0.10/0.08/0.15），仅总 clamp 约束</td><td>_dimension_modifier</td></tr>
   <tr><td><span class="risk r-low">中低</span></td><td>数据源 100% 免费 HTTP 抓取：东财 push2his 已实证反爬、乐咕 PE 字段偶变、外盘源不稳、Google News 需代理</td><td>data_fetchers / factor_collector</td></tr>
+  <tr><td><span class="risk r-low">中低</span></td><td>外部定时服务与 Actions 最近实际运行记录尚未核验；因子采集有 14:15 schedule 兜底，创业板主信号仍依赖 cron-job.org 14:45 触发</td><td>realtime-factor.yml / chinext-timing.yml</td></tr>
   <tr><td><span class="risk r-low">中低</span></td><td>Gist 读写逻辑 4 处重复（factor/signal/citic/realtime），news_link 已有统一 <code>_read_gist_file</code> 应抽公共模块</td><td>各脚本</td></tr>
   <tr><td><span class="risk r-low">中低</span></td><td>死代码：WxPusher 未接入、src/agent 废弃但测试仍依赖、v3/v4 双打分逻辑并存易误用</td><td>多处</td></tr>
   <tr><td><span class="risk r-note">注意</span></td><td><code>.ENV</code> 含真实 API Key / PushPlus / Gist Token —— 已 gitignore 不入库，本地权限需自管</td><td>.ENV</td></tr>
@@ -357,29 +353,28 @@
 <h3>P0 —— 堵缺口，对齐"先验证、再优化"纪律</h3>
 <table>
   <tr><th style="width:40px">#</th><th>动作</th><th>预期收益</th></tr>
-  <tr><td>1</td><td><b>先修回测信息集口径</b>（因子序列滞后一天 <code>comp[d-1]</code> 对齐实盘 14:45 快照），再做 <b>walk-forward 时间序列切分</b>（滚动训练/测试）替代整段 in-sample 寻优；signal_backtest 冷启动期作为观察期，2-4 周后按一致率收紧/放宽阈值</td><td>把"+291.9%"从 in-sample/上限口径变成有样本外背书的数字</td></tr>
+  <tr><td>1</td><td><b>继续执行样本外验证闭环</b>：严格信息集与 walk-forward 验证器已经收口，但 OOS 仍跑输买入持有；继续积累留出样本和 <code>signal_backtest</code> 冷启动样本，不把 OOS 最优参数写回生产</td><td>避免把历史宽松口径误当作当前 alpha 证据</td></tr>
   <tr><td>2</td><td><b>根治 Gist 并发</b>：单写端（云端独占+本地只读）或引入 DB（SQLite on D1/Supabase）；Gist 读改写抽公共模块消除 4 处重复</td><td>根除 last-write-wins 覆盖窗口</td></tr>
 </table>
 
 <h3>P1 —— 工程健康</h3>
 <table>
   <tr><th style="width:40px">#</th><th>动作</th></tr>
-  <tr><td>3</td><td>修复 <code>run_fund_rotation.py</code>：改调 <code>push_news</code>/<code>format_ranked_news_md</code> 或归档该入口</td></tr>
-  <tr><td>4</td><td>修正 <code>decide_position</code> capped 语义 + 落实修正层分项封顶 + 清理 v3/v4 双打分死代码</td></tr>
-  <tr><td>5</td><td>按 <code>docs/数据源加固方案_20260822.md</code> 接入 <b>Tushare Pro</b>（¥0，覆盖 399006 日线/旭创/PE 三核心点），免费源保留为降级链</td></tr>
-  <tr><td>6</td><td>去重复杂度收敛：评估嵌入向量相似度兜底 13 分支；哨兵词表收敛进 keyword_tables（单一事实来源）</td></tr>
+  <tr><td>3</td><td>核验生产调度与状态更新：检查 cron-job.org 对 <code>realtime-factor.yml</code> 的触发、14:15 schedule 兜底、<code>factor_state</code> 是否按交易日更新，以及 <code>chinext-timing.yml</code> 的 14:45 主触发</td></tr>
+  <tr><td>4</td><td>按 <code>docs/数据源加固方案_20260822.md</code> 维护免费多源回退、缓存新鲜度校验；连续 3 轮免费数据维度失败可触发健康告警</td></tr>
+  <tr><td>5</td><td>去重复杂度收敛：评估嵌入向量相似度兜底 13 分支字符串规则；哨兵词表收敛进 keyword_tables（单一事实来源）</td></tr>
 </table>
 
 <h3>P2 —— 长期</h3>
-<p style="font-size:13px">收口 langchain 表述（data_fetchers 已优雅降级，README 措辞同步）；接入 ruff lint/type-check 门禁；KOSPI 接入；factor risk_state 增加时效衰减；sources 健康度告警（连续 N 轮付费源失败→推送）。</p>
+<p style="font-size:13px">收口 langchain 表述（生产入口已解耦，历史兼容层仍在）；接入 ruff lint/type-check 门禁；评估 KOSPI 免费双源；factor risk_state 增加时效衰减；继续观察已上线的免费源健康告警。</p>
 
 <h2>七、一句话总结</h2>
 <div class="lead verdict">
-  <b>工程成熟度（去重/容错/测试/CI）远超个人项目的典型水平，alpha 验证链（样本外回测/信号有效性）是当前最大缺口。项目正处在"系统已跑通、可信度待建立"的临界点——下一步的胜负手是 walk-forward 样本外验证与信号回测冷启动积累，而非继续加因子。</b>
+  <b>工程成熟度（去重/容错/测试/CI）远超个人项目的典型水平，alpha 验证链（样本外回测/信号有效性）是当前最大缺口。项目正处在"系统已跑通、可信度待建立"的临界点——下一步的胜负手是持续积累留出样本、影子期记录和信号回测冷启动样本，而非继续加因子。</b>
 </div>
 
 <div class="foot">
-  分析口径：只读审查，无代码改动 ｜ 生成：2026-08-22 20:56 (GMT+8) ｜ 对应 Markdown 版：docs/项目全链路深度分析_20260822.md
+  分析口径：2026-08-28 复核，已同步当前代码、workflow 与测试事实 ｜ 对应 Markdown 版：docs/项目全链路深度分析_20260822.md
 </div>
 
 </div>
