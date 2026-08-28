@@ -328,6 +328,22 @@ class TestSaveStateFailStop:
         with pytest.raises(RuntimeError):
             rtp.load_state()
 
+    def test_load_state_local_gist_failure_also_raises(self, monkeypatch, tmp_path):
+        """Gist 已配置但本地运行读取失败，也不得回退本地旧状态。"""
+        monkeypatch.setenv("CI", "false")
+        monkeypatch.setenv("GIST_TOKEN", "t")
+        monkeypatch.setenv("GIST_ID", "g")
+        monkeypatch.setattr(rtp, "_state_path", lambda: Path(tmp_path) / "state.json")
+        (Path(tmp_path) / "state.json").write_text(
+            '{"seen": {"old": {"t": "2026-08-28 10:00:00"}}}', encoding="utf-8")
+
+        monkeypatch.setattr(rtp, "_gist_load", lambda token, gid: (_ for _ in ()).throw(
+            RuntimeError("gist down")
+        ))
+
+        with pytest.raises(RuntimeError, match="Gist.*读取失败"):
+            rtp.load_state()
+
     def test_seen_cap_limits_state_size(self, monkeypatch, tmp_path):
         """seen 超上限按时间保留最新（状态文件体积控制，防 Gist 写入截断）"""
         monkeypatch.setenv("CI", "false")
