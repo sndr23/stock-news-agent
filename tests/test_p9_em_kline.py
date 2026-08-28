@@ -10,6 +10,7 @@
 全部 mock，不触网。
 """
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -160,9 +161,11 @@ def test_fetch_index_kline_sina_first(monkeypatch):
     """新浪可用 → 不触腾讯/东财"""
     calls = {"sina": 0, "tencent": 0, "em": 0}
 
+    today = date.today().isoformat()
+
     def fake_sina(symbol, lmt):
         calls["sina"] += 1
-        return [{"date": "2026-08-20", "open": 1, "close": 2, "high": 3, "low": 1, "volume": 100}]
+        return [{"date": today, "open": 1, "close": 2, "high": 3, "low": 1, "volume": 100}]
 
     def fake_tencent(symbol, lmt):
         calls["tencent"] += 1
@@ -183,12 +186,13 @@ def test_fetch_index_kline_sina_first(monkeypatch):
 def test_fetch_index_kline_tier2_tencent(monkeypatch):
     """新浪失败 → 腾讯兜底"""
     calls = {"sina": 0, "tencent": 0, "em": 0}
+    today = date.today().isoformat()
 
     monkeypatch.setattr("factor_collector._fetch_kline_sina",
                         lambda s, l: calls.__setitem__("sina", calls["sina"] + 1) or [])
     monkeypatch.setattr("factor_collector._fetch_kline_tencent",
                         lambda s, l: calls.__setitem__("tencent", calls["tencent"] + 1) or
-                        [{"date": "2026-08-19", "open": 1, "close": 2, "high": 3, "low": 1, "volume": 100}])
+                        [{"date": today, "open": 1, "close": 2, "high": 3, "low": 1, "volume": 100}])
     monkeypatch.setattr("factor_collector._fetch_kline_em",
                         lambda s, l: calls.__setitem__("em", calls["em"] + 1) or [])
     out = fetch_index_kline("sh000001", 5)
@@ -198,13 +202,34 @@ def test_fetch_index_kline_tier2_tencent(monkeypatch):
 
 def test_fetch_index_kline_tier3_em(monkeypatch):
     """新浪、腾讯均失败 → 东财兜底（P9 新增第三冗余）"""
+    today = date.today().isoformat()
     monkeypatch.setattr("factor_collector._fetch_kline_sina", lambda s, l: [])
     monkeypatch.setattr("factor_collector._fetch_kline_tencent", lambda s, l: [])
     monkeypatch.setattr("factor_collector._fetch_kline_em", lambda s, l: [
-        {"date": "2026-08-20", "open": 3907, "close": 3900, "high": 3925, "low": 3888, "volume": 15000000}])
+        {"date": today, "open": 3907, "close": 3900, "high": 3925, "low": 3888, "volume": 15000000}])
     out = fetch_index_kline("sh000001", 5)
     assert len(out) == 1
-    assert out[0]["date"] == "2026-08-20"
+    assert out[0]["date"] == today
+
+
+def test_fetch_index_kline_rejects_stale_source(monkeypatch):
+    """所有免费源只返回旧 K 线时，不能把旧数据交给技术因子。"""
+    stale = [{"date": "2020-01-02", "open": 1, "close": 2,
+              "high": 3, "low": 1, "volume": 100}]
+    calls = {"sina": 0, "tencent": 0, "em": 0}
+
+    def _stale(name):
+        def _load(symbol, lmt):
+            calls[name] += 1
+            return stale
+        return _load
+
+    monkeypatch.setattr("factor_collector._fetch_kline_sina", _stale("sina"))
+    monkeypatch.setattr("factor_collector._fetch_kline_tencent", _stale("tencent"))
+    monkeypatch.setattr("factor_collector._fetch_kline_em", _stale("em"))
+
+    assert fetch_index_kline("sh000001", 5) == []
+    assert calls == {"sina": 1, "tencent": 1, "em": 1}
 
 
 def test_fetch_index_kline_all_fail(monkeypatch):
@@ -213,6 +238,27 @@ def test_fetch_index_kline_all_fail(monkeypatch):
     monkeypatch.setattr("factor_collector._fetch_kline_tencent", lambda s, l: [])
     monkeypatch.setattr("factor_collector._fetch_kline_em", lambda s, l: [])
     assert fetch_index_kline("sh000001", 5) == []
+
+
+def test_fetch_index_kline_continues_after_source_exception(monkeypatch):
+    """首个免费源抛异常时，调度器仍应继续尝试后续免费源。"""
+    today = date.today().isoformat()
+
+    def broken_sina(symbol, lmt):
+        raise OSError("sina unavailable")
+
+    monkeypatch.setattr("factor_collector._fetch_kline_sina", broken_sina)
+    monkeypatch.setattr("factor_collector._fetch_kline_tencent", lambda s, l: [
+        {"date": today, "open": 1, "close": 2, "high": 3,
+         "low": 1, "volume": 100}])
+    monkeypatch.setattr("factor_collector._fetch_kline_em", lambda s, l: [
+        {"date": today, "open": 1, "close": 2, "high": 3,
+         "low": 1, "volume": 100}])
+
+    out = fetch_index_kline("sh000001", 5)
+
+    assert len(out) == 1
+    assert out[0]["date"] == today
 
 
 # ============================================================

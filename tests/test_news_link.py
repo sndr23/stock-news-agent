@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """资讯<->策略三层协同桥（src/strategy/news_link.py）单元测试"""
 import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -145,9 +146,9 @@ def test_macro_exposure_absent_snapshot():
 def test_macro_exposure_citic_net_short():
     # 中信全合约净加空超阈值 → 降仓
     citic = {"pos_history": [{"day": "2026-08-21",
-                              "net": {"IF": -1200, "IC": -800, "IH": -500, "IM": -700,
-                                      "_total": -3200}}]}
-    m = nl.macro_exposure({}, citic_state=citic)
+                               "net": {"IF": -1200, "IC": -800, "IH": -500, "IM": -700,
+                                       "_total": -3200}}]}
+    m = nl.macro_exposure({}, citic_state=citic, today=date(2026, 8, 24))
     assert m["factor"] <= 0.9
     assert any("净加空" in r for r in m["reasons"])
 
@@ -155,13 +156,127 @@ def test_macro_exposure_citic_net_short():
 def test_macro_exposure_citic_net_long():
     # 中信净加多 → 不降仓
     citic = {"pos_history": [{"day": "2026-08-20",
-                              "net": {"IF": 500, "IC": 300, "_total": 800}}]}
-    m = nl.macro_exposure({}, citic_state=citic)
+                               "net": {"IF": 500, "IC": 300, "_total": 800}}]}
+    m = nl.macro_exposure({}, citic_state=citic, today=date(2026, 8, 21))
     assert m["factor"] == 1.0
 
 
 def test_macro_exposure_no_citic_history():
     assert nl.macro_exposure({}, citic_state={})["factor"] == 1.0
+
+
+def test_load_factor_state_does_not_fallback_to_local_when_gist_file_missing(
+        monkeypatch, tmp_path):
+    """Gist 成功但文件缺失时，不能用本地旧快照冒充云端状态。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(nl, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
+    nl._FACTOR_STATE_PATH.write_text(
+        '{"snapshot": {"flows": {"main_net_yi": -120}}}', encoding="utf-8")
+
+    class _MissingFileResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"files": {}}'
+
+    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+
+    assert nl.load_factor_state() == {}
+
+
+def test_load_factor_state_rejects_gist_failure_instead_of_using_local_snapshot(
+        monkeypatch, tmp_path):
+    """Gist 读取失败时，不能静默回退本地旧快照。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(nl, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
+    nl._FACTOR_STATE_PATH.write_text(
+        '{"snapshot": {"flows": {"main_net_yi": -120}}}', encoding="utf-8")
+    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
+        OSError("network down")))
+
+    with pytest.raises(RuntimeError, match="Gist 状态文件 factor_state.json"):
+        nl.load_factor_state()
+
+
+def test_load_realtime_state_does_not_fallback_to_local_when_gist_file_missing(
+        monkeypatch, tmp_path):
+    """Gist 成功但资讯文件缺失时，不能使用本地旧事件。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(nl, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
+    nl._REALTIME_STATE_PATH.write_text(
+        '{"pushed_events": [{"t": "2026-08-28 10:00:00"}]}', encoding="utf-8")
+
+    class _MissingFileResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"files": {}}'
+
+    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+
+    assert nl.load_realtime_state() == {}
+
+
+def test_load_realtime_state_rejects_gist_failure_instead_of_using_local_state(
+        monkeypatch, tmp_path):
+    """Gist 读取失败时，不能静默使用本地旧资讯状态。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(nl, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
+    nl._REALTIME_STATE_PATH.write_text(
+        '{"pushed_events": [{"t": "2026-08-28 10:00:00"}]}', encoding="utf-8")
+    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
+        OSError("network down")))
+
+    with pytest.raises(RuntimeError, match="Gist 状态文件 real_time_state.json"):
+        nl.load_realtime_state()
+
+
+def test_load_citic_pos_state_does_not_fallback_to_local_when_gist_file_missing(
+        monkeypatch, tmp_path):
+    """Gist 成功但中信文件缺失时，不能使用本地旧持仓。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(nl, "_CITIC_POS_STATE_PATH", tmp_path / "citic_pos_state.json")
+    nl._CITIC_POS_STATE_PATH.write_text(
+        '{"pos_history": [{"day": "2026-08-27", "net": {"_total": -3200}}]}',
+        encoding="utf-8")
+
+    class _MissingFileResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"files": {}}'
+
+    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+
+    assert nl.load_citic_pos_state() == {}
+
+
+def test_macro_exposure_ignores_stale_citic_position_history():
+    """中信持仓超过一个交易日未更新时，不得继续触发宏观降仓。"""
+    citic = {"pos_history": [{"day": "2026-08-25",
+                               "net": {"_total": -3200}}]}
+
+    m = nl.macro_exposure({}, citic_state=citic, today=date(2026, 8, 28))
+
+    assert m["factor"] == 1.0
+    assert any("过期" in reason for reason in m["reasons"])
 
 
 # ---------- L2 反向：watchlist 合并 ----------
@@ -237,9 +352,40 @@ def test_today_news_events_excludes_other_days():
 
 
 def test_today_news_events_default_today():
-    # 缺省 today 用系统当前日期
-    evs = nl.today_news_events({}, None)
-    assert evs == []
+    """UTC 次日凌晨时，缺省 today 仍应按北京时间取日期。"""
+    instant = datetime(2026, 8, 28, 16, 30, tzinfo=timezone.utc)
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    state = {"candidate_events": [_cand("北京时间今日事件", "bullish",
+                                         t="2026-08-29 00:10:00")]}
+    old_datetime = nl.datetime
+    nl.datetime = _FakeDateTime
+    try:
+        evs = nl.today_news_events(state, None)
+    finally:
+        nl.datetime = old_datetime
+
+    assert len(evs) == 1
+
+
+def test_recent_pushed_events_uses_beijing_time_window(monkeypatch):
+    """资讯状态的 48 小时窗口不能因 UTC/BJT 偏移多收一条。"""
+    instant = datetime(2026, 8, 28, 0, 30, tzinfo=timezone(timedelta(hours=8)))
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(nl, "datetime", _FakeDateTime)
+    state = {"pushed_events": [_event(
+        "窗口外事件", "bullish", t="2026-08-26 00:29:00")]}  # 48h01 前
+
+    assert nl.recent_pushed_events(state, hours=48) == []
 
 
 def test_today_news_events_empty_state():

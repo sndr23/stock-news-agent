@@ -52,6 +52,145 @@ def test_factor_gist_load_passes_headers(monkeypatch):
     assert state == {"risk_state": "risk_off"}
 
 
+def test_factor_gist_load_failure_raises_instead_of_returning_empty(monkeypatch):
+    """因子 Gist 连续读取失败时必须 fail-stop，禁止空状态覆盖云端历史。"""
+
+    def fake_get(url, **kwargs):
+        raise IOError("network down")
+
+    monkeypatch.setattr(fc.requests, "get", fake_get)
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="读取失败"):
+        fc._gist_load_factor("tok123", "gid123")
+
+
+def test_factor_load_state_does_not_fallback_to_local_after_gist_failure(monkeypatch, tmp_path):
+    """已配置 Gist 且读取失败时，不得拿本地旧状态继续运行并回写云端。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(fc, "STATE_PATH", tmp_path / "factor_state.json")
+    fc.STATE_PATH.write_text('{"basis_history": {"IC": [{"v": -1.2}]}}', encoding="utf-8")
+    monkeypatch.setattr(fc, "_gist_load_factor", lambda token, gist_id: (_ for _ in ()).throw(
+        RuntimeError("Gist 读取失败")
+    ))
+
+    with pytest.raises(RuntimeError, match="Gist 读取失败"):
+        fc._load_state()
+
+
+def test_factor_gist_load_corrupt_json_raises(monkeypatch):
+    """因子 Gist 内容损坏时必须 fail-stop，禁止按空状态继续。"""
+
+    class _BrokenResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": {"factor_state.json": {"content": '{"basis_history":'}}}
+
+    monkeypatch.setattr(fc.requests, "get", lambda url, **kwargs: _BrokenResp())
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="读取失败"):
+        fc._gist_load_factor("tok123", "gid123")
+
+
+def test_factor_gist_load_non_object_json_raises(monkeypatch):
+    """因子 Gist 根节点不是对象时必须拒绝，避免后续按空状态运行。"""
+
+    class _ListResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": {"factor_state.json": {"content": "[]"}}}
+
+    monkeypatch.setattr(fc.requests, "get", lambda url, **kwargs: _ListResp())
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="读取失败"):
+        fc._gist_load_factor("tok123", "gid123")
+
+
+def test_factor_gist_load_empty_content_raises(monkeypatch):
+    """因子 Gist 文件为空时必须拒绝，空文件通常意味着写入截断或损坏。"""
+
+    class _EmptyContentResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": {"factor_state.json": {"content": ""}}}
+
+    monkeypatch.setattr(fc.requests, "get", lambda url, **kwargs: _EmptyContentResp())
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="读取失败"):
+        fc._gist_load_factor("tok123", "gid123")
+
+
+def test_factor_gist_load_missing_file_is_empty_on_first_deploy(monkeypatch):
+    """Gist 请求成功但尚无因子文件时，允许首次部署从空状态开始。"""
+
+    class _EmptyResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": {}}
+
+    monkeypatch.setattr(fc.requests, "get", lambda url, **kwargs: _EmptyResp())
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    assert fc._gist_load_factor("tok123", "gid123") == {}
+
+
+def test_factor_gist_load_missing_file_after_transient_failure_is_empty(monkeypatch):
+    """临时失败后连续成功确认文件不存在时，应允许首次初始化为空状态。"""
+    calls = {"n": 0}
+
+    class _EmptyResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": {}}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IOError("transient network down")
+        return _EmptyResp()
+
+    monkeypatch.setattr(fc.requests, "get", fake_get)
+    monkeypatch.setattr(fc.time, "sleep", lambda _seconds: None)
+
+    assert fc._gist_load_factor("tok123", "gid123") == {}
+
+
+def test_factor_save_state_failure_is_reported_to_caller(monkeypatch, tmp_path):
+    """因子快照 Gist 写入失败时返回失败，避免采集任务假成功。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(fc, "STATE_PATH", tmp_path / "factor_state.json")
+    monkeypatch.setattr(fc, "_gist_save_factor", lambda token, gist_id, state: (_ for _ in ()).throw(
+        RuntimeError("Gist 写入失败")
+    ))
+
+    assert fc._save_state({"risk_state": "neutral"}) is False
+
+
+def test_factor_load_state_rejects_non_object_local_state(monkeypatch, tmp_path):
+    """本地状态根节点不是对象时，因子入口应从空状态安全启动。"""
+    monkeypatch.delenv("GIST_TOKEN", raising=False)
+    monkeypatch.delenv("GIST_ID", raising=False)
+    monkeypatch.setattr(fc, "STATE_PATH", tmp_path / "factor_state.json")
+    fc.STATE_PATH.write_text("[]", encoding="utf-8")
+
+    assert fc._load_state() == {}
+
+
 def test_realtime_gist_load_passes_headers(monkeypatch):
     captured = {}
 

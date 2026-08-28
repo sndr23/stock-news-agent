@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """factor_collector run_once 端到端 mock 测试（不触网、不推微信）"""
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,9 @@ pytestmark = pytest.mark.unit  # 纯单元测试：mock 数据源，无网络
 
 def _mock_data(monkeypatch, tmp_path):
     """mock 数据源 + 状态路径 + 推送，返回记录推送的列表"""
-    monkeypatch.delenv("GIST_TOKEN", raising=False)
-    monkeypatch.delenv("GIST_ID", raising=False)
+    # 设为空而不是删除：后续导入 signal_backtest 时 load_dotenv 不应重新加载真实 Gist 配置。
+    monkeypatch.setenv("GIST_TOKEN", "")
+    monkeypatch.setenv("GIST_ID", "")
     monkeypatch.setattr(fc, "STATE_PATH", tmp_path / "factor_state.json")
 
     monkeypatch.setattr(fc, "fetch_index_quotes", lambda: {
@@ -40,8 +42,17 @@ def _mock_data(monkeypatch, tmp_path):
     })
 
     def fake_kline(symbol, lmt=65):
-        return [{"date": f"2026-08-{i:02d}", "open": 100 + i, "close": 100 + i,
-                 "high": 101 + i, "low": 99 + i, "volume": 100} for i in range(65)]
+        start = date(2026, 6, 1)
+        rows = []
+        current = start
+        while len(rows) < 65:
+            if current.weekday() < 5:
+                i = len(rows)
+                rows.append({"date": current.isoformat(), "open": 100 + i,
+                             "close": 100 + i, "high": 101 + i, "low": 99 + i,
+                             "volume": 100})
+            current += timedelta(days=1)
+        return rows
     monkeypatch.setattr(fc, "fetch_index_kline", fake_kline)
 
     # P1-2/P1-3：个股行情与资金流同样不触网（watchlist 已激活，空行情 → 无自选股异动）
@@ -82,6 +93,58 @@ def test_run_once_full_flow(tmp_path, monkeypatch):
     assert "risk_state" in state
     # 首次运行无方向基准 → 不推方向信号；无异动 → 不推告警
     assert pushed == []
+
+
+def test_failed_factor_push_does_not_consume_cooldown(tmp_path, monkeypatch):
+    """异动推送失败时不得标记已推送，下一轮仍应可以重试。"""
+    _mock_data(monkeypatch, tmp_path)
+    signal = {"key": "test_failed_push", "title": "测试异动", "detail": "发送失败",
+              "direction": "bullish"}
+    monkeypatch.setattr(fc, "detect_anomalies", lambda *args, **kwargs: ([signal], {}))
+    monkeypatch.setattr(fc, "do_push", lambda *args, **kwargs: {"code": 500})
+
+    result = fc.run_once(push=True)
+
+    state = fc._load_state()
+    assert result["pushed"] == []
+    assert "test_failed_push" not in state.get("cooldown", {})
+
+
+def test_failed_stock_push_does_not_consume_cooldown(tmp_path, monkeypatch):
+    """自选股告警推送失败时不得标记已推送，下一轮仍应可以重试。"""
+    _mock_data(monkeypatch, tmp_path)
+    signal = {"key": "test_failed_stock_push", "title": "测试自选股",
+              "detail": "发送失败", "direction": "bullish"}
+    monkeypatch.setattr(fc, "monitor_stocks", lambda: ([signal], {}, {}))
+    monkeypatch.setattr(fc, "do_push", lambda *args, **kwargs: {"code": 500})
+
+    result = fc.run_once(push=True)
+
+    state = fc._load_state()
+    assert result["pushed"] == []
+    assert "test_failed_stock_push" not in state.get("cooldown", {})
+
+
+def test_failed_direction_push_keeps_direction_retryable(tmp_path, monkeypatch):
+    """强方向信号推送失败时不得更新方向去重状态，下一轮仍应重试。"""
+    _mock_data(monkeypatch, tmp_path)
+    monkeypatch.setattr(fc, "fetch_fx", lambda: {
+        "fx_susdjpy": {"name": "美元/日元", "price": 156.0, "change_pct": -2.0},
+        "fx_susdcny": {"name": "美元/人民币", "price": 6.74, "change_pct": -0.01},
+    })
+    monkeypatch.setattr(fc, "fetch_market_breadth", lambda: {
+        "adv": 128, "dec": 4885, "flat": 22, "down_pct": 91.6,
+        "limit_up": 36, "limit_down": 118, "big_down": 2189,
+    })
+    fc._save_state({"last_direction": "中性", "basis_history": {},
+                    "risk_state": "neutral"})
+    monkeypatch.setattr(fc, "do_push", lambda *args, **kwargs: {"code": 500})
+
+    fc.run_once(push=True)
+
+    state = fc._load_state()
+    assert state["last_direction"] == "中性"
+    assert "direction" not in state.get("change_cooldown", {})
 
 
 def test_run_once_direction_change_pushes(tmp_path, monkeypatch):

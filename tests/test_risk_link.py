@@ -114,3 +114,32 @@ def test_load_risk_state(tmp_path, monkeypatch):
     # 非法值 → neutral
     (tmp_path / "factor_state.json").write_text('{"risk_state": "weird"}', encoding="utf-8")
     assert rtp._load_factor_risk_state() == "neutral"
+
+
+def test_load_factor_state_does_not_fallback_to_local_on_gist_failure(
+        tmp_path, monkeypatch):
+    """Gist 已配置但失败时，资讯联动不应读取本地旧风险状态。"""
+    import requests
+
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    monkeypatch.setattr(rtp, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
+    rtp._FACTOR_STATE_PATH.write_text(
+        '{"risk_state": "risk_off"}', encoding="utf-8")
+
+    def _fail(*args, **kwargs):
+        raise OSError("network down")
+
+    monkeypatch.setattr(requests, "get", _fail)
+
+    assert rtp._load_factor_state() == {}
+
+
+def test_load_factor_state_rejects_non_object_local_state(tmp_path, monkeypatch):
+    """本地因子状态根节点不是对象时，联动应安全降级为空。"""
+    monkeypatch.delenv("GIST_TOKEN", raising=False)
+    monkeypatch.delenv("GIST_ID", raising=False)
+    monkeypatch.setattr(rtp, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
+    rtp._FACTOR_STATE_PATH.write_text("[]", encoding="utf-8")
+
+    assert rtp._load_factor_state() == {}

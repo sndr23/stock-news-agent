@@ -273,6 +273,7 @@ def test_decide_cap_forces_immediate_down():
     prev = {"position": 1.0, "pending": None}
     dec = ct.decide_position(0.5, 0.3, prev)  # 分数满仓但风控封顶3成
     assert dec["changed"] and dec["direction"] == "down" and dec["position"] == 0.3
+    assert "风控封顶" in "".join(dec["note"])
 
 
 def test_decide_hold_clears_pending():
@@ -288,6 +289,17 @@ def test_hysteresis_band_blocks_threshold_jitter():
     assert not d["changed"] and d["position"] == 1.0
     d2 = ct.decide_position(0.34, 1.0, prev)  # 明确跌破 0.35 → 降九成
     assert d2["changed"] and d2["position"] == 0.9
+
+
+def test_hysteresis_hold_is_not_reported_as_risk_cap():
+    """滞回带保档不能误报为硬风控封顶。"""
+    prev = {"position": 1.0, "pending": None}
+
+    decision = ct.decide_position(0.38, 1.0, prev)
+
+    assert decision["position"] == 1.0
+    assert "风控封顶" not in "".join(decision["note"])
+    assert "滞回带确认" not in "".join(decision["note"])
 
 
 def test_hysteresis_band_downgrade_path():
@@ -331,6 +343,38 @@ def test_modifier_cannot_flip_neutral_market():
     s = ct.composite({"score": 0.0}, *mods)
     assert s == 0.30
     assert ct.score_to_tier(s) == 0.9  # 最多到九成档，到不了满仓档
+
+
+def test_dimension_modifier_applies_documented_component_caps():
+    """实时修正层的单项上限必须与生产说明一致，而非只靠总上限。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    import run_chinext_timing as rct
+
+    snapshot = {
+        "ts": "2026-08-27 14:30",
+        "basis": {"IC": {"annual_pct": 1.0}, "IM": {"annual_pct": 1.0}},
+        "flows": {"main_net_yi": 150.0},
+        "sector_flows": {"inflow": ["AI"], "outflow": []},
+        "sentiment": {"mood": "亢奋"},
+        "breadth": {"down_pct": 20.0},
+        "option": {"pcr": 0.5},
+    }
+    ctx = {"events": [{"dir": "bullish", "title_norm": "AI"},
+                       {"dir": "bullish", "title_norm": "半导体"},
+                       {"dir": "bullish", "title_norm": "光模块"}],
+           "snapshot_stale": False}
+
+    result = rct._dimension_modifier(snapshot, ctx)
+
+    assert result["basis"] == pytest.approx(0.03)
+    assert result["flow"] == pytest.approx(0.05)
+    assert result["mood"] == pytest.approx(0.04)
+    assert result["news"] == pytest.approx(0.06)
+    assert result["score"] == pytest.approx(0.18)
 
 
 def test_spearman_ic_perfect_rank():
@@ -584,6 +628,77 @@ def test_shadow_raw_stale_snapshot_all_none():
     assert _shadow_raw(ctx2)["basis_min_ap"] == -11.2
 
 
+def test_stale_factor_snapshot_does_not_change_modifier_score():
+    """因子快照停更时，旧贴水/资金值不得继续改变当日综合分。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    import run_chinext_timing as rct
+
+    stale_snapshot = {
+        "basis": {"IC": {"annual_pct": -20.0}},
+        "flows": {"main_net_yi": -150.0},
+    }
+    result = rct._dimension_modifier(
+        stale_snapshot, {"events": [], "snapshot_stale": True})
+
+    assert result["score"] == 0.0
+    assert result["basis"] == 0.0
+    assert result["flow"] == 0.0
+
+
+@pytest.mark.parametrize("snapshot_ts", [None, "2026-08-27", "bad timestamp",
+                                          "2026-08-26 15:53"],
+                         ids=["missing", "date-only", "invalid", "yesterday"])
+def test_snapshot_without_valid_today_timestamp_is_stale(snapshot_ts):
+    """有增强数据但无严格当日采集时间时，必须整体失效而不是继续改分。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import _snapshot_is_stale
+
+    snapshot = {"basis": {"IC": {"annual_pct": -12.0}}}
+    if snapshot_ts is not None:
+        snapshot["ts"] = snapshot_ts
+
+    assert _snapshot_is_stale(snapshot, "2026-08-27") is True
+    assert _snapshot_is_stale({}, "2026-08-27") is False
+
+
+def test_snapshot_with_canonical_today_timestamp_is_fresh():
+    """采集器写入的标准 YYYY-MM-DD HH:MM 当日时间戳可以通过校验。"""
+    import sys as _sys
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent
+    if str(_root / "scripts") not in _sys.path:
+        _sys.path.insert(0, str(_root / "scripts"))
+    from run_chinext_timing import _snapshot_is_stale
+
+    assert _snapshot_is_stale({"ts": "2026-08-27 15:53",
+                               "basis": {}}, "2026-08-27") is False
+
+
+def test_timing_date_helpers_use_beijing_date_at_utc_midnight_boundary(monkeypatch):
+    """GitHub Runner UTC 次日凌晨仍应按北京时间的交易日处理。"""
+    import datetime as _dt
+    import run_chinext_timing as rct
+
+    instant = _dt.datetime(2026, 8, 28, 16, 30, tzinfo=_dt.timezone.utc)
+
+    class _FakeDateTime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(rct, "datetime", _FakeDateTime)
+
+    assert rct._is_trading_day() is False  # BJT = 2026-08-29, Saturday
+
+
 def _make_gather_df(last_date: str, n: int = 70):
     """构造 gather_context 输入 DataFrame：n 根日线，末根日期可指定。"""
     import pandas as pd
@@ -596,12 +711,12 @@ def _make_gather_df(last_date: str, n: int = 70):
                          "high": highs, "low": lows}, index=dates)
 
 
-def test_gather_context_drops_intraday_partial(monkeypatch):
-    """口径收口：末根为当日（14:45 partial）时无条件剔除，信号只用 ≤d-1 完整日线。
+def test_gather_context_keeps_intraday_snapshot(monkeypatch):
+    """v5.1 口径：末根为当日（14:45 partial）→ 保留作为当日快照，核心层用当日数据。
 
-    回归背景：此前仅替换 amounts[-1]（closes 仍含 partial 污染均线/波动），
-    且依赖数据层缓存是否命中导致行为抖动（同一时点信号不可复现）。
-    修复后无论缓存命中与否，当日 bar 一律剔除 → 行为恒一。
+    背景（2026-08-28 用户拍板）：信号日 d 直接用 d 日 14:45 快照（当日盘中价/量能），
+    而非 d-1 收盘——均线/动量/量价反映"当天到现在的走势"，对当日加减仓更有意义；
+    14:45→15:00 的 15 分钟价差接受为近似。
     """
     import sys as _sys
     from pathlib import Path as _P
@@ -623,31 +738,55 @@ def test_gather_context_drops_intraday_partial(monkeypatch):
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
     monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
     monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
-    monkeypatch.setattr(rct, "load_stock_primary", lambda *a, **k: None)
     monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
 
-    # 情形 A：末根为当日（partial）→ 剔除后最后一根应为 08-21（周五）
-    # 71 根（08-18~08-24）剔除当日 → 70 根（08-18~08-21），与 B 完全同窗
+    # 情形 A：末根为当日（partial）→ 保留，末根仍为当日（v5.1 口径）
     df_a = _make_gather_df("2026-08-24", n=71)
     ctx_a = rct.gather_context(df_a)
-    assert ctx_a["dates"][-1] == "2026-08-21", "当日 partial 应被剔除"
-    assert len(ctx_a["closes"]) == len(df_a) - 1
+    assert ctx_a["dates"][-1] == "2026-08-24", "当日快照应保留（v5.1 口径）"
+    assert len(ctx_a["closes"]) == len(df_a)
     assert len(ctx_a["amounts"]) == len(ctx_a["closes"])
     assert len(ctx_a["highs"]) == len(ctx_a["closes"])
     assert len(ctx_a["lows"]) == len(ctx_a["closes"])
     assert ctx_a["day_amount_ratio"] > 0, "当日量能比应单独记录"
 
-    # 情形 B：末根非当日（缓存命中，末根为昨日完整收盘）→ 不剔除，结果与 A 等价
+    # 情形 B：末根非当日（缓存命中，末根为昨日完整收盘）→ 不剔除，末根仍为昨日
     df_b = _make_gather_df("2026-08-21", n=70)
     ctx_b = rct.gather_context(df_b)
     assert ctx_b["dates"][-1] == "2026-08-21"
     assert len(ctx_b["closes"]) == len(df_b)
-    # A 剔除后与 B 的信号信息集完全一致（日期/收盘/量能对齐）
-    assert ctx_a["dates"] == ctx_b["dates"]
-    assert ctx_a["closes"] == ctx_b["closes"]
-    assert ctx_a["amounts"] == ctx_b["amounts"]
     # 情形 B 无当日量能比（末根为完整日，ratio 语义不存在）
     assert ctx_b["day_amount_ratio"] == 0.0
+
+
+def test_gather_context_uses_latest_valid_citic_history(monkeypatch):
+    """中信持仓历史无序时，择时上下文应使用最近有效日期而非列表末项。"""
+    import datetime as _dt
+    import run_chinext_timing as rct
+
+    class _FakeDT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 24, 14, 45)
+
+    monkeypatch.setattr(rct, "datetime", _FakeDT)
+    monkeypatch.setattr(rct, "get_quotes", lambda *a, **k: {})
+    monkeypatch.setattr(rct.nl, "load_factor_state", lambda: {})
+    monkeypatch.setattr(rct.nl, "load_citic_pos_state", lambda: {
+        "pos_history": [
+            {"day": "2026-08-20", "net": {"_total": 900}},
+            {"day": "2026-08-23", "net": {"_total": -1800}},
+        ]
+    })
+    monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
+    monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
+    monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
+    monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
+
+    ctx = rct.gather_context(_make_gather_df("2026-08-21"))
+
+    assert ctx["citic_day"] == "2026-08-23"
+    assert ctx["citic_net"] == -1800.0
 
 
 def test_nested_get():
@@ -793,6 +932,30 @@ def test_render_report_has_commit_and_cap_note():
     assert "（代码 " in txt, "报告应携带代码版本号"
     assert "未实际生效" in txt, "档位未越封顶线时应澄清风控非空仓主因"
     assert "硬风控仅限上限" in txt
+
+
+def test_render_report_shows_index_data_window():
+    """推送正文应显示核心信号实际使用的完整日线窗口。"""
+    rct = _import_rct()
+    res = {
+        "score": 0.0,
+        "core": {"score": 0.0, "signals": {
+            "trend_ma20_60": 0.0, "trend_momentum_60": 0.0,
+            "volprice_quadrant": 0.0, "volprice_amihud": 0.0,
+            "vol_regime": 0.0, "vol_term": 0.0, "value_erp": 0.0,
+            "pullback_52w": 0.0, "dd60": 0.0}},
+        "mods": {"basis": 0.0, "flow": 0.0, "mood": 0.0, "news": 0.0,
+                 "chan": {"score": 0.0, "detail": "缠论:中性"},
+                 "stock": {"score": 0.0, "detail": "跳过"}},
+        "caps": {"cap": 1.0, "triggers": []},
+    }
+    ctx = {"intraday": 0.0, "overseas_drop": 0.0,
+           "history_bars": 1857, "history_last_date": "2026-08-26"}
+    dec = {"position": 0.0, "changed": False, "direction": "hold", "note": []}
+
+    txt = rct.render_report("2026-08-27", res, ctx, dec, prev_pos=0.0)
+
+    assert "399006完整日线：1857根，截至2026-08-26" in txt
 
 
 def test_render_report_mods_health_marker():

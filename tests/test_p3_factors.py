@@ -260,6 +260,21 @@ class TestCalcStyleRotation:
         s = fc.calc_style_rotation()
         assert s["trend"] == "风格均衡"
 
+    def test_date_misalignment_does_not_use_positional_ratio(self, monkeypatch):
+        """两序列交易日不一致时，不能按位置拼出伪造比价。"""
+        big = _klines_from_returns([0.0] * 21)
+        small = _klines_from_returns([0.0] * 21)
+        for row in small:
+            day = int(row["date"][-2:]) + 1
+            row["date"] = f"2026-01-{day:02d}"
+
+        def fake_kline(symbol, lmt=65):
+            return big if "000016" in symbol else small
+
+        monkeypatch.setattr(fc, "fetch_index_kline", fake_kline)
+
+        assert fc.calc_style_rotation() == {}
+
 
 # ============================================================
 # 六维方向合成

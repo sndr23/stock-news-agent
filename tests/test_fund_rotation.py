@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """基金轮动信号层（src/strategy/fund_rotation.py）单元测试"""
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -159,3 +161,71 @@ def test_intraday_estimate_missing_quote():
 
 def test_intraday_estimate_empty():
     assert fdata.intraday_estimate([], {}) == {"est_pct": 0.0, "covered_w": 0.0}
+
+
+def test_holdings_cache_bad_root_falls_back_to_free_source(monkeypatch, tmp_path):
+    """持仓缓存根节点损坏时，应继续请求天天基金免费接口而不是抛异常。"""
+    cache_path = tmp_path / "fund_holdings_cache.json"
+    cache_path.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(fdata, "HOLDINGS_CACHE_PATH", cache_path)
+    rows = [{"secid": "1.600519", "code": "600519", "name": "贵州茅台",
+             "weight": 10.0}]
+    monkeypatch.setattr(fdata, "get_holdings", lambda *args, **kwargs: rows)
+
+    assert fdata.load_holdings_cached(["000001"]) == {"000001": rows}
+
+
+def test_holdings_cache_empty_free_response_uses_fresh_cache(monkeypatch, tmp_path):
+    """免费接口返回空结果时，有效缓存仍应作为降级结果返回。"""
+    cache_path = tmp_path / "fund_holdings_cache.json"
+    rows = [{"secid": "1.600519", "code": "600519", "name": "贵州茅台",
+             "weight": 10.0}]
+    cache_path.write_text(
+        json.dumps({"_ts": time.time(), "funds": {"000001": {"rows": rows}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(fdata, "HOLDINGS_CACHE_PATH", cache_path)
+    monkeypatch.setattr(fdata, "get_holdings", lambda *args, **kwargs: [])
+
+    assert fdata.load_holdings_cached(["000001"]) == {"000001": rows}
+
+
+def test_holdings_cache_invalid_timestamp_is_not_used(monkeypatch, tmp_path):
+    """持仓缓存时间戳非法时，不得在降级判断中抛异常或使用旧持仓。"""
+    cache_path = tmp_path / "fund_holdings_cache.json"
+    cache_path.write_text(
+        '{"_ts":"not-a-timestamp","funds":{"000001":{"rows":[{"secid":"1.600519"}]}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(fdata, "HOLDINGS_CACHE_PATH", cache_path)
+    monkeypatch.setattr(fdata, "get_holdings",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            OSError("free source unavailable")))
+
+    assert fdata.load_holdings_cached(["000001"]) == {"000001": []}
+
+
+def test_expired_holdings_cache_is_not_rejuvenated_after_repeated_failures(
+        monkeypatch, tmp_path):
+    """过期持仓在连续失败时不得因重写全局时间戳而无限续期。"""
+    cache_path = tmp_path / "fund_holdings_cache.json"
+    rows = [{"secid": "1.600519", "code": "600519", "name": "贵州茅台",
+             "weight": 10.0}]
+    cache_path.write_text(
+        json.dumps({"_ts": time.time() - 8 * 86400,
+                    "funds": {"000001": {"rows": rows}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(fdata, "HOLDINGS_CACHE_PATH", cache_path)
+    monkeypatch.setattr(fdata, "get_holdings", lambda *args, **kwargs: [])
+
+    first = fdata.load_holdings_cached(["000001"])
+    second = fdata.load_holdings_cached(["000001"])
+
+    assert first == {"000001": []}
+    assert second == {"000001": []}
+
+
+def test_sec_id_to_tencent_ignores_malformed_identifier():
+    """损坏的免费持仓 secid 不应阻断其余证券行情转换。"""
+    assert fdata.secid_to_tencent("bad-secid") == ""

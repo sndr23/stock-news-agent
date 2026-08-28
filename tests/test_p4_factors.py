@@ -52,7 +52,7 @@ def _sample_snapshot(ts=None) -> dict:
 
 def _zt_pool_data(tc, lbc_list):
     """构造涨停池 data：tc + pool（每项只含 lbc）"""
-    return {"tc": tc, "qdate": 20260819,
+    return {"tc": tc, "qdate": int(date.today().strftime("%Y%m%d")),
             "pool": [{"lbc": n} for n in lbc_list]}
 
 
@@ -186,6 +186,30 @@ class TestFetchSectorFlows:
 # ============================================================
 
 class TestComputeWinrate:
+    def test_gist_failure_does_not_fallback_to_local_state(self, tmp_path, monkeypatch):
+        """回测统计配置 Gist 时，不应拿本地旧推送记录替代云端状态。"""
+        monkeypatch.setenv("GIST_TOKEN", "tok123")
+        monkeypatch.setenv("GIST_ID", "gid123")
+        monkeypatch.setattr(sb, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
+        sb._REALTIME_STATE_PATH.write_text(
+            '{"pushed_events": [{"t": "2026-08-28 10:00"}]}', encoding="utf-8")
+
+        def _fail(*args, **kwargs):
+            raise OSError("network down")
+
+        monkeypatch.setattr(sb.requests, "get", _fail)
+
+        assert sb._load_realtime_state() == {}
+
+    def test_non_object_local_state_degrades_to_empty(self, tmp_path, monkeypatch):
+        """本地回测状态根节点不是对象时，应安全降级为空。"""
+        monkeypatch.delenv("GIST_TOKEN", raising=False)
+        monkeypatch.delenv("GIST_ID", raising=False)
+        monkeypatch.setattr(sb, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
+        sb._REALTIME_STATE_PATH.write_text("[]", encoding="utf-8")
+
+        assert sb._load_realtime_state() == {}
+
     def test_extracts_overall_rates(self, monkeypatch):
         monkeypatch.setattr(sb, "_load_realtime_state",
                             lambda: {"pushed_events": [{"t": "2026-08-19 10:00"}]})

@@ -218,7 +218,8 @@ def _mock_base(monkeypatch, tmp_path):
     })
 
     def fake_kline(symbol, lmt=260):
-        return [{"date": f"2026-08-{i:02d}", "open": 100 + i, "close": 100 + i,
+        return [{"date": (date(2026, 1, 1) + timedelta(days=i)).isoformat(),
+                 "open": 100 + i, "close": 100 + i,
                  "high": 101 + i, "low": 99 + i, "volume": 100} for i in range(65)]
     monkeypatch.setattr(fc, "fetch_index_kline", fake_kline)
     monkeypatch.setattr(fc, "fetch_stock_quotes", lambda symbols: {})
@@ -253,7 +254,8 @@ class TestConfidenceTiering:
         # - 温和放量突破（递增序列+末日放量）→ 量价+1（info 信号不切 risk_off）
         # - 普涨 dp=15 → 宽度+1；日元温和 -0.3%（急贬会触发 warning 切 risk_off，避开）
         def up_kline(symbol, lmt=260):
-            ks = [{"date": f"2026-08-{i:02d}", "open": 100 + i * 0.5, "close": 100 + i * 0.5,
+            ks = [{"date": (date(2026, 1, 1) + timedelta(days=i)).isoformat(),
+                   "open": 100 + i * 0.5, "close": 100 + i * 0.5,
                    "high": 101 + i * 0.5, "low": 99 + i * 0.5, "volume": 100}
                   for i in range(64)]
             last = {"date": "2026-08-19", "open": 132, "close": 132, "high": 133,
@@ -354,6 +356,21 @@ class TestDataHealth:
         # P8 后源总数 13→14（分钟K线）
         assert snap["sources"]["total"] == 14
         assert snap["sources"]["ok"] == 5
+
+    def test_run_once_alerts_after_three_failed_rounds(self, tmp_path, monkeypatch):
+        """连续三轮免费源失败后推送一次健康度告警，后续轮次不重复刷屏。"""
+        pushed = _mock_base(monkeypatch, tmp_path)
+        for _ in range(4):
+            fc.run_once(push=True)
+
+        alerts = [p for p in pushed if p["title"] == "免费数据源连续失败告警"]
+        assert len(alerts) == 1
+        assert "连续失败 3 轮" in alerts[0]["content"]
+        assert "资金流" in alerts[0]["content"]
+
+        state = fc._load_state()
+        assert state["source_health"]["资金流"]["consecutive_failures"] == 4
+        assert state["source_health"]["资金流"]["alerted"] is True
 
     def test_build_snapshot_sources_key(self):
         snap = fc.build_snapshot({}, {}, {}, "neutral", sources={"ok": 9, "total": 11})

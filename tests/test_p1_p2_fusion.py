@@ -283,6 +283,7 @@ class TestRelatedPushedNews:
         ])
         monkeypatch.setattr(fc, "_REALTIME_STATE_PATH", p)
         monkeypatch.delenv("GIST_TOKEN", raising=False)
+        monkeypatch.delenv("GIST_ID", raising=False)
         out = fc._related_pushed_news(["中际旭创", "300308"], hours=48)
         assert out == ["中际旭创获大额订单"]
 
@@ -291,6 +292,7 @@ class TestRelatedPushedNews:
         p = self._write_state(tmp_path, [{"pushed": True, "t": now, "title": "央行降准"}])
         monkeypatch.setattr(fc, "_REALTIME_STATE_PATH", p)
         monkeypatch.delenv("GIST_TOKEN", raising=False)
+        monkeypatch.delenv("GIST_ID", raising=False)
         assert fc._related_pushed_news(["中际旭创"]) == []
 
     def test_empty_keywords(self):
@@ -413,6 +415,16 @@ class TestForwardReturns:
         assert fr["ret_3"] == 20.0
         assert "ret_5" not in fr  # 数据不足
 
+    def test_includes_ten_day_horizon_when_data_is_available(self):
+        kl = _klines([100, 110, 105, 120, 130, 125, 135, 140, 145, 150, 160])
+        fr = sb._forward_returns(kl, "2026-08-01")
+        assert fr["ret_5"] == 25.0
+        assert fr["ret_10"] == 60.0
+
+    def test_omits_ten_day_horizon_when_data_is_insufficient(self):
+        kl = _klines([100, 110, 105, 120, 130])
+        assert "ret_10" not in sb._forward_returns(kl, "2026-08-01")
+
     def test_event_before_first_day(self):
         kl = _klines([100, 110])
         fr = sb._forward_returns(kl, "2026-07-30")
@@ -426,6 +438,25 @@ class TestForwardReturns:
     def test_last_day_no_forward(self):
         kl = _klines([100, 110])
         assert sb._forward_returns(kl, "2026-08-02") == {}
+
+
+def test_backtest_window_uses_beijing_date(monkeypatch):
+    """UTC 次日凌晨应按北京时间日期裁剪回测窗口。"""
+    instant = datetime(2026, 8, 27, 16, 30, tzinfo=timezone.utc)
+
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(sb, "datetime", _FakeDateTime)
+    events = [{"dir": "bullish", "scope": "market", "stocks": [],
+               "title_norm": "北京时间边界", "sectors": [],
+               "t": "2026-08-27 10:00:00"}]
+
+    summary = sb.backtest(events, days=0)
+
+    assert summary["events_total"] == 0
 
 
 class TestBacktest:
@@ -479,6 +510,7 @@ class TestBacktest:
         assert "信号质量回测报告" in report
         assert "总体一致率" in report
         assert "利多组" in report
+        assert "后10日" in report
         assert "明细" in report
 
     def test_report_cold_start_note(self, monkeypatch):

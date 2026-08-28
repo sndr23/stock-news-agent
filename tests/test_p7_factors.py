@@ -101,6 +101,17 @@ class TestFetchOptionPcr:
                             lambda url, params=None, **kw: _opt_page(rows, 1))
         assert fc.fetch_option_pcr() == {}
 
+    def test_nonfinite_or_negative_volume_is_not_counted(self, monkeypatch):
+        """期权成交量非法时，不得污染 PCR 或合约覆盖统计。"""
+        rows = [
+            {"f12": "1", "f14": "50ETF购8月2900", "f5": "nan"},
+            {"f12": "2", "f14": "50ETF沽8月2900", "f5": -100},
+        ]
+        monkeypatch.setattr(fc, "_http_get",
+                            lambda url, params=None, **kw: _opt_page(rows, 2))
+
+        assert fc.fetch_option_pcr() == {}
+
     def test_pagination_stops_at_total(self, monkeypatch):
         page1 = [{"f12": str(i), "f14": "50ETF购8月2900", "f5": 10} for i in range(500)]
         page2 = [{"f12": "999", "f14": "50ETF沽8月2900", "f5": 500}]

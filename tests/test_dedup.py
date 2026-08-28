@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timedelta
 from src.tools.data_fetchers import (
     _normalize_url, _simhash, _hamming, _in_news_window,
-    dedup_news_3layer, NO_DATA_SENTINEL,
+    dedup_news_3layer, NO_DATA_SENTINEL, BJT,
 )
 
 
@@ -42,19 +42,19 @@ class TestSimHash:
 
 class TestInNewsWindow:
     def test_today_passes(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(BJT).strftime("%Y-%m-%d")
         assert _in_news_window(today) is True
 
     def test_future_rejected(self):
-        future = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+        future = (datetime.now(BJT) + timedelta(days=2)).strftime("%Y-%m-%d")
         assert _in_news_window(future) is False
 
     def test_yesterday_passes_with_window1(self):
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(BJT) - timedelta(days=1)).strftime("%Y-%m-%d")
         assert _in_news_window(yesterday, look_back_days=1) is True
 
     def test_old_date_rejected(self):
-        old = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+        old = (datetime.now(BJT) - timedelta(days=10)).strftime("%Y-%m-%d")
         assert _in_news_window(old, look_back_days=1) is False
 
     def test_empty_rejected(self):

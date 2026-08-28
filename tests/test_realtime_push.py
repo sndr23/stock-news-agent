@@ -10,6 +10,7 @@
 """
 import importlib.util
 import json
+from datetime import date
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,34 @@ def _load_rtp():
 
 
 rtp = _load_rtp()
+
+
+def test_is_trading_day_rejects_makeup_saturday():
+    """实时资讯入口与 A 股统一：法定补班周六仍不算交易日。"""
+    assert not rtp._is_trading_day(date(2026, 10, 10))
+
+
+def test_is_trading_day_default_uses_beijing_date(monkeypatch):
+    """默认日期必须取北京时间，避免 UTC 跨日跳过/提前运行。"""
+    import datetime as _dt
+
+    instant = _dt.datetime(2026, 8, 28, 16, 30, tzinfo=_dt.timezone.utc)
+
+    class _FakeDateTime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(rtp, "datetime", _FakeDateTime)
+
+    assert rtp._is_trading_day() is False  # BJT = 2026-08-29, Saturday
+
+
+def test_state_timestamp_interprets_persisted_time_as_beijing_time():
+    """状态中的时间字符串是北京时间，转 epoch 时不得按 Runner 本地时区解释。"""
+    expected = datetime(2026, 8, 28, 9, 30, tzinfo=rtp.BJT).timestamp()
+
+    assert rtp._state_timestamp("2026-08-28 09:30:00") == expected
 
 
 # ============================================================
@@ -728,6 +757,35 @@ class TestRunOnce:
         pushed_recs = [r for r in saved["seen"].values() if r.get("pushed")]
         assert pushed_recs, "推送成功必须记录 seen.pushed=True"
         assert saved["pushed_events"], "推送成功必须记录已推事件"
+
+    def test_dry_run_without_new_items_does_not_save_state(self, monkeypatch, tmp_path):
+        """dry-run 无新增资讯时也必须保持只读，不触发状态持久化"""
+        self._setup(monkeypatch, tmp_path, {"code": 200, "msg": "ok"})
+        item = {
+            "title": "央行宣布降准0.5个百分点 释放万亿流动性",
+            "content": "国常会部署，支持实体",
+            "source": "财联社",
+            "published_at": "2026-08-01 10:00:00",
+        }
+        fp = rtp._news_fingerprint(item)
+        monkeypatch.setattr(rtp, "load_state", lambda: {
+            "version": 2,
+            "seen": {fp: {"t": "2026-08-01 10:00:00", "pushed": False}},
+            "pending": {},
+            "pushed_events": [],
+        })
+        saved = []
+        monkeypatch.setattr(rtp, "save_state", lambda state: saved.append(state))
+        monkeypatch.setattr(
+            rtp,
+            "get_stock_news",
+            type("T", (), {"func": staticmethod(lambda: [item])})(),
+        )
+
+        stats = rtp.run_once(dry_run=True)
+
+        assert stats["new"] == 0
+        assert saved == [], "dry-run 不得在无新增分支持久化状态"
 
     def test_push_fail_does_not_record_fingerprint(self, monkeypatch, tmp_path):
         """推送失败：不记录指纹，下轮重试（重大消息不丢失）"""

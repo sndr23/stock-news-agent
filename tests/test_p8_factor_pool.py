@@ -66,6 +66,21 @@ class TestFetchMinuteKline:
         out = fc.fetch_minute_kline()
         assert len(out) == 1
 
+    def test_nonfinite_or_nonpositive_rows_are_skipped(self, monkeypatch):
+        """分钟K线价格必须为有限正数，成交量不得为负数。"""
+        rows = [
+            ["202608190935", "nan", "3905", "3906", "3899", "12345", {}],
+            ["202608190940", "3905", "3910", "3911", "3904", "-1", {}],
+            ["202608190945", "3905", "3910", "3911", "3904", "20000", {}],
+        ]
+        monkeypatch.setattr(fc, "_http_get",
+                            lambda url, **kw: self._payload(rows))
+
+        out = fc.fetch_minute_kline("sh000001", "m5", 48)
+
+        assert len(out) == 1
+        assert out[0]["time"] == "202608190945"
+
 
 class TestDailyDerivedFactors:
     def test_insufficient_data_returns_empty(self):
