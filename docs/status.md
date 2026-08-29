@@ -13,7 +13,14 @@
 - 严格回测（v5.1 d日快照 + T.35/P.25）：策略累计 **+156.0%**，年化 **+8.1%**，夏普 **0.60**，最大回撤 **-42.5%**，卡玛 0.19；买入持有 +170.1%/-69.7%；平均仓位 40%，换仓 352 次。
 - 官方 walk-forward OOS（v5.1 d日快照 + T.35/P.25）：复合累计 **+89.5%**，年化 +7.4%，夏普 0.54，最大回撤 **-27.0%**，卡玛 0.27；买入持有 +111.2%/-57.0%；卡玛差距 -0.08 过拟合检测通过。
 - **关键发现（口径×权重耦合，ND-004 依据）**：d 日快照已含当日涨跌，趋势因子时效性已够，T.50 提权反而追当日涨跌（OOS +83.8%）；落袋（反向离场）在快照口径下更有价值，T.35/P.25 OOS +96.8%（固定参数）/官方口径 +89.5%。趋势 ≤0.45 全区间优于 0.50。训练段动态寻优跨折漂移（+74.6%），劣于固定权重。详见 `docs/策略缺陷实验报告_20260828.md` 第七章。
-- 测试门禁：本轮最终结果为 **1097 passed, 21 deselected**（新增 3 个 ETag 乐观锁用例），执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
+- **P1-2 策略失效熔断已完成（2026-08-29，commit `2aeaeea`，已 push）**：新增 `_cumulative_nav()`（策略 Π(1+pos×ret) / 基准 Π(1+ret) 累计净值）+ `strategy_health(window=20, lag_gate=0.10, dd_gate=0.15)`——滚动 20 日内策略落后基准 ≥10pp 或回撤 ≥15% → 告警；有效样本 <20 → **不告警**（安全默认）。影子 history 每条新增 `nav`/`bh_nav` 埋点。**只告警不改仓位**。真实数据验证：5 条影子（3 条有效）→ 策略 0.9985 vs 基准 1.0121，正确不误报。
+- **P1-3 执行滑点埋点已完成（2026-08-29，commit `5c6fbd1`，已 push）**：用户明确的执行链路为"14:45 信号 → 15:00 前手动操作 → 按当日收盘净值成交 → 赚明天/未来的收益"，故信号价（14:45 盘中）与成交价（15:00 收盘）天然存在 15 分钟摩擦：`slip = 收盘涨幅 − 盘中涨幅`，仅换仓产生成本 `|Δpos| × slip`。新增影子字段 `close_pct`（次日随 next_ret 回填）+ `execution_slippage()` + 对账脚本 `scripts/_exp_execution_slippage.py`。历史无法回算（两字段埋点时间不同，需同日配对），随运行累积，建议 ≥20 个交易日后作结论。
+- **口径已确认（2026-08-29 用户明确）**：策略预测目标是**明天/未来收益，不是当天**。当前回测口径 `决策 comp[d]（d 日 14:45 快照）→ 成交 closes[d]（收盘净值）→ 收益 closes[d+1]/closes[d]` 与该执行链路完全对齐。
+- **网络已恢复**：`2aeaeea` + `5c6fbd1` 均已 push，远程 main = 本地 HEAD `5c6fbd1`（已用 `git ls-remote` 验证）。14:35 的推送失败为环境代理故障（`proxy 127.0.0.1`）。注：沙箱内 `git fetch` 不写入 `refs/remotes/`（故 `git status -sb` 显示 `[gone]`），验证远程须用 `git ls-remote`，不影响推送与远程数据。
+- **远程遗留分支（2026-08-29 发现，待用户决定是否清理）**：`codex/ranking-improvements-and-fixes`（落后 main 106 commit，所改 `src/agent/`、`src/api/` 旧架构文件已不存在）、`codex/tech-keyword-boundary-and-fixes`（领先 0，已完全合入）、`arena/01a028c8-stock-news-agent`（落后 33 commit，其 2 个 commit——workflow 注释 14:30→14:45、`shadow_raw` 键名 `main_net`→`main_net_yi`——**均已在 main 中**）。三者均无未合入的有效工作，保留会混淆后续接手的 Agent。
+- **P1-1 波动率目标：暂不实施**——动态仓位缩放会改变仓位逻辑，触及"OOS 期间不调整核心权重/档位线"纪律；待 v5.1 留出样本观察期（≈20 个交易日）后再评估。
+- **P0-3 修正层 IC 验门：脚本就绪，数据不足**。验门脚本 `scripts/_exp_modifier_ic.py` 已可用（各修正项 vs next_ret/r3/r5/r10 的 Spearman IC，门槛 |IC|≥0.05 且样本≥10）。但云端影子 history **仅 5 条**（2026-08-24~28，系统 08-22 上线以来全部交易日），`next_ret` 仅 3 条有效、`r3/r5/r10` 全部未到期 → **不作任何结论**，各修正项维持原样。约需 5 个交易日（≈09-04）达 10 条门槛后可出结论。
+- 测试门禁：本轮最终结果为 **1106 passed, 21 deselected**（P0-2 +3、P1-2 +5、P1-3 +4），执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
 - **生产级审查 P0 批次（2026-08-29 凌晨）**：
   - **P0-0 生产可用性（严重缺陷已修）**：`src/strategy/data_freshness.py`、`src/strategy/state_io.py` 此前**从未提交且未被 .gitignore 排除**，而 `data.py`/`index_pe.py`/`overseas.py`/`news_link.py`/`factor_collector.py` 均依赖二者——任何 git clone 环境（含 CI）都会 ImportError。已补提交（commit `fc9ee7c`）+ 10 个新增测试 + 3 篇文档。
   - **P0-1 技术债已清理**：原 56 文件未提交（+4680/-1495）+ 48 未跟踪 → 已拆为 5 个语义 commit（`fc9ee7c` 生产可用性 / `b2490b2` 择时 v5.1 / `d742742` 数据源加固 / `bac8493` 测试 / `87c4842` 文档）。仅保留保护项未提交：`scripts/_*.py` 临时研究脚本、`_jetson_state.json`、`tmp_csindex.html`、`findings.md`、`progress.md`（其他 Agent 工作笔记）。**未 push**（待用户决定）。
