@@ -1051,3 +1051,49 @@ def test_strategy_health_ok_when_tracking_benchmark():
     h = _hist([(1.0, 0.01)] * 20)
     res = rct.strategy_health(h, window=20)
     assert res["level"] == "ok" and res["ok"] is True
+
+
+# ---------------- 执行滑点测算（P1-3，2026-08-29） ----------------
+
+def test_execution_slippage_empty_without_paired_fields():
+    """无 intraday_pct/close_pct 配对时不产出结论（安全默认）。"""
+    res = rct.execution_slippage([{"date": "2026-08-28", "position": 0.0}])
+    assert res["n"] == 0
+    assert res["total_cost"] == 0.0
+
+
+def test_execution_slippage_measures_signal_to_fill_gap():
+    """滑点 = 收盘涨幅 − 14:45 盘中涨幅（注意 intraday_pct 是百分点）。"""
+    hist = [
+        # 14:45 涨 1.00%，收盘涨 1.50% → 滑点 +0.50%（买入方吃亏）
+        {"date": "2026-08-27", "position": 1.0, "intraday_pct": 1.00,
+         "close_pct": 0.0150},
+    ]
+    res = rct.execution_slippage(hist)
+    assert res["n"] == 1
+    assert res["events"][0]["slip"] == pytest.approx(0.005, abs=1e-6)
+
+
+def test_execution_slippage_only_counts_position_changes():
+    """只有换仓才产生摩擦：成本 = |Δ仓位| × 滑点。"""
+    hist = [
+        {"date": "2026-08-26", "position": 0.0, "intraday_pct": 0.0,
+         "close_pct": 0.01},              # 建仓前，无 Δ
+        {"date": "2026-08-27", "position": 1.0, "intraday_pct": 0.0,
+         "close_pct": 0.01},              # 空→满，Δ=1.0，滑点 1%
+        {"date": "2026-08-28", "position": 1.0, "intraday_pct": 0.0,
+         "close_pct": 0.01},              # 维持，Δ=0，无摩擦
+    ]
+    res = rct.execution_slippage(hist)
+    assert res["n"] == 3
+    # 仅 08-27 一笔产生摩擦：1.0 × 0.01 = 0.01
+    assert res["total_cost"] == pytest.approx(0.01, abs=1e-6)
+
+
+def test_execution_slippage_handles_negative_gap():
+    """14:45 后继续下跌（滑点为负）时，买入方反而占便宜。"""
+    hist = [{"date": "2026-08-27", "position": 1.0,
+             "intraday_pct": 2.00, "close_pct": 0.0050}]
+    res = rct.execution_slippage(hist)
+    assert res["events"][0]["slip"] == pytest.approx(-0.015, abs=1e-6)
+    assert res["mean_slip"] < 0

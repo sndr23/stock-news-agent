@@ -450,6 +450,13 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
             i = idx.get(str(h.get("date") or ""))
             if i is not None and i + 1 < len(closes) and dates[i] < today:
                 h["next_ret"] = round(closes[i + 1] / closes[i] - 1.0, 4)
+        # 回填当日收盘涨幅（P1-3 执行滑点，2026-08-29）：与 14:45 的 intraday_pct
+        # 配对，二者之差即"信号→成交"的 15 分钟价差。当日 14:45 运行时拿到的是
+        # 盘中快照，收盘价要等次日才能取到完整值，故在这里回填（与 next_ret 同机制）。
+        if h.get("close_pct") is None:
+            i = idx.get(str(h.get("date") or ""))
+            if i is not None and i > 0 and dates[i] < today:
+                h["close_pct"] = round(closes[i] / closes[i - 1] - 1.0, 4)
         # 多期前瞻：记录"还需等几根"递减，0 时用 close 前缀补实际收益
         for offk, rk, k in (("fwd3_off", "r3", 3), ("fwd5_off", "r5", 5),
                             ("fwd10_off", "r10", 10)):
@@ -644,6 +651,54 @@ def strategy_health(hist: list, window: int = 20,
             "stats": {"n": len(recs), "window": window, "nav": round(nav, 4),
                       "bh": round(bh, 4), "lag": round(lag, 4),
                       "mdd": round(mdd, 4)}}
+
+
+def execution_slippage(hist: list) -> dict:
+    """执行滑点测算（P1-3，2026-08-29）。
+
+    实盘链路：14:45 出信号（基于盘中价）→ 15:00 前下单 → 按**当日收盘净值**成交。
+    因此"信号价"与"成交价"天然存在 15 分钟价差，这是真实摩擦成本：
+
+        slip = 当日收盘涨幅 − 14:45 盘中涨幅
+
+    只有**仓位变化**（换仓）才产生实际摩擦：成本 = |Δposition| × slip
+    （slip>0 表示 14:45 后继续上涨，买入方吃亏、卖出方少赚）
+
+    量纲注意：``intraday_pct`` 存的是**百分点**（如 -1.23 = -1.23%），
+    而 ``close_pct`` / ``next_ret`` 是**小数**（如 -0.0123），此处统一为小数。
+
+    Returns:
+        {"n": 有效样本, "mean_slip": 平均滑点, "worst": 最差单笔,
+         "total_cost": 累计摩擦（按换仓幅度加权）, "events": [...]}
+    """
+    events = []
+    prev_pos = None
+    for r in hist:
+        pos = r.get("position")
+        ip, cp = r.get("intraday_pct"), r.get("close_pct")
+        if not isinstance(ip, (int, float)) or not isinstance(cp, (int, float)):
+            if isinstance(pos, (int, float)):
+                prev_pos = pos
+            continue
+        slip = cp - ip / 100.0   # 百分点 → 小数
+        dpos = abs(float(pos) - prev_pos) if isinstance(pos, (int, float)) \
+            and prev_pos is not None else 0.0
+        events.append({"date": r.get("date"), "slip": round(slip, 6),
+                       "dpos": round(dpos, 4),
+                       "cost": round(dpos * slip, 6),
+                       "intraday_pct": ip, "close_pct": cp})
+        if isinstance(pos, (int, float)):
+            prev_pos = pos
+    if not events:
+        return {"n": 0, "mean_slip": 0.0, "mean_abs_slip": 0.0, "worst": 0.0,
+                "total_cost": 0.0, "events": []}
+    slips = [e["slip"] for e in events]
+    return {"n": len(events),
+            "mean_slip": round(sum(slips) / len(slips), 6),
+            "mean_abs_slip": round(sum(abs(s) for s in slips) / len(slips), 6),
+            "worst": round(max(slips, key=abs), 6),
+            "total_cost": round(sum(e["cost"] for e in events), 6),
+            "events": events}
 
 
 def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
