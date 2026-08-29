@@ -352,7 +352,6 @@ def test_dimension_modifier_applies_documented_component_caps():
     _root = _P(__file__).resolve().parent.parent
     if str(_root / "scripts") not in _sys.path:
         _sys.path.insert(0, str(_root / "scripts"))
-    import run_chinext_timing as rct
 
     snapshot = {
         "ts": "2026-08-27 14:30",
@@ -635,7 +634,6 @@ def test_stale_factor_snapshot_does_not_change_modifier_score():
     _root = _P(__file__).resolve().parent.parent
     if str(_root / "scripts") not in _sys.path:
         _sys.path.insert(0, str(_root / "scripts"))
-    import run_chinext_timing as rct
 
     stale_snapshot = {
         "basis": {"IC": {"annual_pct": -20.0}},
@@ -685,7 +683,6 @@ def test_snapshot_with_canonical_today_timestamp_is_fresh():
 def test_timing_date_helpers_use_beijing_date_at_utc_midnight_boundary(monkeypatch):
     """GitHub Runner UTC 次日凌晨仍应按北京时间的交易日处理。"""
     import datetime as _dt
-    import run_chinext_timing as rct
 
     instant = _dt.datetime(2026, 8, 28, 16, 30, tzinfo=_dt.timezone.utc)
 
@@ -723,7 +720,6 @@ def test_gather_context_keeps_intraday_snapshot(monkeypatch):
     _root = _P(__file__).resolve().parent.parent
     if str(_root / "scripts") not in _sys.path:
         _sys.path.insert(0, str(_root / "scripts"))
-    import run_chinext_timing as rct
     import datetime as _dt
 
     class _FakeDT(_dt.datetime):
@@ -762,7 +758,6 @@ def test_gather_context_keeps_intraday_snapshot(monkeypatch):
 def test_gather_context_uses_latest_valid_citic_history(monkeypatch):
     """中信持仓历史无序时，择时上下文应使用最近有效日期而非列表末项。"""
     import datetime as _dt
-    import run_chinext_timing as rct
 
     class _FakeDT(_dt.datetime):
         @classmethod
@@ -861,7 +856,6 @@ def _import_rct():
     _root = _P(__file__).resolve().parent.parent
     if str(_root / "scripts") not in _sys.path:
         _sys.path.insert(0, str(_root / "scripts"))
-    import run_chinext_timing as rct
     return rct
 
 
@@ -999,3 +993,61 @@ def test_render_report_mods_health_marker():
                  "snapshot": {}}
     txt3 = rct.render_report("2026-08-27", res, ctx_stale, dec, prev_pos=0.0)
     assert "(缺)" not in txt3
+
+
+# ---------------- 策略失效熔断（P1-2，2026-08-29） ----------------
+
+import sys as _sys
+from pathlib import Path as _P
+_ROOT = _P(__file__).resolve().parent.parent
+if str(_ROOT / "scripts") not in _sys.path:
+    _sys.path.insert(0, str(_ROOT / "scripts"))
+import run_chinext_timing as rct  # noqa: E402
+
+def _hist(rows):
+    """构造影子 history：[{date, position, next_ret}, ...]"""
+    return [{"date": f"2026-01-{i + 1:02d}", "position": p, "next_ret": r}
+            for i, (p, r) in enumerate(rows)]
+
+
+def test_cumulative_nav_tracks_strategy_and_benchmark():
+    """策略净值 = Π(1+pos×ret)；基准 = Π(1+ret)；未回填记录跳过。"""
+    h = _hist([(0.0, 0.10), (1.0, -0.10), (0.5, 0.10)])
+    h.append({"date": "2026-01-04", "position": 1.0, "next_ret": None})
+    nav, bh = rct._cumulative_nav(h)
+    # 基准：(1.10)(0.90)(1.10)=1.089；策略：1.0×0.90×1.05=0.945
+    assert bh == pytest.approx(1.089, abs=1e-4)
+    assert nav == pytest.approx(0.945, abs=1e-4)
+
+
+def test_strategy_health_stays_silent_on_insufficient_samples():
+    """样本不足时必须不告警，避免小样本误报（安全默认）。"""
+    h = _hist([(0.0, 0.05)] * 5)
+    res = rct.strategy_health(h, window=20)
+    assert res["ok"] is True
+    assert res["level"] == "insufficient"
+
+
+def test_strategy_health_alerts_when_lagging_benchmark():
+    """滚动窗口内策略落后基准 ≥ 阈值 → 告警（不改仓位，只提示）。"""
+    # 20 个交易日均上涨 1%，但策略始终空仓 → 落后基准约 22pp
+    h = _hist([(0.0, 0.01)] * 20)
+    res = rct.strategy_health(h, window=20, lag_gate=0.10)
+    assert res["level"] == "alert"
+    assert any("落后基准" in r for r in res["reasons"])
+    assert res["stats"]["lag"] > 0.10
+
+
+def test_strategy_health_alerts_on_drawdown():
+    """滚动窗口内策略回撤 ≥ 阈值 → 告警。"""
+    rows = [(1.0, 0.02)] * 5 + [(1.0, -0.05)] * 15   # 满仓连跌 → 回撤 >15%
+    res = rct.strategy_health(_hist(rows), window=20, dd_gate=0.15)
+    assert res["level"] == "alert"
+    assert any("回撤" in r for r in res["reasons"])
+
+
+def test_strategy_health_ok_when_tracking_benchmark():
+    """策略与基准同步时不应告警。"""
+    h = _hist([(1.0, 0.01)] * 20)
+    res = rct.strategy_health(h, window=20)
+    assert res["level"] == "ok" and res["ok"] is True

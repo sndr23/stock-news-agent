@@ -464,12 +464,15 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                     h[rk] = round(closes[i + k] / base - 1.0, 4)
                 elif dates[i] < today:
                     h[offk] = move - 1  # 尚未到期，递减等待
+    # 净值埋点（2026-08-29 P1-2）：截至本条之前的策略/基准累计净值
+    _nav, _bh_nav = _cumulative_nav(hist)
     hist.append({"date": today, "score": score, "core": core_s,
                  "basis": m.get("basis", 0.0), "flow": m.get("flow", 0.0),
                  "mood": m.get("mood", 0.0), "news": m.get("news", 0.0),
                  "chan": chan_d, "stock": stock_d,
                  "kospi": 0.0, "sox": min(ovs_drop, 0.0), "vix": 0.0, "a50": 0.0,
                  "position": position, "next_ret": None,
+                 "nav": _nav, "bh_nav": _bh_nav,
                  "fwd3_off": 3, "fwd5_off": 5, "fwd10_off": 10,
                  "r3": None, "r5": None, "r10": None,
                  # 原始输入（验门增益：离散档分对 Spearman IC 分辨力弱，补原始量可直接做
@@ -580,7 +583,71 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) -> str:
+def _cumulative_nav(hist: list) -> tuple:
+    """基于影子 history 的 next_ret 累乘策略净值与基准净值（均从 1.0 起）。
+
+    策略净值 = Π(1 + position × next_ret)；基准净值 = Π(1 + next_ret)
+    （基准 = 满仓持有创业板指，与回测口径一致；未回填 next_ret 的记录跳过）
+
+    用途（2026-08-29 P1-2）：净值埋点是策略失效熔断、绩效归因、执行对账的
+    共同基础——从埋点日起累积，样本足够后即可量化"策略 vs 买入持有"。
+    """
+    nav = bh = 1.0
+    for r in hist:
+        nr = r.get("next_ret")
+        if not isinstance(nr, (int, float)):
+            continue
+        bh *= (1.0 + nr)
+        nav *= (1.0 + (r.get("position") or 0.0) * nr)
+    return round(nav, 6), round(bh, 6)
+
+
+def strategy_health(hist: list, window: int = 20,
+                    lag_gate: float = 0.10, dd_gate: float = 0.15) -> dict:
+    """策略健康度（P1-2 策略失效熔断，2026-08-29）。
+
+    **只监控告警，不改仓位**——保持决策透明，是否干预由人判断。
+    三个条件：
+      ① 滚动 window 日策略累计落后基准 ≥ lag_gate（策略衰减/系统性踏空）
+      ② 策略滚动净值回撤 ≥ dd_gate（回撤失控）
+      ③ 有效样本 < window → 不告警（安全默认，避免小样本误报）
+
+    Returns:
+        {"ok": bool, "level": "ok"|"alert"|"insufficient",
+         "reasons": [str], "stats": dict}
+    """
+    recs = [r for r in hist if isinstance(r.get("next_ret"), (int, float))]
+    if len(recs) < window:
+        return {"ok": True, "level": "insufficient",
+                "reasons": [f"有效样本 {len(recs)}/{window}，不触发熔断（安全默认）"],
+                "stats": {"n": len(recs), "window": window}}
+    win = recs[-window:]
+    nav = bh = peak = 1.0
+    mdd = 0.0
+    for r in win:
+        nr = r.get("next_ret")
+        nav *= (1.0 + (r.get("position") or 0.0) * nr)
+        bh *= (1.0 + nr)
+        peak = max(peak, nav)
+        mdd = min(mdd, nav / peak - 1.0)
+    lag = bh - nav  # 正数 = 策略落后基准
+    reasons = []
+    if lag >= lag_gate:
+        reasons.append(
+            f"近{window}日策略落后基准 {lag * 100:.1f}pp"
+            f"（策略 {nav - 1:+.1%} vs 持有 {bh - 1:+.1%}）")
+    if -mdd >= dd_gate:
+        reasons.append(
+            f"近{window}日策略回撤 {mdd * 100:.1f}% ≥ 阈值 {dd_gate * 100:.0f}%")
+    return {"ok": not reasons, "level": "alert" if reasons else "ok",
+            "reasons": reasons,
+            "stats": {"n": len(recs), "window": window, "nav": round(nav, 4),
+                      "bh": round(bh, 4), "lag": round(lag, 4),
+                      "mdd": round(mdd, 4)}}
+
+
+def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
+                  health: dict | None = None) -> str:
     core, caps = res["core"], res["caps"]
     mods = res["mods"]
     pos = dec["position"]
@@ -659,6 +726,13 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float) 
                      f"贴水/资金/情绪基于旧快照，请结合盘中走势谨慎参考")
     if dec["note"] and not chg and "确认" not in dec["note"][0]:
         lines.append("■ " + "；".join(dec["note"]))
+    # 策略失效熔断（P1-2，2026-08-29）：只告警不改仓位，样本不足时标注进度
+    if health:
+        if health.get("level") == "alert":
+            lines.append("⚠ 策略健康度告警：" + "；".join(health["reasons"]))
+            lines.append("  （仅提示，不自动改变仓位；请人工判断是否暂停跟投）")
+        elif health.get("level") == "insufficient":
+            lines.append(f"■ 策略健康度：{health['reasons'][0]}")
     lines.append("")
     lines.append("档位线：≥+0.40满仓｜≥-0.15九成｜≥-0.30战略六成底仓｜更低空仓")
     lines.append(f"升档需连续2日确认，降档当日生效；15:00 前下单有效。仅供参考。"
@@ -970,7 +1044,9 @@ def main():
     prev = {"position": prev_pos, "pending": state.get("pending")}
     dec = ct.decide_position(res["score"], res["caps"]["cap"], prev)
 
-    report = render_report(today, res, ctx, dec, prev_pos)
+    # 策略失效熔断（P1-2）：基于影子 history 的累计净值评估健康度，仅告警不改仓位
+    _health = strategy_health(state.get("history") or [])
+    report = render_report(today, res, ctx, dec, prev_pos, health=_health)
     print("\n" + report + "\n")
 
     if args.push:
