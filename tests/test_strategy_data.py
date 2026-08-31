@@ -49,6 +49,36 @@ def _mk_df(last_date):
                         index=[pd.Timestamp(last_date)])
 
 
+def _is_cn_workday(day):
+    """A 股交易日判定；日历库缺失/不支持该年份时退化为周一至周五。"""
+    try:
+        from src.strategy.data_freshness import _is_workday
+
+        return _is_workday(day, "cn")
+    except Exception:
+        return day.weekday() < 5
+
+
+def _stale_date(target_lag: int = 5):
+    """返回按 A 股交易日口径确定"陈旧"的日期。
+
+    生产侧 is_recent_data_date 按**工作日**计数（max_lag_days=3），而自然日
+    -5 在周末/节后只覆盖 ≤3 个交易日，会被误判为新鲜（2026-08-31 回归）。
+    这里改为倒推 target_lag(>3) 个交易日，任何星期几/长假期都成立。
+    """
+    day = datetime.now().date()
+    lag = 0
+    while lag < target_lag:
+        day -= timedelta(days=1)
+        if _is_cn_workday(day):
+            lag += 1
+    return day
+
+
+def _stale_day_str(target_lag: int = 5):
+    return _stale_date(target_lag).strftime("%Y-%m-%d")
+
+
 def test_index_sina_cache_fresh_hits(monkeypatch):
     """缓存末根不早于昨天 → 直接命中，不触发网络"""
     fresh = _mk_df(datetime.now().date())
@@ -73,7 +103,7 @@ def test_index_sina_cache_fresh_hits(monkeypatch):
 
 def test_index_sina_cache_stale_refetch(monkeypatch):
     """缓存末根早于昨天 → 判为陈旧，强制重拉（修复隔日滞后）"""
-    stale = _mk_df((datetime.now() - timedelta(days=5)).date())
+    stale = _mk_df(_stale_date())
     monkeypatch.setattr(sdata, "_cache_get", lambda key, ttl_days=None: stale)
     import requests
     hit = {"net": False}
@@ -95,7 +125,7 @@ def test_index_sina_cache_stale_refetch(monkeypatch):
 
 def test_index_sina_rejects_stale_live_response(monkeypatch):
     """新浪接口返回旧日线时不得把旧响应当成成功数据。"""
-    stale_day = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    stale_day = _stale_day_str()
     monkeypatch.setattr(sdata, "_cache_get", lambda key, ttl_days=None: None)
     import requests
 
@@ -495,7 +525,7 @@ def test_fetch_stock_daily_skips_malformed_source(monkeypatch):
 
 def test_index_daily_full_rejects_stale_bar_when_cache_metadata_is_fresh(monkeypatch):
     """缓存文件虽新但末根交易日过期时，免费源失败不得继续返回旧指数。"""
-    stale = _mk_df((datetime.now() - timedelta(days=5)).date())
+    stale = _mk_df(_stale_date())
     monkeypatch.setattr(sdata, "_cache_get", lambda key, ttl_days=None: stale)
     monkeypatch.setattr(sdata, "_fetch_index_full_frame",
                         lambda *a, **k: None)
@@ -507,7 +537,7 @@ def test_index_daily_full_rejects_stale_bar_when_cache_metadata_is_fresh(monkeyp
 
 def test_index_daily_rejects_stale_cache_after_incremental_fetch_failure(monkeypatch):
     """增量补数失败后，旧指数缓存不得继续交给基金轮动使用。"""
-    stale = _mk_df((datetime.now() - timedelta(days=5)).date())
+    stale = _mk_df(_stale_date())
     monkeypatch.setattr(sdata, "_cache_get", lambda key, ttl_days=None: stale)
     monkeypatch.setattr(sdata, "_fetch_index_frame",
                         lambda *a, **k: None)
@@ -521,7 +551,7 @@ def test_fetch_index_frame_skips_stale_source_and_uses_next_free_source(monkeypa
     """指数首个免费源返回旧根时，应继续尝试后续免费源。"""
     import akshare as ak
 
-    stale_day = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    stale_day = _stale_day_str()
     fresh_day = datetime.now().strftime("%Y-%m-%d")
     stale = pd.DataFrame({"日期": [stale_day], "收盘": [1.0]})
     fresh = pd.DataFrame({"date": [fresh_day], "close": [2.0]})
@@ -542,7 +572,7 @@ def test_fetch_index_full_frame_skips_stale_source_and_uses_next_free_source(mon
     """399006 全量链首源有旧数据时，也必须继续尝试后续免费源。"""
     import akshare as ak
 
-    stale_day = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    stale_day = _stale_day_str()
     fresh_day = datetime.now().strftime("%Y-%m-%d")
     stale = pd.DataFrame({"日期": [stale_day], "收盘": [1.0], "成交额": [10.0]})
     fresh = pd.DataFrame({"date": [fresh_day], "close": [2.0], "amount": [20.0]})
@@ -569,7 +599,7 @@ def test_fetch_index_full_frame_rejects_stale_final_fallback(monkeypatch):
     """所有免费源都过期时，末级新浪响应也不得继续下传。"""
     import akshare as ak
 
-    stale_day = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    stale_day = _stale_day_str()
     stale = pd.DataFrame({
         "date": [stale_day], "close": [1.0], "amount": [10.0],
     })

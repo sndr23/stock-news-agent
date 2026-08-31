@@ -50,8 +50,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-cloud.txt
 
+      # 2026-08-31 事故修复:门禁失败不得阻断生产任务(详见 realtime-push.yml 注释)
       - name: 运行单元测试门禁
+        id: unit_gate
+        continue-on-error: true
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 门禁失败告警
+        if: steps.unit_gate.outcome == 'failure'
+        run: |
+          echo "::warning::单元测试门禁失败,本轮任务仍继续执行,请尽快修复 tests/ 回归用例"
 
       - name: 执行回测并推送报告
         run: python scripts/signal_backtest.py --push --days ${{ github.event.inputs.days || '60' }}

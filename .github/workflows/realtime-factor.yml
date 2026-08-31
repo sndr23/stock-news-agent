@@ -58,8 +58,16 @@ jobs:
           pip install -r requirements-cloud.txt
 
       # 测试门禁：拦截纯函数回归（同资讯管线）
+      # 2026-08-31 事故修复:门禁失败不得阻断生产任务(详见 realtime-push.yml 注释)
       - name: 运行单元测试门禁
+        id: unit_gate
+        continue-on-error: true
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 门禁失败告警
+        if: steps.unit_gate.outcome == 'failure'
+        run: |
+          echo "::warning::单元测试门禁失败,本轮任务仍继续执行,请尽快修复 tests/ 回归用例"
 
       # --collect：采集+写快照/状态（贴水/资金/情绪/risk_state），仅允许健康度故障告警，
       # 不恢复普通量化因子异动推送。

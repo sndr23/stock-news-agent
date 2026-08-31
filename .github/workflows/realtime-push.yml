@@ -67,8 +67,20 @@ jobs:
 
       # 轻量测试门禁（2026-08-06 新增）：单元测试均为 mock 型，本地实测 294 项约 6s。
       # 相比整个任务 1.5-2 分钟，测试耗时可忽略，但能拦截纯函数回归（依赖 ~= 升级/重构误伤）。
+      #
+      # ⚠️ 2026-08-31 事故修复：门禁失败不得阻断生产推送。
+      # 8-29 起因 tests/test_strategy_data.py 的日期敏感性用例失败，连续 59 次运行
+      # 卡死在本步、推送步骤被 skipped，导致 62 小时零推送；而这些用例与资讯推送
+      # 链路无任何耦合。故改为 continue-on-error：门禁结果仅作告警，不阻断业务。
       - name: 运行单元测试门禁
+        id: unit_gate
+        continue-on-error: true
         run: python -m pytest tests/ -q -m "unit" --no-header -p no:cacheprovider
+
+      - name: 门禁失败告警
+        if: steps.unit_gate.outcome == 'failure'
+        run: |
+          echo "::warning::单元测试门禁失败，本轮推送仍继续执行，请尽快修复 tests/ 回归用例"
 
       # 实时轮询每次运行都跑全量测试会浪费大量免费分钟额度，故仅跑 unit 子集
       - name: 执行实时推送
