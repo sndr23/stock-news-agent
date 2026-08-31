@@ -2149,10 +2149,11 @@ def _gist_load_factor(token: str, gist_id: str) -> dict:
 
 
 def _gist_save_factor(token: str, gist_id: str, state: dict) -> None:
-    """写回 Gist factor_state.json（ETag 乐观锁，防并发写-写覆盖）。
+    """写回 Gist factor_state.json（单文件提交）。
 
-    2026-08-29 P0-2：改用 state_io.patch_gist_file——先 GET 取 ETag，
-    PATCH 带 If-Match；冲突（412）则放弃写入并报错，不覆盖其他写端的更新。
+    2026-08-31 修复：If-Match 乐观锁被 GitHub 拒绝（Gists API 不支持条件
+    请求，400），并发安全由 concurrency 串行 + 单文件提交保证；详见
+    state_io.patch_gist_file。禁止给 Gist PATCH 加 If-Match。
     """
     patch_gist_file(
         FACTOR_STATE_FILENAME,

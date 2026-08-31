@@ -112,9 +112,9 @@ def save_state(state: dict) -> bool:
         return False
     if not (token and gist_id):
         return True  # 本地已写，无 Gist 配置（本地模式）
-    # 2026-08-29 P0-2：ETag 乐观锁写入（先 GET 取 ETag，PATCH 带 If-Match）；
-    # 冲突 412 → 放弃写入，不覆盖其他写端更新。择时为 14:45 单写端，
-    # 但影子 history 是长期累积资产，仍需防并发覆盖。
+    # 2026-08-31 修复：If-Match 乐观锁被 GitHub 拒绝（Gists API 不支持
+    # 条件请求，400），曾致云端零写入。并发安全由 concurrency 串行 +
+    # 单文件提交保证；影子 history 的防覆盖依赖同 group 串行。
     try:
         patch_gist_file(
             TIMING_STATE_FILENAME,

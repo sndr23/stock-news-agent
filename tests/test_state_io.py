@@ -60,7 +60,7 @@ def test_partial_gist_config_does_not_fallback_to_local_state(
         rct.load_state()
 
 
-# ---------------- Gist ETag 乐观锁（P0-2，2026-08-29） ----------------
+# ---------------- Gist 写入（2026-08-31 修复：禁止 If-Match 条件请求） ----------------
 
 class _FakeResp:
     def __init__(self, status=200, headers=None, payload=None):
@@ -70,58 +70,52 @@ class _FakeResp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            import requests as _requests
+            raise _requests.exceptions.HTTPError(f"HTTP {self.status_code}")
 
     def json(self):
         return self._payload
 
 
 class _FakeRequests:
-    """记录 GET/PATCH 调用，可模拟 412 版本冲突。"""
+    """记录 PATCH 调用，可模拟持续 HTTP 错误。"""
 
     def __init__(self, patch_status=200):
         self.calls = []
         self.patch_status = patch_status
 
-    def get(self, url, headers=None, timeout=None):
-        self.calls.append(("GET", headers))
-        return _FakeResp(200, headers={"ETag": 'W/"v1"'}, payload={"updated_at": "x"})
-
     def patch(self, url, json=None, headers=None, timeout=None):
         self.calls.append(("PATCH", headers, json))
-        if self.patch_status == 412:
-            return _FakeResp(412, headers={})
-        return _FakeResp(200, headers={})
+        return _FakeResp(self.patch_status, headers={})
 
 
-def test_patch_gist_file_sends_if_match_header(monkeypatch):
-    """写入必须带 If-Match（ETag），否则并发写会互相覆盖。"""
+def test_patch_gist_file_sends_no_conditional_headers(monkeypatch):
+    """PATCH 不得携带 If-Match：Gists API 不支持条件请求，2026-08-29 起带该头
+    一律 400，曾导致云端三条链路全停 62+ 小时（回归护栏）。"""
     fake = _FakeRequests()
-    monkeypatch.setattr("requests.get", fake.get)
     monkeypatch.setattr("requests.patch", fake.patch)
 
     state_io.patch_gist_file("real_time_state.json", '{"seen": 1}',
                              "tok", "gid", max_attempts=2)
 
     methods = [c[0] for c in fake.calls]
-    assert methods == ["GET", "PATCH"]
-    patch_headers = fake.calls[1][1]
-    assert patch_headers.get("If-Match") == 'W/"v1"', "PATCH 必须带 ETag 版本校验"
+    assert methods == ["PATCH"]
+    patch_headers = fake.calls[0][1]
+    assert "If-Match" not in patch_headers, "Gist PATCH 禁止 If-Match（400）"
+    assert "If-None-Match" not in patch_headers
     # 只提交目标文件，不整包回写（避免波及其他状态文件）
-    assert list(fake.calls[1][2]["files"]) == ["real_time_state.json"]
+    assert list(fake.calls[0][2]["files"]) == ["real_time_state.json"]
 
 
-def test_patch_gist_file_aborts_on_version_conflict(monkeypatch):
-    """412 版本冲突必须放弃写入并报错，绝不覆盖其他写端的更新。"""
-    fake = _FakeRequests(patch_status=412)
-    monkeypatch.setattr("requests.get", fake.get)
+def test_patch_gist_file_gives_up_after_retries(monkeypatch):
+    """持续 HTTP 错误必须重试后放弃并报错，不得静默吞掉。"""
+    fake = _FakeRequests(patch_status=500)
     monkeypatch.setattr("requests.patch", fake.patch)
 
-    with pytest.raises(RuntimeError, match="版本冲突"):
+    with pytest.raises(RuntimeError, match="写入失败"):
         state_io.patch_gist_file("factor_state.json", '{"x": 1}',
                                  "tok", "gid", max_attempts=2)
-    # 重试耗尽后必须放弃，不得继续提交覆盖写
-    assert sum(1 for c in fake.calls if c[0] == "PATCH") == 2
+    assert len(fake.calls) == 2
 
 
 def test_patch_gist_file_rejects_missing_config(monkeypatch):
