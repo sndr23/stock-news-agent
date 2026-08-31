@@ -1230,12 +1230,12 @@ def _gist_load(token: str, gist_id: str) -> dict:
 
 
 def _gist_save(token: str, gist_id: str, state: dict) -> None:
-    """将状态写回 Gist（ETag 乐观锁，防并发写-写覆盖）。
+    """将状态写回 Gist（单文件提交，防并发覆盖）。
 
-    2026-08-29 P0-2：改用 state_io.patch_gist_file——先 GET 取 ETag，
-    PATCH 时带 If-Match；若期间被其他写端更新过（412）则放弃写入并报错，
-    宁可本轮状态未落盘，也不覆盖他人更新（2026-08-13 曾因此冲掉 4759 条去重记录）。
-    只提交 real_time_state.json 单文件，不整包回写，避免波及其他状态文件。
+    2026-08-31 修复：Gists API 不支持条件请求，ccbe890（8-29 P0-2）加入的
+    If-Match 头自上线起即被 GitHub 一律拒绝（400），曾致云端零写入 62+ 小时。
+    并发安全依赖 workflow concurrency 串行 + 单文件提交；patch_gist_file
+    内部自带重试。禁止给 Gist PATCH 加 If-Match/If-None-Match。
     """
     patch_gist_file(
         GIST_STATE_FILENAME,
