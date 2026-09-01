@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 
 import pandas as pd
@@ -1013,6 +1014,44 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
 
 # ---------------- 主流程 ----------------
 
+def _append_intraday_bar_if_needed(df, symbol: str):
+    """盘中拿不到当日日线 bar 时，用腾讯实时构造当日 partial bar 拼到末尾。
+
+    背景（2026-09-01 排查）：GitHub Actions 海外出口盘中拉新浪全量拿不到当日
+    实时 bar（末根最多到昨日收盘）——v5.1"信号日 d 用 d 日 14:45 快照"口径
+    （ND-004 拍板）在云端从未生效，实盘一直跑 d-1 收盘口径。本守卫把实盘
+    信息集对齐回已拍板口径：仅交易日 09:30~15:00 且 df 末根早于今天时拼接；
+    腾讯失败则保持 d-1 口径原样返回（宁可滞后不要假数据）。
+    """
+    from src.strategy.data import fetch_intraday_bar_tencent
+
+    now = datetime.now(BJT)
+    if now.weekday() >= 5 or not _is_trading_day():
+        return df
+    if not (dt_time(9, 30) <= now.time() <= dt_time(15, 0)):
+        return df
+    if df.index.empty or pd.Timestamp(df.index.max()).normalize() >= pd.Timestamp(now.date()):
+        return df  # 已含当日 bar（本地国内出口新浪盘中本就含），无需拼接
+    bar = fetch_intraday_bar_tencent(symbol)
+    if not bar:
+        logger.warning("当日盘中 bar 拼接失败，保持 d-1 收盘口径（新浪海外出口拿不到当日实时 bar）")
+        return df
+    today_ts = pd.Timestamp(now.date())
+    row = {"close": bar["close"], "amount": bar["amount"]}
+    if "high" in bar:
+        row["high"] = bar["high"]
+    if "low" in bar:
+        row["low"] = bar["low"]
+    for col in df.columns:
+        row.setdefault(col, float("nan"))
+    appended = pd.DataFrame(row, index=[today_ts])[df.columns.tolist()]
+    out = pd.concat([df, appended])
+    out.index = pd.to_datetime(out.index)
+    logger.info("已拼接当日盘中快照 bar（%s close=%.2f amount=%.0f）——实盘信息集对齐 d 日快照口径",
+                today_ts.date(), bar["close"], bar["amount"])
+    return out
+
+
 def main():
     _configure_stdout()
     _load_local_env()
@@ -1044,6 +1083,7 @@ def main():
             f"{MIN_SIGNAL_HISTORY} 根完整日线），"
             "退出（不推送伪中性信号）"
         )
+    df = _append_intraday_bar_if_needed(df, SYMBOL)
     logger.info("399006 日线 %d 根（%s ~ %s）", len(df),
                 df.index[0].date(), df.index[-1].date())
 

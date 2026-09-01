@@ -162,6 +162,70 @@ class TestIsSameEvent:
         assert m["title_norm"] == "更长的标题"
 
 
+class TestCrossFamilyFallback:
+    """事件组抽取不稳定跨族兜底（2026-09-01 修复：美债 4.75% 28 分钟双推实证）
+
+    根因：一方事件组非空另一方为空（或双方各抽各的）时 _is_same_event 直接
+    return False，连 Jaccard 0.64 的规则4 都没机会执行。兜底：方向/金额守卫
+    + 高相似阈值（Jaccard≥0.55 或 LCS≥8 且覆盖短标题≥50%）。
+    """
+
+    def _sig(self, title, entities=None, events=None):
+        judge = {"entities": entities or []}
+        sig = rtp._push_event_sig({"title": title, "content": ""}, judge)
+        if events is not None:
+            sig["events"] = list(events)
+        return sig
+
+    def test_us_10y_yield_double_push_merged(self):
+        """8-31 实证双推对：21:34 升至4.75% vs 22:02 突破4.75% → 同事件"""
+        a = self._sig("美国10年期国债收益率升至4.75%，为2025年1月以来最高水平",
+                      entities=["美联储"])
+        b = self._sig("美国10年期国债收益率突破4.75%，创2025年1月以来新高",
+                      entities=["美债"])
+        assert rtp._is_same_event(a, b)
+
+    def test_one_side_event_group_still_merged(self):
+        """根因场景：一方被 LLM 抽到事件组、另一方为空 → 仍走兜底合并"""
+        a = self._sig("美国10年期国债收益率升至4.75%，为2025年1月以来最高水平",
+                      entities=["美联储"], events=["利率变动"])
+        b = self._sig("美国10年期国债收益率突破4.75%，创2025年1月以来新高",
+                      entities=["美债"])
+        assert rtp._is_same_event(a, b)
+
+    def test_direction_conflict_not_merged(self):
+        """方向守卫：收益率升至4.75 vs 跌破4.30 → 不同事件"""
+        a = self._sig("美国10年期国债收益率升至4.75%，为2025年1月以来最高水平",
+                      entities=["美债"])
+        b = self._sig("美国10年期国债收益率跌破4.30%，创2025年3月以来新低",
+                      entities=["美债"])
+        assert not rtp._is_same_event(a, b)
+
+    def test_amount_conflict_not_merged(self):
+        """金额守卫（合成签名直构 cross_family 场景）：40-80亿回购 vs 5亿回购"""
+        a = {"title_norm": "中际旭创拟40亿元至80亿元回购公司股份",
+             "entities": ["中际旭创"], "stocks": [], "events": ["回购"],
+             "numbers": ["亿:40", "亿:80"], "sectors": []}
+        b = {"title_norm": "中际旭创拟5亿元回购公司股份用于股权激励",
+             "entities": ["中际旭创"], "stocks": [], "events": [],
+             "numbers": ["亿:5"], "sectors": []}
+        assert not rtp._is_same_event(a, b)
+
+    def test_low_similarity_not_merged(self):
+        """低相似度不误并：单边事件组 + 标题零共享 → 保持独立"""
+        a = self._sig("寒武纪发布新一代云端训练芯片",
+                      entities=["寒武纪"], events=["发布"])
+        b = self._sig("央行开展3000亿元买断式逆回购操作")
+        assert not rtp._is_same_event(a, b)
+
+    def test_iran_two_statements_independent(self):
+        """回归：伊朗总统 vs 军方不同表态（标题相似度低）保持独立推送"""
+        a = self._sig("伊朗总统：不寻求战争但也绝不任由敌人侵略",
+                      entities=["伊朗", "美国"])
+        b = self._sig("伊朗军方：伊方决心将美国人逐出西亚地区", entities=["伊朗"])
+        assert not rtp._is_same_event(a, b)
+
+
 class TestSameEventMarketSession:
     """市场开收盘/复盘类多源快讯同事件合并（2026-08-03 21:32 美股开盘三源三推实证修复）
 
@@ -2116,3 +2180,44 @@ class TestMarketThemeEntityScan20260825:
         sig = self._sig("美国8月CPI同比3.2%高于预期", ["美国劳工统计局"])
         pushed = [self._pe("美国7月CPI同比3.4%符合预期", ["美国"], self._ts(5))] * 5
         assert rtp._topic_saturated(sig, pushed) is False
+
+
+class TestPruneSeen:
+    """seen 裁剪（2026-09-01）：条数/字节双上限，优先淘汰未推条目。
+
+    9-01 实锤：SEEN_MAX=3000 被单日 2972 条未推记录击穿，00:32 已推的
+    「君正股份 DRAM 涨价」被挤出 seen → 盘后复盘漏条。裁剪必须保 pushed=True。
+    """
+
+    @staticmethod
+    def _mk(seen: dict, n: int, pushed: bool, base_t: str, prefix: str = "f") -> dict:
+        for i in range(n):
+            fp = f"{prefix}{i:04d}"
+            seen[fp] = {"t": f"{base_t} {10 + i:02d}:00:00", "pushed": pushed,
+                        "title": f"{prefix}-事件-{i}" * 3}
+        return seen
+
+    def test_prune_keeps_pushed_first(self):
+        seen = {}
+        self._mk(seen, 4, False, "2026-09-01", "un")   # 4 条未推（旧）
+        self._mk(seen, 2, True, "2026-09-01", "pd")    # 2 条已推
+        out = rtp._prune_seen(seen, max_items=3, max_bytes=10 ** 9)
+        assert len(out) == 3
+        pushed_out = [r for r in out.values() if r.get("pushed")]
+        assert len(pushed_out) == 2  # 已推全部保留
+
+    def test_byte_cap_prevents_gist_blowup(self):
+        """字节上限优先于条数：长标题（中文 UTF-8 3B/字）触发裁剪。"""
+        seen = {}
+        self._mk(seen, 6, False, "2026-09-01", "x")
+        # 每条约 20 字中文标题 * 3B + fp/t 等 ≈ 150B+，6 条 > 500B 上限
+        out = rtp._prune_seen(seen, max_items=100, max_bytes=500)
+        assert 0 < len(out) < 6
+
+    def test_under_limit_untouched(self):
+        seen = {"a1": {"t": "2026-09-01 10:00:00", "pushed": True, "title": "t"}}
+        out = rtp._prune_seen(seen, max_items=100, max_bytes=10 ** 6)
+        assert out == seen
+
+    def test_empty_ok(self):
+        assert rtp._prune_seen({}) == {}

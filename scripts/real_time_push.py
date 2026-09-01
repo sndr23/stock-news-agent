@@ -151,14 +151,68 @@ LLM_BATCH_SIZE = 8
 # 状态窗口：指纹保留时长（小时），滚动清理
 STATE_WINDOW_HOURS = 48
 
+# 未推条目的独立窗口（小时，2026-09-01 新增）：见 _expire_seen_fingerprints 说明。
+# 已推条目仍需完整 48h（复盘列表 + 48h 同事件拦截依赖）。
+STATE_WINDOW_HOURS_UNPUSHED = 24
+
 # 候选溢出挂起重试上限（2026-08-06 新增）：同一指纹连续 N 轮溢出后放弃（写 seen），
 # 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
 MAX_PENDING_RETRY = 3
 
 # seen 指纹条数上限（2026-08-13 P0 新增）：48h 清理后仍超上限则按时间保留最新。
 # 此前 seen 无上限（峰值 4759 条 → 状态文件 0.72MB），Gist 写入截断损坏是
-# "状态被覆盖清空"事故的诱因；3000 条 ≈ 0.45MB，留足 Gist 1MB 余量。
-SEEN_MAX = 3000
+# "状态被覆盖清空"事故的诱因。
+# 2026-09-01 上调 3000 → 12000：实测单日未推条目（pushed=False）达 2972 条，
+# 3000 上限一天就被击穿，seen 时间窗口缩到不足 1 天（09-01 04:03~22:33），
+# 凌晨已推事件被挤出 seen → 盘后复盘漏条 + 次日重复推送风险。
+# 体积按 _prune_seen 的字节上限兜底：Gist 单文件 1MB 硬限（8-13 状态文件
+# 膨胀到 0.72MB 时即发生过写入截断损坏），700KB 留足余量。条数上限只是
+# 第一道闸，真正决定能不能安全落盘的是字节上限。
+SEEN_MAX = 12000
+SEEN_MAX_BYTES = 700_000
+
+def _est_seen_bytes(seen: dict, sample: int = 200) -> int:
+    """估算 seen 序列化后的字节数（抽样平均 × 条数，避免整表 json.dumps）。
+
+    2026-09-01 修正：按 UTF-8 编码字节估算。中文每字符 3 字节，原先按
+    len(str) 字符数估算低估约 2~3 倍——700KB 目标下实际可能冲到 1MB+
+    （Gist 单文件 1MB 是写入截断损坏的硬限）。+60 覆盖 JSON 键名/引号/
+    花括号等每条目开销。
+    """
+    if not seen:
+        return 0
+    items = list(seen.items())[:sample]
+    per = sum(len(fp.encode("utf-8", "replace"))
+              + len(str(rec.get("t", "") or "").encode("utf-8", "replace"))
+              + len(str(rec.get("title", "") or "").encode("utf-8", "replace"))
+              + 60
+              for fp, rec in items) / len(items)
+    return int(per * len(seen))
+
+
+def _prune_seen(seen: dict, max_items: int = SEEN_MAX,
+                max_bytes: int = SEEN_MAX_BYTES) -> dict:
+    """指纹表裁剪：条数与字节双上限，超限时优先淘汰未推条目。
+
+    2026-09-01：pushed=True 的条目是盘后复盘列表与 48h 同事件拦截的依据，
+    pushed=False 只是"本轮已处理、别再判"的标记，去重价值低。单纯按时间
+    裁剪会把当天已推事件挤出去——9-01 实锤：00:32 推送的「君正股份 DRAM
+    涨价」被挤出 seen，复盘"今日已推事件"直接漏掉这一条。
+    排序键 (pushed, t) 使 False 组整体排在前面，组内按时间升序，
+    于是切片淘汰的是"最老的未推条目"。
+    字节上限优先于条数上限：Gist 单文件 1MB 是硬限，超限会写入截断损坏
+    （8-13 事故根因），条数再多也必须让位于体积安全。
+    """
+    if not seen:
+        return seen
+    per = max(_est_seen_bytes(seen) / len(seen), 1.0)
+    allowed = min(max_items, max(1, int(max_bytes / per)))
+    if len(seen) <= allowed:
+        return seen
+    items = sorted(seen.items(),
+                   key=lambda kv: (bool(kv[1].get("pushed")), str(kv[1].get("t", ""))))
+    return dict(items[len(items) - allowed:])
+
 
 # 心跳告警（2026-08-06 新增）：有新增资讯但连续 N 轮 0 推送时输出告警日志，
 # 帮助区分"确实没大事" vs "系统静默故障"
@@ -963,12 +1017,47 @@ def _same_event_shared_group(ctx: _SameEventCtx) -> bool:
     return _lcs_len(ctx.ta, ctx.tb) >= 5
 
 
+def _same_event_cross_family(ctx: _SameEventCtx) -> bool:
+    """事件组抽取不稳定兜底（2026-09-01 修复：美债收益率 4.75% 双推实证）
+
+    21:34"美债10Y收益率升至4.75%为2025年1月以来最高"(entities=美联储)
+    vs 22:02"美债10Y收益率突破4.75%创2025年1月以来新高"(entities=美债)
+    28 分钟内双推。根因：LLM 对行情类快讯的事件组抽取不稳定——一方抽到
+    事件组、另一方为空（或双方各抽各的），shared_ev=∅ 且不满足
+    "双方均无事件组"，_is_same_event 直接 return False，连标题
+    Jaccard 0.64 的规则4 都没机会执行。
+
+    兜底判据（严守误并风险）：
+    - 方向对立终止（"升至" vs "跌破"，沿用 _title_direction_conflict）
+    - 金额守卫：双方金额均明确且无交集 → 不同事件
+    - 标题高度相似才合并：字符集 Jaccard≥0.55，或连续 LCS≥8 且覆盖
+      短标题 ≥50%（美债案例 Jaccard 0.643、LCS"美国10年期国债收益率"=10 字）
+    """
+    ta, tb = ctx.ta, ctx.tb
+    if not (ta and tb):
+        return False
+    if _title_direction_conflict(ta, tb):
+        return False
+    if (ctx.num_a and ctx.num_b) and not (ctx.num_a & ctx.num_b):
+        return False
+    if len(set(ta) & set(tb)) / len(set(ta) | set(tb)) >= 0.55:
+        return True
+    shorter = min(len(ta), len(tb))
+    if shorter >= 8:
+        l = _lcs_len(ta, tb)
+        if l >= 8 and l / shorter >= 0.5:
+            return True
+    return False
+
+
 def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     """判断两个推送级事件签名是否指向同一事件（满足其一即同事件）
 
     结构（SNA-04 重构，行为与重构前完全等价，57 处去重专项测试锁定）：
     - 共享事件组族 _same_event_shared_group：规则1-3
     - 无事件组族 _same_event_no_group：规则4-8（市场域/实体锚定/标题相似度）
+    - 跨族兜底 _same_event_cross_family（2026-09-01）：事件组单边缺失/双方
+      各抽各的时的标题相似度兜底（美债 4.75% 双推实证）
 
     规则目录：
     1. 主体(个股/LLM实体)交集非空 且 事件组交集非空 → 同主体同事件
@@ -997,7 +1086,10 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
         return _same_event_shared_group(ctx)
     if not ctx.ev_a and not ctx.ev_b:
         return _same_event_no_group(ctx)
-    return False
+    # 2026-09-01：事件组单边缺失/双方各抽各的（LLM 对行情类快讯抽取不稳定）
+    # 不再直接 return False——美债 4.75% 双推实证，改走跨族相似度兜底
+    # （方向/金额守卫 + 高相似阈值，见 _same_event_cross_family）
+    return _same_event_cross_family(ctx)
 
 
 def _same_event_no_group(ctx: _SameEventCtx) -> bool:
@@ -1380,10 +1472,14 @@ def save_state(state: dict) -> None:
     if expired:
         logger.info(f"清理过期指纹 {len(expired)} 条，剩余 {len(seen)} 条")
     # 2026-08-13 P0：seen 无上限导致状态文件膨胀至 0.72MB（Gist 写入截断损坏诱因）。
-    # 48h 清理后仍超上限时，按时间保留最新 SEEN_MAX 条，控制文件体积。
-    if len(seen) > SEEN_MAX:
-        seen = dict(sorted(seen.items(), key=lambda kv: kv[1].get("t", ""))[-SEEN_MAX:])
-        logger.warning(f"seen 超过上限 {SEEN_MAX} 条，按时间保留最新（状态文件体积控制）")
+    # 48h 清理后仍超上限时按上限裁剪，优先淘汰未推条目（见 _prune_seen）。
+    # 2026-09-01 修正触发条件：条数上限不是唯一闸门——纯条数未超但字节已超
+    # 700KB 时同样裁剪（中文 UTF-8 下 12000 条可能超 1MB Gist 硬限）。
+    if len(seen) > SEEN_MAX or _est_seen_bytes(seen) > SEEN_MAX_BYTES:
+        before_n = len(seen)
+        seen = _prune_seen(seen, SEEN_MAX)
+        logger.warning(f"seen 超过上限（{before_n} 条 → {len(seen)} 条），"
+                       "优先淘汰未推条目后按时间保留最新（条数/字节双上限）")
     state["seen"] = seen
 
     # 滚动清理过期挂起重试（48h 窗口）+ 上限 200 条防爆胀
@@ -1578,8 +1674,18 @@ _LLM_SYSTEM_PROMPT = """你是A股资讯重要性审核员。判断每条资讯�
 明确不推（无论业绩多好、涨跌多剧烈）：
 - 纯个人观点/猜测类言论：政客或机构单方面"怀疑""认为""预计"等表态，没有真实事件或官方立场
   变化、没有实际市场反应佐证，则不视为重大事件——即便话题涉及地缘、石油或美股
+- ⚠️地缘/军事"事实层"豁免（2026-08-31 实证漏推：特朗普称将对伊朗袭击美军事件作出回应，
+  4 条源全被拒，次日美伊交火、布油站上 90 美元才补推）：已发生的军事行动及其官方确认——
+  袭击/交火/空袭/导弹打击/拦截/伤亡确认/一方宣布将采取军事报复——不是"观点表态"，
+  属第 2 条"重大地缘政治事件"必推（同一冲突事件的多源/多角度快讯按同一事件口径合并判定）。
+  只有未伴随新事实的口头警告、预期管理、立场重申才适用上方"表态不推"条款
 - 只影响中小市值个股自身股价的消息：业绩预告/业绩变动、小额回购、增持/减持、中标/签约、
   日常经营、子公司事项、分红送转等——除非该股是行业龙头或直接改变板块逻辑
+- ⚠️龙头大额资本运作必推（2026-08-31 实证漏推：中际旭创拟 40-80 亿元回购 21:34 被拒、
+  次日 06:02 换措辞才推，延迟 9 小时）：核心科技龙头（寒武纪、中际旭创、宁德时代、
+  英伟达产业链第一梯队等）的回购/增持计划金额 ≥10 亿元，属第 4 条"科技龙头重大消息"
+  必推——判定看行业第一梯队属性（如"光模块巨头"），不要因消息是回购/增持类就按
+  "中小市值消息"条款降级
 - 外围央行（非中国）的日常表态/会议纪要/储备数据（印度央行、匈牙利央行、澳洲联储等的例行表态），
   除非涉及重大政策转向或直接影响 A 股；注意：①此条不含宏观数据发布本身——
   外围重要数据（美国 CPI/PPI/非农/利率决议等）因直接影响全球市场与 A 股，仍按优先级 1 推送；
@@ -2830,8 +2936,11 @@ def run_once(dry_run: bool = False) -> dict:
                 pass
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-            # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比
-            pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now})
+            # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
+            # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
+            # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
+            pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
+                                  "title": str(n.get("title", ""))[:60]})
             pushed += 1
         else:
             # 推送标题直接用新闻原文标题（避免显示"重要资讯"占位符）
@@ -2840,7 +2949,8 @@ def run_once(dry_run: bool = False) -> dict:
             if result.get("code") == 200 or result.get("errcode") == 0:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
-                pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now})
+                pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
+                                      "title": str(n.get("title", ""))[:60]})
                 pushed += 1
             else:
                 # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
@@ -2922,6 +3032,74 @@ def _parse_pub_time(text: str):
     return None
 
 
+# 板块标签归一规则：有序，越具体越靠前，一个标签只归入一个规范类（防重复计数）。
+# 2026-09-01 审核实证：LLM 抽的 sectors 是自由文本，'半导体'/'半导体设备'/
+# '半导体/HBM'/'半导体/晶圆代工' 各计 1 票 → Top3 退化为并列 2 票的噪声。
+_SECTOR_CANON_RULES = (
+    ("存储芯片", ("存储芯片", "半导体/存储芯片", "hbm", "dram", "nand", "闪存", "存储器")),
+    ("光模块", ("光模块", "cpo", "光通信")),
+    ("AI算力", ("ai算力", "ai/算力", "ai芯片", "ai硬件", "算力", "云计算",
+                "服务器", "数据中心", "idc")),
+    ("半导体", ("半导体", "晶圆", "国产替代", "芯片", "封测", "光刻", "设备")),
+    ("能源", ("能源", "原油", "石油", "油气", "石化", "煤炭", "天然气")),
+    ("宏观", ("宏观", "利率", "汇率", "美联储", "央行", "cpi", "pmi")),
+    ("电子元件", ("mlcc", "电子元件", "被动元件", "电容")),
+    ("港股", ("中概股", "港股")),
+    ("化工", ("化工", "化学")),
+    ("制造业", ("制造业", "工业")),
+)
+
+
+def _canonical_sector(raw) -> str:
+    """把 LLM 自由板块标签归一到规范名；空/无效标签返回 ''。"""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    for canon, keys in _SECTOR_CANON_RULES:
+        if any(k in low for k in keys):
+            return canon
+    return s
+
+
+def _direction_asof(factor_state: dict) -> str:
+    """量化方向结论的归属日期（YYYY-MM-DD）；无 direction_history 时返回 ''。
+
+    2026-09-01：direction_history 以日期为键，最新键即最近一次打分的交易日。
+    last_direction 只是值，本身不带时间，必须回查 history 才能判断时效。
+    """
+    hist = factor_state.get("direction_history") or {}
+    if not isinstance(hist, dict) or not hist:
+        return ""
+    keys = [str(k) for k in hist.keys() if str(k).strip()]
+    return max(keys) if keys else ""
+
+
+def _stale_trading_days(asof: str, today: str, cap: int = 15) -> int:
+    """asof 之后（不含当日）到 today 之间新增的交易日数。
+
+    返回 -1 表示日期无法解析/asof 缺失。交易日口径复用 _is_trading_day
+    （中国工作日，chinese_calendar 缺失时退化为周一至周五）。
+    """
+    try:
+        d0 = datetime.strptime(str(asof)[:10], "%Y-%m-%d").date()
+        d1 = datetime.strptime(str(today)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return -1
+    if d1 <= d0:
+        return 0
+    n = 0
+    cur = d0 + timedelta(days=1)
+    while cur <= d1 and n < cap:
+        try:
+            if _is_trading_day(cur):
+                n += 1
+        except Exception:
+            pass
+        cur += timedelta(days=1)
+    return n
+
+
 def _snapshot_block(factor_state: dict, title: str) -> list:
     """把 factor_collector 的紧凑快照格式化为 markdown 块（盘前/盘后共用）"""
     snap = factor_state.get("snapshot") or {}
@@ -2995,11 +3173,34 @@ def _snapshot_block(factor_state: dict, title: str) -> list:
         lines.append(f"- 涨停情绪: {flag}{mood}｜涨停{sentiment.get('zt', 0)}"
                      f"（连板高度{sentiment.get('max_lbc', 0)}）"
                      f"｜炸板率{sentiment.get('zbr', 0):.0f}%")
+    # 2026-09-01：资金维度全部显式标注来源成败。审核实证：全市场净流出 309 亿
+    # 未进复盘，而行业资金流源已连失败 41 轮仍在展示残缺数据 → 信息严重偏斜。
+    # 原则：有数据就展示，无数据必须写"数据缺失"，绝不整行静默消失或补零。
+    failed_srcs = [str(x) for x in ((snap.get("sources") or {}).get("failed") or [])]
+    mflow = snap.get("flows") or {}
+    mn = mflow.get("main_net_yi")
+    mgy = mflow.get("margin_yi")
+    mf_parts = []
+    if isinstance(mn, (int, float)):
+        m_arrow = "▲" if mn >= 0 else "▼"
+        mf_parts.append(f"{m_arrow} 主力净{'流入' if mn >= 0 else '流出'} {abs(mn):.0f} 亿")
+    elif "资金流" in failed_srcs:
+        mf_parts.append("主力净流入 数据缺失")
+    if isinstance(mgy, (int, float)):
+        mf_parts.append(f"两融 {mgy:.0f} 亿（{mflow.get('margin_chg_yi', 0):+.0f}）")
+    if mf_parts:
+        lines.append("- 资金流向: " + "｜".join(mf_parts))
     sf = snap.get("sector_flows") or {}
     in_s = "、".join(f"{n} {v:+.1f}亿" for n, v in (sf.get("inflow") or [])[:3])
     out_s = "、".join(f"{n} {v:+.1f}亿" for n, v in (sf.get("outflow") or [])[:3])
     if in_s or out_s:
-        lines.append(f"- 行业资金: 流入 {in_s or '—'} ｜ 流出 {out_s or '—'}")
+        # 流出空不再显示裸"—"（8-31 审核实证"流出 —"无法区分真无流出 vs
+        # 数据缺半边）。fetch_sector_flows 有行数守卫，能产出 inflow 非空 +
+        # outflow 空的组合即"全部返回行业主力净流入≥0"这一合法市场事实。
+        out_show = out_s or ("无净流出行业" if in_s else "—")
+        lines.append(f"- 行业资金: 流入 {in_s or '—'} ｜ 流出 {out_show}")
+    elif "行业资金流" in failed_srcs:
+        lines.append("- 行业资金: 数据缺失（源失败已整弃，≠无资金异动）")
     # P7（2026-08-19）：资金面利率 + 期权情绪（影子因子，简报常规展示）
     liq = snap.get("liquidity") or {}
     gc = liq.get("gc007") or {}
@@ -3029,7 +3230,10 @@ def _snapshot_block(factor_state: dict, title: str) -> list:
     if src.get("total"):
         ratio = src.get("ok", 0) / src["total"]
         flag = "⚠️" if ratio < 0.7 else ""
-        lines.append(f"- 数据健康度: {flag}{src.get('ok', 0)}/{src['total']} 源正常")
+        # 2026-09-01：附异常源名单（8-31 审核实证：12/14 但不知哪 2 个源失败）
+        failed = src.get("failed") or []
+        tag = f"（异常：{'、'.join(str(x) for x in failed)}）" if failed else ""
+        lines.append(f"- 数据健康度: {flag}{src.get('ok', 0)}/{src['total']} 源正常{tag}")
     last_dir = str(factor_state.get("last_direction", "") or "")
     if last_dir:
         # P4-6：IC 加权已启用时标注（含样本数），人工决策时知悉合成口径
@@ -3038,7 +3242,20 @@ def _snapshot_block(factor_state: dict, title: str) -> list:
         if ic.get("weights"):
             n = ic.get("n")
             ic_tag = f"（IC加权，n={n}）" if isinstance(n, int) else "（IC加权）"
-        lines.append(f"- 量化综合方向: {last_dir}{ic_tag}")
+        # 2026-09-01 方向停更保护（审核实证：9-01 盘后展示的"偏多"实为 8-28
+        # 打分，与当日"创业板指 空头排列"反向，却无任何时效标注 → 误导决策）。
+        # 方向结论必须自带日期；停更 ≥1 个交易日即降级，禁止冒充当日结论。
+        today_str = datetime.now(BJT).strftime("%Y-%m-%d")
+        asof = _direction_asof(factor_state)
+        stale = _stale_trading_days(asof, today_str) if asof else -1
+        if stale < 0:
+            lines.append(f"- 量化综合方向: ⚠️ {last_dir}（打分日期未知："
+                         "factor_collector 未记录 direction_history，勿作当日结论）")
+        elif stale >= 1:
+            lines.append(f"- 量化综合方向: ⚠️ 待更新（末次 {asof}「{last_dir}」，"
+                         f"已停更 {stale} 个交易日，非当日结论）")
+        else:
+            lines.append(f"- 量化综合方向: {last_dir}{ic_tag}")
     return lines
 
 
@@ -3162,41 +3379,44 @@ def run_evening_review(dry_run: bool = False) -> dict:
 
     lines = [f"## 📊 盘后复盘 {today}", ""]
 
-    # 1. 当日已推事件（seen: pushed=True 且时间为今日；标题为原文截断）
-    todays = []
-    for fp, rec in (state.get("seen") or {}).items():
-        if not isinstance(rec, dict) or not rec.get("pushed"):
-            continue
-        if str(rec.get("t", "")).startswith(today):
-            todays.append(rec)
-    todays.sort(key=lambda r: str(r.get("t", "")))
+    # 1. 当日已推事件（唯一数据源：pushed_events）
+    # 2026-09-01 口径统一：此前事件列表取 seen、方向分布取 pushed_events，
+    # 两者清理策略不同（SEEN_MAX 条 vs 300 条，均 48h 窗口）必然漂移——
+    # 9-01 实锤：列表 28 条 / 方向分布 29 条，差的那条正是被 seen 容量挤出、
+    # 只存在于 pushed_events 的 00:32「君正股份 DRAM 涨价」。
+    # 现同一份 today_events 同时供列表与方向分布使用，杜绝双口径。
+    today_events = [pe for pe in (state.get("pushed_events") or [])
+                    if str(pe.get("t", "")).startswith(today)]
+    todays = sorted(today_events, key=lambda r: str(r.get("t", "")))
     lines.append(f"### 今日已推事件（{len(todays)} 条）")
     lines.append("")
     if todays:
         for rec in todays:
             t = str(rec.get("t", ""))[11:16]
-            title = str(rec.get("title", ""))[:60]
+            # 2026-09-01 起的新条目带原文 title；历史条目回落到 title_norm
+            title = str(rec.get("title") or rec.get("title_norm") or "")[:60]
             lines.append(f"- {t} {title}")
     else:
         lines.append("- 今日无推送（平静日或系统未运行）")
     lines.append("")
 
-    # 2. 推送方向统计（pushed_events 当日条目，P0-3 起带 dir 字段）
-    today_events = [pe for pe in (state.get("pushed_events") or [])
-                    if str(pe.get("t", "")).startswith(today)]
+    # 2. 推送方向统计（与事件列表同源：pushed_events 当日条目，P0-3 起带 dir）
     bull = sum(1 for pe in today_events if pe.get("dir") == "bullish")
     bear = sum(1 for pe in today_events if pe.get("dir") == "bearish")
     if today_events:
         lines.append(f"### 方向分布")
         lines.append("")
         lines.append(f"- 利好 {bull} 条｜利空 {bear} 条｜未标注 {len(today_events) - bull - bear} 条")
-        # 板块热度 Top3
+        # 板块热度 Top3（2026-09-01：先归一再计数，同分用板块名做二级排序键。
+        # 此前 sorted(key=count, reverse=True) 在并列 2 票时按 dict 插入顺序取
+        # 前三，Top3 实际是任意的，掩盖了"半导体/AI算力各 7 票"的真实主线）
         sector_count = {}
         for pe in today_events:
             for s in _as_list(pe.get("sectors")):
-                if str(s).strip():
-                    sector_count[str(s).strip()] = sector_count.get(str(s).strip(), 0) + 1
-        top_sectors = sorted(sector_count.items(), key=lambda x: x[1], reverse=True)[:3]
+                canon = _canonical_sector(s)
+                if canon:
+                    sector_count[canon] = sector_count.get(canon, 0) + 1
+        top_sectors = sorted(sector_count.items(), key=lambda x: (-x[1], x[0]))[:3]
         if top_sectors:
             lines.append("- 板块热度: " + "、".join(f"{s}({c})" for s, c in top_sectors))
         lines.append("")

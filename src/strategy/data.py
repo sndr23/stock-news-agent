@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from src.strategy.data_freshness import is_recent_data_date
+from src.strategy.data_freshness import BJT, is_recent_data_date
 
 logger = logging.getLogger(__name__)
 
@@ -681,6 +681,61 @@ def load_index_sina(symbol: str = "399006", datalen: int = 3000,
         return load_index_daily_full(symbol, "20190101")
     _cache_set(key, df)
     return df
+
+
+def fetch_intraday_bar_tencent(symbol: str = "399006") -> Optional[dict]:
+    """腾讯实时行情 → 当日盘中 bar（close/high/low/amount），构造失败返回 None。
+
+    背景（2026-09-01 排查）：GitHub Actions 海外出口盘中拉新浪全量拿不到当日
+    实时 bar（末根最多到昨日收盘），v5.1"信号日 d 用 d 日 14:45 快照"口径在
+    云端从未生效。本函数用腾讯实时接口（国内 CDN，对海外出口稳定）构造当日
+    partial bar 拼进日线，把实盘信息集对齐到已拍板的 d 日快照口径。
+
+    单位对齐（2026-09-01 实测）：新浪日线 amount=成交量（股）；腾讯 [36] 为
+    成交量（手）→ ×100 对齐。字段位：[3]现价 [33]最高 [34]最低 [36]成交量(手)。
+    """
+    import requests
+
+    pre = "sh" if symbol.startswith(("000", "950")) else "sz"
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        r = session.get(f"http://qt.gtimg.cn/q={pre}{symbol}",
+                        headers={"Referer": "https://gu.qq.com/"}, timeout=10)
+        r.encoding = "gbk"
+        payload = r.text.partition("=")[2].strip().strip('"')
+        parts = payload.split("~")
+        if len(parts) < 37:
+            logger.warning("腾讯实时 %s 字段不足（%d 段），放弃拼当日 bar",
+                           symbol, len(parts))
+            return None
+        def _num(idx, positive=False):
+            try:
+                v = float(parts[idx])
+            except (ValueError, TypeError, IndexError):
+                return None
+            if v != v or v in (float("inf"), float("-inf")):
+                return None
+            if positive and v <= 0:
+                return None
+            return v
+
+        close = _num(3, positive=True)
+        high = _num(33, positive=True)
+        low = _num(34, positive=True)
+        vol_shares = _num(36)
+        if close is None or vol_shares is None or vol_shares < 0:
+            logger.warning("腾讯实时 %s 价格/成交量非法，放弃拼当日 bar", symbol)
+            return None
+        bar = {"close": close, "amount": vol_shares * 100.0}
+        if high is not None and low is not None and high >= close >= low:
+            bar["high"] = high
+            bar["low"] = low
+        return bar
+    except Exception as e:
+        logger.warning("腾讯实时 %s 获取失败(%s)，放弃拼当日 bar",
+                       symbol, type(e).__name__)
+        return None
 
 
 def load_index_daily_full(symbol: str = "399006", start: str = "20220101") -> pd.DataFrame:

@@ -158,6 +158,7 @@ class TestDetectSentimentAnomalies:
 
 class TestFetchSectorFlows:
     def test_parse_and_rank(self, monkeypatch):
+        monkeypatch.setattr(fc, "_SECTOR_FLOWS_MIN_ROWS", 0)
         rows = [
             {"f12": "BK0437", "f14": "煤炭", "f62": 1179380208.0},
             {"f12": "BK1492", "f14": "焦炭", "f62": 681017011.0},
@@ -173,6 +174,44 @@ class TestFetchSectorFlows:
         out = fc.fetch_sector_flows(top_n=3)
         assert out["inflow"] == [("煤炭", 11.8), ("焦炭", 6.8), ("银行", 5.2)]
         assert out["outflow"] == [("软件开发", -15.3), ("互联网服务", -12.1), ("半导体", -9.8)]
+
+    def test_truncated_response_rejected(self, monkeypatch):
+        """2026-09-01 截断守卫：有效行业数低于阈值 → 整体放弃（宁缺毋假）。
+        8-31 实证：东财反爬截断只回净流入侧，outflow 恒空被误当"全行业净流入"。"""
+        monkeypatch.setattr(fc, "_SECTOR_FLOWS_MIN_ROWS", 50)
+        rows = [{"f12": f"BK{i:04d}", "f14": f"行业{i}", "f62": 1e8 * i}
+                for i in range(1, 11)]  # 10 行 < 50
+        text = json.dumps({"data": {"total": 10, "diff": rows}})
+        monkeypatch.setattr(fc, "_http_get",
+                            lambda url, params=None, headers=None, encoding=None: text)
+        assert fc.fetch_sector_flows() == {}
+
+    def test_dirty_row_skipped_not_fatal(self, monkeypatch):
+        """2026-09-01：单行脏数据（f62="-"）跳过而非整体放弃。"""
+        monkeypatch.setattr(fc, "_SECTOR_FLOWS_MIN_ROWS", 0)
+        rows = [
+            {"f12": "BK0437", "f14": "煤炭", "f62": 1179380208.0},
+            {"f12": "BK1492", "f14": "焦炭", "f62": "-"},  # 脏行
+            {"f12": "BK0733", "f14": "软件开发", "f62": -1530000000.0},
+        ]
+        text = json.dumps({"data": {"total": 3, "diff": rows}})
+        monkeypatch.setattr(fc, "_http_get",
+                            lambda url, params=None, headers=None, encoding=None: text)
+        out = fc.fetch_sector_flows(top_n=3)
+        assert out["inflow"] == [("煤炭", 11.8)]
+        assert out["outflow"] == [("软件开发", -15.3)]
+
+    def test_all_inflow_market_fact_kept(self, monkeypatch):
+        """2026-09-01：行数守卫通过后 outflow 空是"全行业净流入"合法事实，正常产出。"""
+        monkeypatch.setattr(fc, "_SECTOR_FLOWS_MIN_ROWS", 2)
+        rows = [{"f12": f"BK{i:04d}", "f14": f"行业{i}", "f62": 1e8 * i}
+                for i in range(1, 4)]  # 3 行 ≥ 2，全部净流入
+        text = json.dumps({"data": {"total": 3, "diff": rows}})
+        monkeypatch.setattr(fc, "_http_get",
+                            lambda url, params=None, headers=None, encoding=None: text)
+        out = fc.fetch_sector_flows(top_n=2)
+        assert out["inflow"] == [("行业3", 3.0), ("行业2", 2.0)]
+        assert out["outflow"] == []
 
     def test_empty_response(self, monkeypatch):
         monkeypatch.setattr(fc, "_http_get", lambda *a, **k: "")
@@ -338,7 +377,11 @@ class TestRealtimePushP4Display:
         assert "主力净流出行业：软件开发-15.3亿" in ctx
 
     def test_snapshot_block_p4_lines(self):
-        factor_state = {"snapshot": _sample_snapshot(), "last_direction": "偏空"}
+        today = datetime.now(BJT).strftime("%Y-%m-%d")
+        factor_state = {"snapshot": _sample_snapshot(), "last_direction": "偏空",
+                        # 2026-09-01：当日 direction_history 键 → 走"当日结论"分支
+                        "direction_history": {today: {"dir": "偏空", "score": -0.5,
+                                                      "factors": {}}}}
         lines = rtp._snapshot_block(factor_state, "因子环境")
         joined = "\n".join(lines)
         assert "涨停情绪: 低迷｜涨停36（连板高度3）｜炸板率25%" in joined

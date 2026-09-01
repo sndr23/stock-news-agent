@@ -358,13 +358,18 @@ def _complete_sentiment(data: dict) -> bool:
 
 
 def _complete_sector_flows(data: dict) -> bool:
-    """判断行业资金流 TOP 结果是否是完整的两侧列表。"""
+    """判断行业资金流结果是否完整可用。
+
+    2026-09-01 调整：流出侧允许为空列表——全行业主力净流入≥0 是合法市场
+    事实；接口截断风险由 fetch_sector_flows 的 <50 行整弃守卫承担（截断
+    响应进不到这里）。流入侧仍必须非空，行结构仍需完整。
+    """
     if not isinstance(data, dict) or not isinstance(data.get("inflow"), list):
         return False
     if not isinstance(data.get("outflow"), list):
         return False
     rows = data["inflow"] + data["outflow"]
-    return bool(data["inflow"]) and bool(data["outflow"]) and all(
+    return bool(data["inflow"]) and all(
         isinstance(row, (list, tuple)) and len(row) == 2
         and str(row[0]).strip()
         and _finite_float(row[1]) is not None
@@ -1073,6 +1078,11 @@ def fetch_zt_sentiment() -> dict:
     return {}
 
 
+# 行业资金流最小有效行业数守卫（2026-09-01）：东财行业板块约 86 个，
+# 有效行数低于此值视为响应截断/不完整，整体放弃（防"只回流入侧"被误当全行业净流入）
+_SECTOR_FLOWS_MIN_ROWS = 50
+
+
 def fetch_sector_flows(top_n: int = 3) -> dict:
     """行业板块主力净流入/流出 TOP（P4-3）：回答"钱在往哪跑"
 
@@ -1094,12 +1104,21 @@ def fetch_sector_flows(top_n: int = 3) -> dict:
     vals = []
     for r in rows:
         if not isinstance(r, dict):
-            return {}
+            continue
         name = str(r.get("f14", "") or "").strip()
         flow = _finite_float(r.get("f62"))
         if not name or flow is None:
-            return {}
+            # 2026-09-01：单行脏数据跳过而非整体放弃（防一条缺失清空两侧 TOP）
+            continue
         vals.append((name, flow / 1e8))
+    # 2026-09-01：行业板块（fs=m:90 t:2）应约 86 个。东财 push2 对脚本请求存在
+    # 反爬/响应截断（2026-08-31 审核实证：云端两轮 outflow 恒空而 inflow 正常，
+    # 本地复现 RemoteDisconnected——po=1 按 f62 降序，截断响应只含净流入侧，
+    # 流出侧丢失被误当"全行业净流入"）。有效行业数低于阈值视为数据不完整，
+    # 整体放弃（渲染整行不显示 + 健康度记失败），宁缺毋假。
+    # 阈值为模块常量便于测试 monkeypatch（fixture 无需构造 86 行）。
+    if len(vals) < _SECTOR_FLOWS_MIN_ROWS:
+        return {}
     if not vals:
         return {}
     inflow = [(n, round(v, 1)) for n, v in
@@ -2345,8 +2364,12 @@ def build_snapshot(tech: dict, basis: dict, fx: dict, risk_state: str,
     if stocks:
         out["stocks"] = stocks
     if flows:
+        mn = flows.get("main_net_yi")
         out["flows"] = {
-            "main_net_yi": _to_float(flows.get("main_net_yi")),
+            # 2026-09-01：源失败时保留 null，禁止 _to_float 补 0.0。
+            # 补 0 会被展示层渲染成"两市主力 ▼ 净流出 0 亿"——把采集失败
+            # 伪装成"资金零变动"，比整行缺失更危险（用户会当成真实信号）。
+            "main_net_yi": _to_float(mn) if mn is not None else None,
             "margin_yi": _to_float(flows.get("margin_yi")),
             "margin_chg_yi": _to_float(flows.get("margin_chg_yi")),
         }
@@ -2404,7 +2427,14 @@ def build_snapshot(tech: dict, basis: dict, fx: dict, risk_state: str,
                          ("pcr", "call_vol", "put_vol", "contracts") if k in option}
     # P5-3：数据健康度紧凑键（含 weak_direction 由 run_once 维护，不在此处）
     if isinstance(sources, dict) and sources.get("total"):
-        out["sources"] = {"ok": sources.get("ok", 0), "total": sources.get("total", 0)}
+        src = {"ok": sources.get("ok", 0), "total": sources.get("total", 0)}
+        # 2026-09-01：异常源名单随快照透出。health 侧（run_once）早已算好
+        # failed，但此前只落 ok/total，展示层 real_time_push 的
+        # "（异常：…）"标签恒为空——8-31 审核实证"12/14 但不知哪 2 个源失败"。
+        failed = [str(x) for x in (sources.get("failed") or []) if str(x).strip()]
+        if failed:
+            src["failed"] = failed
+        out["sources"] = src
     return out
 
 
@@ -2832,6 +2862,9 @@ def run_once(push: bool, collect: bool = False) -> dict:
     health = {"ok": sum(sources_ok.values()), "total": len(sources_ok)}
     health["ratio"] = round(health["ok"] / health["total"], 2) if health["total"] else 0.0
     failed = [k for k, v in sources_ok.items() if not v]
+    # 2026-09-01：异常源名单随快照透传（health → snapshot.sources → 盘后简报
+    # "数据健康度"行展示），修复 8-31 审核实证"12/14 但不知哪 2 个源失败"
+    health["failed"] = failed
     print(f"[数据健康度] {health['ok']}/{health['total']}"
           + (f"（缺：{'、'.join(failed)}）" if failed else ""))
 
@@ -2924,11 +2957,18 @@ def run_once(push: bool, collect: bool = False) -> dict:
             else:
                 _rollback_cooldown(state, stock_fresh, stock_cooldown_before)
                 logger.warning("自选股异动推送失败，下一轮重试")
-        # 量化方向信号（核心需求"利好买、利空卖，和量化同步"）：多因子合成方向
-        # （偏多=利好/偏空=利空/中性），方向改变时推送"量化方向信号"（含各因子利好/利空明细）。
-        # 独立冷却（change_cooldown）防盘中方向抖动反复推。
-        # P4-6：IC 加权——用已积累的 direction_history（≥20个交易日）回测各维度 IC，
-        # 复用本轮上证 K 线算次日收益（零额外请求）；失败/样本不足等权回退
+    # 量化方向信号（核心需求"利好买、利空卖，和量化同步"）：多因子合成方向
+    # （偏多=利好/偏空=利空/中性），方向改变时推送"量化方向信号"（含各因子利好/利空明细）。
+    # 独立冷却（change_cooldown）防盘中方向抖动反复推。
+    # P4-6：IC 加权——用已积累的 direction_history（≥20个交易日）回测各维度 IC，
+    # 复用本轮上证 K 线算次日收益（零额外请求）；失败/样本不足等权回退
+    # 2026-09-01 重构：打分计算+落库从 if push 块移出——云端 8-22 停推后
+    # 只跑 --collect（realtime-factor.yml），原实现使 direction_history 自
+    # 08-28 后停更，盘后复盘"量化综合方向"长期展示陈旧值（9-01 审核实证：
+    # 展示的"偏多"实为 08-28 打分，与当日创业板空头排列反向）。
+    # 现在 persist（collect/push 均满足）即更新 direction_history 与
+    # last_direction；仅"方向变更推送"保留在 push 分支。
+    if persist:
         factor_ic = {}
         try:
             import signal_backtest as sb
@@ -2969,34 +3009,39 @@ def run_once(push: bool, collect: bool = False) -> dict:
         direction_state_update = True
         if changed or escalated:
             if abs(analysis["score"]) >= STRONG_DIR_THRESHOLD:
-                now_ts = time.time()
-                change_cooldown = state.setdefault("change_cooldown", {})
-                if now_ts - change_cooldown.get("direction", 0) >= STATE_CHANGE_COOLDOWN_HOURS * 3600:
-                    if escalated:
-                        analysis["escalated"] = True
-                    # P4-1：附近30天已推事件方向一致率（signal_backtest），
-                    # 失败（无状态/无行情）静默降级为无标注，不影响方向推送
-                    winrate = {}
-                    try:
-                        import signal_backtest as sb
-                        winrate = sb.compute_winrate(days=30)
-                    except Exception as e:
-                        logger.debug(f"信号胜率计算失败，跳过标注: {e}")
-                    content = "## 量化方向信号\n\n" + format_direction_signal(
-                        analysis, last_dir, winrate=winrate, sources=health)
-                    # P0 联动增强：附最近已推资讯标题，方向信号与资讯事件互为印证
-                    related = _recent_pushed_titles()
-                    if related:
-                        content += "\n\n近2小时已推资讯：\n" + "\n".join(f"- {t}" for t in related)
-                    r4 = do_push("量化方向信号", content)
-                    print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}，强信号）"
-                          f" → code={r4.get('code', r4.get('errcode'))}")
-                    if _push_succeeded(r4):
-                        change_cooldown["direction"] = now_ts
-                        state.pop("weak_direction", None)
-                    else:
-                        direction_state_update = False
-                        logger.warning("量化方向信号推送失败，下一轮重试")
+                if push:
+                    now_ts = time.time()
+                    change_cooldown = state.setdefault("change_cooldown", {})
+                    if now_ts - change_cooldown.get("direction", 0) >= STATE_CHANGE_COOLDOWN_HOURS * 3600:
+                        if escalated:
+                            analysis["escalated"] = True
+                        # P4-1：附近30天已推事件方向一致率（signal_backtest），
+                        # 失败（无状态/无行情）静默降级为无标注，不影响方向推送
+                        winrate = {}
+                        try:
+                            import signal_backtest as sb
+                            winrate = sb.compute_winrate(days=30)
+                        except Exception as e:
+                            logger.debug(f"信号胜率计算失败，跳过标注: {e}")
+                        content = "## 量化方向信号\n\n" + format_direction_signal(
+                            analysis, last_dir, winrate=winrate, sources=health)
+                        # P0 联动增强：附最近已推资讯标题，方向信号与资讯事件互为印证
+                        related = _recent_pushed_titles()
+                        if related:
+                            content += "\n\n近2小时已推资讯：\n" + "\n".join(f"- {t}" for t in related)
+                        r4 = do_push("量化方向信号", content)
+                        print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}，强信号）"
+                              f" → code={r4.get('code', r4.get('errcode'))}")
+                        if _push_succeeded(r4):
+                            change_cooldown["direction"] = now_ts
+                            state.pop("weak_direction", None)
+                        else:
+                            direction_state_update = False
+                            logger.warning("量化方向信号推送失败，下一轮重试")
+                else:
+                    # collect 模式：强信号只落库不推送（8-22 起云端仅 collect）
+                    print(f"\n[方向] {analysis['direction']}（{analysis['score']:+.2f}）"
+                          "强信号（collect 模式不推送，仅落库）")
             else:
                 state["weak_direction"] = {
                     "dir": analysis["direction"], "score": analysis["score"],
@@ -3006,7 +3051,6 @@ def run_once(push: bool, collect: bool = False) -> dict:
                       f"（<{STRONG_DIR_THRESHOLD}），不单独推送，进简报")
         if direction_state_update:
             state["last_direction"] = analysis["direction"]
-    if persist:
         if _save_state(state) is False:
             raise RuntimeError("因子状态写入失败，禁止报告采集成功")
 

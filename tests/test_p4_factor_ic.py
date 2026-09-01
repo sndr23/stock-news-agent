@@ -215,9 +215,14 @@ class TestDirectionSignalWeightedDisplay:
 
 class TestSnapshotBlockICTag:
     def _factor_state(self, with_ic=True):
+        import datetime as _dt
+        today = _dt.datetime.now(rtp.BJT).strftime("%Y-%m-%d")
         fs = {"snapshot": {"ts": "2026-08-19 15:00", "risk_state": "neutral",
                            "indexes": {"上证指数": {"price": 3930.0, "change_pct": 0.8, "trend": ""}}},
-              "last_direction": "偏多"}
+              "last_direction": "偏多",
+              # 2026-09-01 起 _snapshot_block 要求 direction_history 含当日键才
+              # 视为当日结论（否则降级"打分日期未知"）——测试构造当日打分。
+              "direction_history": {today: {"dir": "偏多", "score": 0.5, "factors": {}}}}
         if with_ic:
             fs["factor_ic"] = {"n": 25, "ic": {"对冲": 0.3}, "weights": {"对冲": 0.4}}
         return fs

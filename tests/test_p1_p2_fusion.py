@@ -399,8 +399,15 @@ class TestFactorEnvLineFlows:
 # P2-3: signal_backtest
 # ============================================================
 
-def _klines(closes, start="2026-08-01"):
-    """构造连续日K（start 起，跳过周末简化为连续日期）"""
+def _klines(closes, start=None):
+    """构造连续日K（start 起，跳过周末简化为连续日期）。
+
+    start 缺省用今天-3 天（2026-09-01 起：与 TestBacktest._event_day 对齐，
+    避免写死日期滑出 backtest 窗口）。显式传 start 的用例（TestForwardReturns
+    等纯函数测试）不受影响。
+    """
+    if start is None:
+        start = (datetime.now(BJT) - timedelta(days=3)).strftime("%Y-%m-%d")
     base = datetime.strptime(start, "%Y-%m-%d")
     return [{"date": (base + timedelta(days=i)).strftime("%Y-%m-%d"), "close": c}
             for i, c in enumerate(closes)]
@@ -408,7 +415,7 @@ def _klines(closes, start="2026-08-01"):
 
 class TestForwardReturns:
     def test_event_on_trading_day(self):
-        kl = _klines([100, 110, 105, 120, 130])
+        kl = _klines([100, 110, 105, 120, 130], start="2026-08-01")
         fr = sb._forward_returns(kl, "2026-08-01")
         assert fr["base"] == 100
         assert fr["ret_1"] == 10.0
@@ -416,27 +423,28 @@ class TestForwardReturns:
         assert "ret_5" not in fr  # 数据不足
 
     def test_includes_ten_day_horizon_when_data_is_available(self):
-        kl = _klines([100, 110, 105, 120, 130, 125, 135, 140, 145, 150, 160])
+        kl = _klines([100, 110, 105, 120, 130, 125, 135, 140, 145, 150, 160],
+                     start="2026-08-01")
         fr = sb._forward_returns(kl, "2026-08-01")
         assert fr["ret_5"] == 25.0
         assert fr["ret_10"] == 60.0
 
     def test_omits_ten_day_horizon_when_data_is_insufficient(self):
-        kl = _klines([100, 110, 105, 120, 130])
+        kl = _klines([100, 110, 105, 120, 130], start="2026-08-01")
         assert "ret_10" not in sb._forward_returns(kl, "2026-08-01")
 
     def test_event_before_first_day(self):
-        kl = _klines([100, 110])
+        kl = _klines([100, 110], start="2026-08-01")
         fr = sb._forward_returns(kl, "2026-07-30")
         assert fr["base"] == 100
         assert fr["ret_1"] == 10.0
 
     def test_event_after_last_day_no_data(self):
-        kl = _klines([100, 110])
+        kl = _klines([100, 110], start="2026-08-01")
         assert sb._forward_returns(kl, "2026-09-01") == {}
 
     def test_last_day_no_forward(self):
-        kl = _klines([100, 110])
+        kl = _klines([100, 110], start="2026-08-01")
         assert sb._forward_returns(kl, "2026-08-02") == {}
 
 
@@ -460,20 +468,28 @@ def test_backtest_window_uses_beijing_date(monkeypatch):
 
 
 class TestBacktest:
+    # 2026-09-01：事件日期改为相对今天（today-3d），此前写死 2026-08-01，
+    # 随日期推进滑出 backtest 的 30 天窗口（since=now-30d）→ evaluated 恒 0。
+    # 测试日期必须用动态口径，禁自然日硬编码（8-29 教训）。
+    @staticmethod
+    def _event_day() -> str:
+        return (datetime.now(BJT) - timedelta(days=3)).strftime("%Y-%m-%d")
+
     def _events(self):
+        d = self._event_day()
         return [
             # 利多 + 上证后1日上涨 → hit
             {"dir": "bullish", "scope": "market", "stocks": [],
-             "title_norm": "央行降准", "sectors": ["宏观"], "t": "2026-08-01 10:00:00"},
+             "title_norm": "央行降准", "sectors": ["宏观"], "t": f"{d} 10:00:00"},
             # 利空 + 上证后1日上涨 → miss
             {"dir": "bearish", "scope": "market", "stocks": [],
-             "title_norm": "地缘风险", "sectors": ["宏观"], "t": "2026-08-01 11:00:00"},
+             "title_norm": "地缘风险", "sectors": ["宏观"], "t": f"{d} 11:00:00"},
             # 个股级：stocks 命中 → 用个股K线（后1日上涨 → 利多 hit）
             {"dir": "mildly_bullish", "scope": "stock", "stocks": ["中际旭创"],
-             "title_norm": "中际旭创获订单", "sectors": ["光模块"], "t": "2026-08-01 10:30:00"},
+             "title_norm": "中际旭创获订单", "sectors": ["光模块"], "t": f"{d} 10:30:00"},
             # 未标注方向 → 跳过
             {"dir": "", "scope": "stock", "stocks": [],
-             "title_norm": "无方向", "sectors": [], "t": "2026-08-01 12:00:00"},
+             "title_norm": "无方向", "sectors": [], "t": f"{d} 12:00:00"},
         ]
 
     def test_backtest_aggregates(self, monkeypatch):

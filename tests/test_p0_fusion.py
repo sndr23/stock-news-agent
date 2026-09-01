@@ -327,9 +327,13 @@ class TestEveningReview:
                 "fp2": {"t": f"{today} 13:40:00", "pushed": False, "title": "未推消息"},
                 "fp3": {"t": "2026-08-01 10:00:00", "pushed": True, "title": "往日已推"},
             },
+            # 2026-09-01 起盘后复盘唯一数据源为 pushed_events（列表与方向分布同源，
+            # 修复 seen/pushed_events 双口径漂移）。条目带 title_norm 供展示回落。
             "pushed_events": [
-                {"t": f"{today} 10:15:00", "dir": "bearish", "sectors": ["全球流动性"]},
-                {"t": f"{today} 13:20:00", "dir": "bullish", "sectors": ["半导体", "AI"]},
+                {"t": f"{today} 10:15:00", "dir": "bearish", "sectors": ["全球流动性"],
+                 "title_norm": "日本央行加息"},
+                {"t": f"{today} 13:20:00", "dir": "bullish", "sectors": ["半导体", "AI"],
+                 "title_norm": "半导体板块异动"},
             ],
             "pending": {},
         }
@@ -343,13 +347,14 @@ class TestEveningReview:
         stats = rtp.run_evening_review(dry_run=True)
         out = capsys.readouterr().out
 
-        assert "今日已推事件（1 条）" in out
+        assert "今日已推事件（2 条）" in out
         assert "日本央行加息" in out
+        assert "半导体板块异动" in out
         assert "未推消息" not in out
         assert "往日已推" not in out
         assert "利好 1 条｜利空 1 条" in out
         assert "半导体" in out
-        assert stats["pushed_events"] == 1
+        assert stats["pushed_events"] == 2
 
     def test_dry_run_empty_state(self, local_env, monkeypatch, capsys, tmp_path):
         state_path = tmp_path / "real_time_state.json"

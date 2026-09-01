@@ -121,6 +121,11 @@ def _install_collect_deps(monkeypatch):
         ("build_snapshot", _build),
         ("_save_state", _save),
         ("do_push", _push),
+        # 2026-09-01 起方向打分在 persist（collect/push）块执行（此前只在 push
+        # 块，云端停推后 direction_history 停更 4 天）——collect 测试需 mock
+        # 方向合成，避免真实 _direction_analysis 依赖行情数据。
+        ("_direction_analysis",
+         lambda *a, **k: {"direction": "中性", "score": 0.0, "factors": []}),
         # 默认按交易日运行：避免周六/周日跑测试时 run_once 走进"非交易日跳过"
         # 分支，使断言依赖真实日历（需要非交易日的用例自行覆盖为 False）。
         ("_is_workday", lambda *a, **k: True),
