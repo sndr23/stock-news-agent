@@ -3367,13 +3367,15 @@ def run_morning_brief(dry_run: bool = False) -> dict:
     return stats
 
 
-def run_evening_review(dry_run: bool = False) -> dict:
+def run_evening_review(dry_run: bool = False, on_date: str = None) -> dict:
     """盘后复盘（15:10 触发）：当日已推事件回顾 + 推送统计 + 因子环境
 
     只读设计：读 state 不写 state（当日数据由常规轮询维护，复盘仅聚合展示）。
+    on_date（2026-09-02）：补发指定日期复盘（如凌晨补发前一交易日），
+    默认当天。日期仅过滤事件列表，因子环境始终取 factor_state 最新快照。
     """
     now = datetime.now(BJT)
-    today = now.strftime("%Y-%m-%d")
+    today = on_date or now.strftime("%Y-%m-%d")
     state = load_state()
     factor_state = _load_factor_state()
 
@@ -3459,6 +3461,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只诊断不推送不保存状态")
     parser.add_argument("--brief", choices=["morning", "evening"],
                         help="盘前简报(morning, 08:45)/盘后复盘(evening, 15:10)，融合因子快照（P0-2/P0-3）")
+    parser.add_argument("--date", default=None,
+                        help="补发指定日期的复盘（YYYY-MM-DD，与 --brief evening 搭配；默认当天）")
     args = parser.parse_args()
 
     # 2026-08-13 P2 修复：删除重复 basicConfig——src.config 已配置 root logger
@@ -3475,7 +3479,7 @@ def main():
         if args.brief == "morning":
             run_morning_brief(dry_run=args.dry_run)
         else:
-            run_evening_review(dry_run=args.dry_run)
+            run_evening_review(dry_run=args.dry_run, on_date=args.date)
         return
 
     if args.loop:
