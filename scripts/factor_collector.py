@@ -1154,13 +1154,17 @@ def fetch_liquidity() -> dict:
     return out
 
 
-def fetch_option_pcr(max_pages: int = 12) -> dict:
+def fetch_option_pcr(max_pages: int = 30) -> dict:
     """期权成交量 PCR（P7-2 2026-08-19）：全市场期权 认沽/认购 成交量比
 
     恐慌/贪婪温度计：PCR≥1.3 恐慌对冲占优（机构买保险），≤0.55 看涨占优。
     数据源东财期权列表（fs=m:10 全市场，与行业资金流同源），按合约名称
     "购"/"沽"分桶统计成交量；分页拉全量（每页500，上限 max_pages），
     任一页失败即中止按已拉数据统计（部分覆盖时 contracts < total 有标注）。
+    2026-09-01：max_pages 12→30（15000 合约）。A股场内期权（沪深 ETF 期权 +
+    中金所股指期权）全市场合约数常超 6000，12 页拉不全 → contracts < total
+    → 健康度连续失败（9-01 实测 43 轮）。影子因子宁缺毋假不变：30 页仍拉不
+    全则保持判定失败，不拿部分覆盖冒充全市场 PCR。
     返回 {"pcr", "call_vol", "put_vol", "contracts", "total"}；无认购量返回 {}。
     """
     call_v = put_v = contracts = total = 0
