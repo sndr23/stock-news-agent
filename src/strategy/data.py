@@ -619,8 +619,12 @@ def load_index_sina(symbol: str = "399006", datalen: int = 3000,
         # 新鲜度按末根 bar 日期而非墙钟时长判定（修复 2026-08-25 隔日滞后 bug）：
         # 原 TTL=1天 固定窗口 + GitHub Actions 每日 cache 恢复，导致周二/周四命中
         # 前一日缓存、数据滞后一个交易日，核心层用缺日线打分。
-        # 新浪接口盘中含当日 bar；周末/短假允许少量日历滞后，过期即重拉。
-        if _last_bar_is_fresh(cached):
+        # 2026-09-01 收紧 max_lag_days 3→1：8-29~8-31 业务 run 连续失败期间
+        # GitHub Actions cache 冻结在 8-28 版本（末根 8-27），9-1 恢复后 lag=3
+        # 仍被判"新鲜"而跳过重拉，8-28/8-31 两个交易日日线缺失并连续污染信号
+        # （8-31 与 9-1 核心分完全相同即铁证）。工作日口径 lag≤1 = 末根必须是
+        # 今天或上一工作日；长假多拉一次全量无害，宁可重拉不可用旧数据。
+        if _last_bar_is_fresh(cached, max_lag_days=1):
             return cached
     url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={tsec}&scale=240&ma=no&datalen={datalen}")
