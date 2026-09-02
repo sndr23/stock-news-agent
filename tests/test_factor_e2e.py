@@ -67,7 +67,7 @@ def _mock_data(monkeypatch, tmp_path):
     monkeypatch.setattr(fc, "fetch_sector_flows", lambda: {})
     # P7（2026-08-19）：资金面利率/期权 PCR 同样不触网（空数据 → 无新增异动）
     monkeypatch.setattr(fc, "fetch_liquidity", lambda: {})
-    monkeypatch.setattr(fc, "fetch_option_pcr", lambda: {})
+    monkeypatch.setattr(fc, "fetch_option_pcr", lambda *a, **k: {})
     # P8（2026-08-19）：分钟K线不触网（空数据 → 分钟影子因子 0 分）
     monkeypatch.setattr(fc, "fetch_minute_kline", lambda *a, **kw: [])
     import signal_backtest as sb  # noqa: E402

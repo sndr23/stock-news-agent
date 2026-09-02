@@ -1203,7 +1203,7 @@ def _sina_option_quotes(codes: list, batch: int = 60) -> dict:
     return out
 
 
-def fetch_option_pcr(max_pages: int = 30) -> dict:
+def fetch_option_pcr(max_pages: int = 30, notes: dict = None) -> dict:
     """期权成交量 PCR（P7-2 2026-08-19）：全市场场内期权 认沽/认购 成交量比
 
     恐慌/贪婪温度计：PCR≥1.3 恐慌对冲占优（机构买保险），≤0.55 看涨占优。
@@ -1250,6 +1250,8 @@ def fetch_option_pcr(max_pages: int = 30) -> dict:
         if roster and total > 0 and len(roster) >= total:
             break
     if not roster or total <= 0:
+        if notes is not None:
+            notes["期权PCR"] = f"东财名单失败（roster={len(roster)} total={total}，主域+延迟镜像均不可用）"
         return {}
 
     # 2) 新浪批量行情 + 购沽分桶（C/P 优先，名称兜底）
@@ -1272,8 +1274,13 @@ def fetch_option_pcr(max_pages: int = 30) -> dict:
         else:
             call_v += vol
     if contracts < total:  # 覆盖不足 → 整体放弃（_complete_option 同口径拒收）
+        if notes is not None:
+            notes["期权PCR"] = (f"新浪行情覆盖不足 {contracts}/{total}"
+                                f"（quotes={len(quotes)}，可能 hq.sinajs.cn 对云端出口限流）")
         return {}
     if call_v <= 0:
+        if notes is not None:
+            notes["期权PCR"] = f"认购成交量合计为0（覆盖 {contracts}/{total}）"
         return {}
     return {"pcr": round(put_v / call_v, 3), "call_vol": call_v,
             "put_vol": put_v, "contracts": contracts, "total": total}
@@ -2315,12 +2322,16 @@ def _rollback_cooldown(state: dict, signals: list, previous: dict) -> None:
 
 
 def record_source_health(state: dict, sources_ok: dict,
-                         threshold: int = DATA_HEALTH_ALERT_ROUNDS) -> list:
+                         threshold: int = DATA_HEALTH_ALERT_ROUNDS,
+                         notes: dict = None) -> list:
     """记录各数据维度连续失败次数，返回本轮首次达到阈值的维度名。
 
     ``sources_ok`` 是当前轮最终结果，不区分内部使用了哪一个免费回退源：
     只要该维度拿到有效数据就算成功。告警锁存由
     :func:`mark_source_health_alerted` 在推送成功后设置。
+    ``notes``（可选）：{维度名: 失败原因}，失败时写入 rec["last_fail_note"]
+    随 Gist 状态透出（2026-09-02 补观测盲区：此前只有计数，云端日志拉不到
+    时无法判断失败层）；成功时清除残留备注。
     """
     threshold = max(1, int(threshold))
     health = state.setdefault("source_health", {})
@@ -2330,9 +2341,13 @@ def record_source_health(state: dict, sources_ok: dict,
         if ok:
             rec["consecutive_failures"] = 0
             rec["alerted"] = False
+            rec.pop("last_fail_note", None)
         else:
             rec["consecutive_failures"] = int(rec.get("consecutive_failures", 0)) + 1
             rec["alerted"] = bool(rec.get("alerted", False))
+            note = (notes or {}).get(name)
+            if note:
+                rec["last_fail_note"] = str(note)
             if rec["consecutive_failures"] >= threshold and not rec["alerted"]:
                 alerts.append(name)
     return alerts
@@ -2363,17 +2378,19 @@ def _format_source_health_alert(names: list, threshold: int) -> str:
 
 
 def maybe_push_source_health_alert(state: dict, sources_ok: dict,
-                                   allow_alert: bool = False) -> bool:
+                                   allow_alert: bool = False,
+                                   notes: dict = None) -> bool:
     """按当前运行模式记录健康度，并在允许时发送连续失败告警。
 
     ``allow_alert`` 由 ``--push`` / ``--collect`` 设置；纯 ``--dry-run`` 不
     修改状态，也不发送告警。``--collect`` 只开启本告警，不开启因子异动推送。
+    ``notes`` 透传给 :func:`record_source_health`（失败原因随状态透出）。
     返回值表示健康度告警是否实际发送成功。
     """
     if not allow_alert:
         return False
     alerts = record_source_health(
-        state, sources_ok, threshold=DATA_HEALTH_ALERT_ROUNDS)
+        state, sources_ok, threshold=DATA_HEALTH_ALERT_ROUNDS, notes=notes)
     if not alerts:
         return False
     result = do_push(
@@ -2901,7 +2918,8 @@ def run_once(push: bool, collect: bool = False) -> dict:
     # P7（2026-08-19）：资金面利率（GC007）/ 期权成交量 PCR（影子因子：展示+记录，
     # 不参与方向合成，IC 回测达标后升级正式维度）
     liquidity = fetch_liquidity()
-    option = fetch_option_pcr()
+    _opt_notes = {}
+    option = fetch_option_pcr(notes=_opt_notes)
     # P8（2026-08-19）：因子池扩展——日线衍生因子（复用上证日K零请求）+
     # 分钟级因子（m5×48 当日全量，腾讯 ifzq 源）。均为影子维度。
     daily_factors = calc_daily_derived_factors(sh_kline)
@@ -2946,7 +2964,7 @@ def run_once(push: bool, collect: bool = False) -> dict:
     state = _load_state()
     persist = push or collect
     health_alert_sent = maybe_push_source_health_alert(
-        state, sources_ok, allow_alert=persist)
+        state, sources_ok, allow_alert=persist, notes=_opt_notes)
     signals, new_history = detect_anomalies(tech, basis, fx, state.get("basis_history"))
     # P3：外盘/宽度为市场级风险（隔夜暴跌3%+、跌停潮），纳入 risk_off 口径；
     # P4：炸板潮（炸板率≥50%）同属市场级风险，并入 risk_off；
