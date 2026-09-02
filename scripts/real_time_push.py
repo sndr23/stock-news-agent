@@ -172,22 +172,20 @@ SEEN_MAX = 12000
 SEEN_MAX_BYTES = 700_000
 
 def _est_seen_bytes(seen: dict, sample: int = 200) -> int:
-    """估算 seen 序列化后的字节数（抽样平均 × 条数，避免整表 json.dumps）。
+    """seen 序列化后的精确字节数（全量 json.dumps，与 _gist_save 写入口径一致）。
 
-    2026-09-01 修正：按 UTF-8 编码字节估算。中文每字符 3 字节，原先按
-    len(str) 字符数估算低估约 2~3 倍——700KB 目标下实际可能冲到 1MB+
-    （Gist 单文件 1MB 是写入截断损坏的硬限）。+60 覆盖 JSON 键名/引号/
-    花括号等每条目开销。
+    2026-09-02 修正：原抽样估算口径（指纹 + t + title + 60B ≈ 150B/条）与
+    实际序列化（全部字段 + indent=2 格式化 ≈ 175B/条）不一致，且记录里存
+    的是 title_norm 而 title 字段往往不存在——估算系统性偏低。9-02 实证：
+    4055 条估算 607KB 未触发 700KB 裁剪，实际 709KB。700KB 级整表 dumps
+    每轮一次成本可忽略，改精确计算后 SEEN_MAX_BYTES 才是真硬上限。
+    注意：该上限只约束 seen 本身；整文件还含 candidate_events/pending/
+    pushed_events（约 +210KB），917KB 实证写入侧仍安全（<1MB Gist 硬限），
+    读取侧已由 _gist_load 的 raw_url 回退根治，不再依赖体积控制。
     """
     if not seen:
         return 0
-    items = list(seen.items())[:sample]
-    per = sum(len(fp.encode("utf-8", "replace"))
-              + len(str(rec.get("t", "") or "").encode("utf-8", "replace"))
-              + len(str(rec.get("title", "") or "").encode("utf-8", "replace"))
-              + 60
-              for fp, rec in items) / len(items)
-    return int(per * len(seen))
+    return len(json.dumps(seen, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
 def _prune_seen(seen: dict, max_items: int = SEEN_MAX,
@@ -1311,10 +1309,27 @@ def _gist_load(token: str, gist_id: str) -> dict:
     content = fobj.get("content")
     try:
         state = json.loads(content)
-    except json.JSONDecodeError as e:
-        # JSON 截断/损坏（18:02 轮 0.72MB 写入截断实证）：必须报错，禁止降级空状态
-        logger.error(f"Gist 状态文件 JSON 解析失败（内容 {len(content or '')} 字符，可能写入被截断损坏）: {e}")
-        raise
+    except (json.JSONDecodeError, TypeError) as e:
+        # 2026-09-02 P0 根因修复：Gist API GET 的 content 字段在文件接近 ~900KB 时
+        # 会被截断返回（fobj["truncated"]=True；实测 917KB 文件 content 截到约
+        # 70.8 万字符即断，raw_url 下载同一文件完整可解析）——不是写入侧损坏。
+        # run#1214（09-02 07:00 北京）起 21 连败即此问题：json.loads 截断串必抛。
+        # 因此解析失败不直接 raise，先回退 raw_url 下载完整内容；仍失败才真正
+        # raise（"禁止静默降级空状态"原则不变）。
+        raw_url = fobj.get("raw_url")
+        if not raw_url:
+            logger.error(f"Gist 状态文件 JSON 解析失败且无 raw_url 可回退"
+                         f"（内容 {len(content) if content else 0} 字符）: {e}")
+            raise
+        logger.warning(f"Gist content 解析失败（可能 API 截断，{len(content) if content else 0} 字符）: {e}；"
+                       "回退 raw_url 下载完整内容")
+        # raw.githubusercontent 同样有 CDN 缓存，追加时间戳参数强制绕过（同上方 API 缓存对策）
+        sep = "&" if "?" in raw_url else "?"
+        raw_resp = requests.get(f"{raw_url}{sep}ts={int(time.time() * 1000)}",
+                                headers=headers, timeout=30)
+        raw_resp.raise_for_status()
+        state = json.loads(raw_resp.content.decode("utf-8"))
+        logger.info(f"raw_url 回退成功（{len(raw_resp.content)} 字节），content 截断绕过")
     # 结构校验：解析成功但缺 seen 等核心键 → 视为损坏（防"{}"等畸形内容被当空状态）
     if not isinstance(state, dict) or "seen" not in state:
         raise ValueError("Gist 状态文件结构异常（缺少 seen 键），拒绝空状态运行")
