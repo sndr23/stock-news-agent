@@ -1154,27 +1154,82 @@ def fetch_liquidity() -> dict:
     return out
 
 
+# 东财 clist 主机池（2026-09-02）：期权名单无实时性要求，主域被拒（连接重置/
+# 反爬）时降级 push2delay 延迟镜像——仅用于合约名单，行情一律走新浪。
+_EM_CLIST_HOSTS = (
+    "https://push2.eastmoney.com",
+    "https://push2delay.eastmoney.com",
+)
+
+
+def _sina_option_quotes(codes: list, batch: int = 60) -> dict:
+    """新浪 hq.sinajs.cn 批量期权行情：{code: (成交量, "C"/"P")}。
+
+    2026-09-02 换源实证：CON_OP_ 响应（GBK，约 48 列）中 [41]=成交量（张）、
+    [45]="C"/"P" 购沽标志——成交量与东财实时域单合约 stock/get 的 f47、
+    成交额与 f48 完全一致（样本 10012409：新浪 2495/50115.00 = 东财 2495/50115.0）。
+    [41]='-'（当日无成交，远月虚值合约常态）按 0 计入覆盖，对齐旧东财 f5=0
+    口径；仅响应行缺失/列数不足才视为数据缺失（不计覆盖，宁缺毋假）。
+    新浪系规则：Referer 必须 finance.sina.com.cn，rotate_ua=False。
+    """
+    out = {}
+    for i in range(0, len(codes), batch):
+        part = codes[i:i + batch]
+        text = _http_get(
+            "https://hq.sinajs.cn/list=" + ",".join(f"CON_OP_{c}" for c in part),
+            headers={"Referer": "https://finance.sina.com.cn"},
+            encoding="gbk", rotate_ua=False)
+        if not text:
+            continue
+        for line in text.splitlines():
+            m = re.match(r'var hq_str_CON_OP_(\w+)="([^"]*)"', line.strip())
+            if not m:
+                continue
+            code, body = m.group(1), m.group(2)
+            cols = body.split(",")
+            if len(cols) < 46:
+                continue  # 列不足：数据缺失，不计覆盖
+            cp = cols[45].strip().upper()
+            vol = _finite_float(cols[41])
+            if vol is not None and vol < 0:
+                vol = None  # 负值非法：不计覆盖
+            elif vol is None:
+                # '-' = 当日无成交，按 0 计入覆盖（对齐旧东财 f5=0 口径：
+                # 远月深度虚值合约常态无成交，误判缺失会导致覆盖不足被拒）
+                vol = 0.0
+            out[code] = (vol, cp if cp in ("C", "P") else None)
+        if i + batch < len(codes):
+            time.sleep(0.3)  # 分批间隔，降低批量请求风控压力
+    return out
+
+
 def fetch_option_pcr(max_pages: int = 30) -> dict:
-    """期权成交量 PCR（P7-2 2026-08-19）：全市场期权 认沽/认购 成交量比
+    """期权成交量 PCR（P7-2 2026-08-19）：全市场场内期权 认沽/认购 成交量比
 
     恐慌/贪婪温度计：PCR≥1.3 恐慌对冲占优（机构买保险），≤0.55 看涨占优。
-    数据源东财期权列表（fs=m:10 全市场，与行业资金流同源），按合约名称
-    "购"/"沽"分桶统计成交量；分页拉全量（每页500，上限 max_pages），
-    任一页失败即中止按已拉数据统计（部分覆盖时 contracts < total 有标注）。
-    2026-09-01：max_pages 12→30（15000 合约）。A股场内期权（沪深 ETF 期权 +
-    中金所股指期权）全市场合约数常超 6000，12 页拉不全 → contracts < total
-    → 健康度连续失败（9-01 实测 43 轮）。影子因子宁缺毋假不变：30 页仍拉不
-    全则保持判定失败，不拿部分覆盖冒充全市场 PCR。
+    2026-09-02 换源：东财 push2 clist（fs=m:10）行情字段（f5/f6）全量返回
+    '-'（668 合约只剩名单，显式请求量额返 0），42c2202 的分页修复方向错误。
+    改混合方案——东财名单（代码+名称，每页 500 分页）+ 新浪 CON_OP_ 批量
+    行情（[41] 成交量经东财 f47 交叉验证；[45] C/P 定购沽，名称"购/沽"兜底）。
+    口径说明：覆盖东财 fs=m:10 全市场期权（沪深 ETF 期权为主，总合约数实测
+    668）；中金所股指期权若不在名单内则不在口径中（与旧口径一致以东财
+    名单为准）。
+    宁缺毋假不变：名单拉不到、行情批量全失败或覆盖不足（contracts < total）
+    均判定失败，不拿部分覆盖冒充全市场 PCR。
     返回 {"pcr", "call_vol", "put_vol", "contracts", "total"}；无认购量返回 {}。
     """
-    call_v = put_v = contracts = total = 0
+    # 1) 东财合约名单（代码+名称，fs=m:10 与旧口径一致；主域被拒时降级延迟镜像）
+    roster = []  # [(code, name)]
+    total = 0
     for pn in range(1, max_pages + 1):
-        text = _http_get("https://push2.eastmoney.com/api/qt/clist/get", params={
-            "fid": "f5", "po": "1", "pz": "500", "pn": pn, "np": "1",
-            "fltt": "2", "invt": "2", "fs": "m:10", "fields": "f12,f14,f5",
-        })
-        if not text:
-            break
+        text = ""
+        for host in _EM_CLIST_HOSTS:
+            text = _http_get(f"{host}/api/qt/clist/get", params={
+                "fid": "f12", "po": "1", "pz": "500", "pn": pn, "np": "1",
+                "fltt": "2", "invt": "2", "fs": "m:10", "fields": "f12,f14",
+            })
+            if text:
+                break
         try:
             data = json.loads(text).get("data") or {}
             if not isinstance(data, dict):
@@ -1188,20 +1243,36 @@ def fetch_option_pcr(max_pages: int = 30) -> dict:
         for r in rows:
             if not isinstance(r, dict):
                 continue
+            code = str(r.get("f12", "") or "")
             name = str(r.get("f14", "") or "")
-            vol = _finite_float(r.get("f5"))
-            if not name or vol is None or vol < 0 or not vol.is_integer():
-                continue
-            vol = int(vol)
-            if "沽" not in name and "购" not in name:
-                continue
-            contracts += 1
-            if "沽" in name:
-                put_v += vol
-            elif "购" in name:
-                call_v += vol
-        if contracts >= total > 0:
+            if code:
+                roster.append((code, name))
+        if roster and total > 0 and len(roster) >= total:
             break
+    if not roster or total <= 0:
+        return {}
+
+    # 2) 新浪批量行情 + 购沽分桶（C/P 优先，名称兜底）
+    quotes = _sina_option_quotes([c for c, _ in roster])
+    call_v = put_v = contracts = 0
+    for code, name in roster:
+        vol, cp = quotes.get(code, (None, None))
+        if vol is None:
+            continue  # 行情无效：不计覆盖，交由覆盖校验拒收
+        if cp not in ("C", "P"):
+            if "沽" in name:
+                cp = "P"
+            elif "购" in name:
+                cp = "C"
+            else:
+                continue
+        contracts += 1
+        if cp == "P":
+            put_v += vol
+        else:
+            call_v += vol
+    if contracts < total:  # 覆盖不足 → 整体放弃（_complete_option 同口径拒收）
+        return {}
     if call_v <= 0:
         return {}
     return {"pcr": round(put_v / call_v, 3), "call_vol": call_v,

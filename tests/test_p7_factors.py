@@ -72,22 +72,60 @@ class TestFetchLiquidity:
 
 
 # ============================================================
-# P7-2 fetch_option_pcr
+# P7-2 fetch_option_pcr（2026-09-02 换源：东财名单 + 新浪 CON_OP_ 行情）
 # ============================================================
 def _opt_page(rows, total):
     return json.dumps({"data": {"diff": rows, "total": total}})
 
 
+def _sina_lines(quotes):
+    """构造新浪 CON_OP_ 响应体：quotes = {code: (vol, cp)}。
+
+    列位（2026-09-02 实证）：[41]=成交量、[45]=C/P，响应至少 46 列。
+    """
+    lines = []
+    for code, (vol, cp) in quotes.items():
+        cols = ["x"] * 46
+        cols[41] = str(vol)
+        cols[45] = cp
+        lines.append(f'var hq_str_CON_OP_{code}="{",".join(cols)}";')
+    return "\n".join(lines)
+
+
 class TestFetchOptionPcr:
+    def _install(self, monkeypatch, roster_pages, sina_quotes):
+        """roster_pages = {pn: (rows, total)}；sina_quotes = {code: (vol, cp)}。"""
+        def fake_get(url, params=None, **kw):
+            if "hq.sinajs.cn" in url:
+                codes = [c.replace("CON_OP_", "") for c in url.split("list=CON_OP_")[1].split(",")]
+                lines = []
+                for c in codes:
+                    if c not in sina_quotes:
+                        continue
+                    vol, cp = sina_quotes[c]
+                    cols = ["x"] * 46
+                    cols[41] = str(vol)
+                    cols[45] = cp
+                    lines.append(f'var hq_str_CON_OP_{c}="{",".join(cols)}";')
+                return "\n".join(lines)
+            if "push2.eastmoney.com" in url:
+                rows, total = roster_pages[params.get("pn")]
+                return _opt_page(rows, total)
+            return ""
+
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+
     def test_pcr_from_call_put_volumes(self, monkeypatch):
-        rows = [
-            {"f12": "10005678", "f14": "50ETF购8月2900", "f5": 1000},
-            {"f12": "10005679", "f14": "50ETF沽8月2900", "f5": 2000},
-            {"f12": "10005680", "f14": "300ETF购8月4000", "f5": 500},
-            {"f12": "10005681", "f14": "300ETF沽8月4000", "f5": 1500},
+        roster = [
+            {"f12": "10005678", "f14": "50ETF购8月2900"},
+            {"f12": "10005679", "f14": "50ETF沽8月2900"},
+            {"f12": "10005680", "f14": "300ETF购8月4000"},
+            {"f12": "10005681", "f14": "300ETF沽8月4000"},
         ]
-        monkeypatch.setattr(fc, "_http_get",
-                            lambda url, params=None, **kw: _opt_page(rows, 4))
+        quotes = {"10005678": (1000, "C"), "10005679": (2000, "P"),
+                  "10005680": (500, "C"), "10005681": (1500, "P")}
+        self._install(monkeypatch, {1: (roster, 4)}, quotes)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         out = fc.fetch_option_pcr()
         # PCR = (2000+1500) / (1000+500) = 2.333
         assert out["pcr"] == pytest.approx(2.333, abs=0.001)
@@ -96,53 +134,126 @@ class TestFetchOptionPcr:
         assert out["contracts"] == 4
 
     def test_no_call_volume_returns_empty(self, monkeypatch):
-        rows = [{"f12": "1", "f14": "50ETF沽8月2900", "f5": 100}]
-        monkeypatch.setattr(fc, "_http_get",
-                            lambda url, params=None, **kw: _opt_page(rows, 1))
+        roster = [{"f12": "1", "f14": "50ETF沽8月2900"}]
+        self._install(monkeypatch, {1: (roster, 1)}, {"1": (100, "P")})
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         assert fc.fetch_option_pcr() == {}
 
     def test_nonfinite_or_negative_volume_is_not_counted(self, monkeypatch):
-        """期权成交量非法时，不得污染 PCR 或合约覆盖统计。"""
-        rows = [
-            {"f12": "1", "f14": "50ETF购8月2900", "f5": "nan"},
-            {"f12": "2", "f14": "50ETF沽8月2900", "f5": -100},
+        """成交量非法 → 覆盖不足 → 整体放弃，不得污染 PCR。"""
+        roster = [
+            {"f12": "1", "f14": "50ETF购8月2900"},
+            {"f12": "2", "f14": "50ETF沽8月2900"},
         ]
-        monkeypatch.setattr(fc, "_http_get",
-                            lambda url, params=None, **kw: _opt_page(rows, 2))
-
+        self._install(monkeypatch, {1: (roster, 2)},
+                      {"1": ("nan", "C"), "2": (-100, "P")})
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         assert fc.fetch_option_pcr() == {}
 
-    def test_pagination_stops_at_total(self, monkeypatch):
-        page1 = [{"f12": str(i), "f14": "50ETF购8月2900", "f5": 10} for i in range(500)]
-        page2 = [{"f12": "999", "f14": "50ETF沽8月2900", "f5": 500}]
+    def test_roster_pagination_stops_at_total(self, monkeypatch):
+        page1 = [{"f12": str(i), "f14": "50ETF购8月2900"} for i in range(500)]
+        page2 = [{"f12": "999", "f14": "50ETF沽8月2900"}]
+        pages = {pn: (rows, 501) for pn, rows in ((1, page1), (2, page2))}
         calls = []
 
         def fake_get(url, params=None, **kw):
-            calls.append(params.get("pn"))
-            if params.get("pn") == 1:
-                return _opt_page(page1, 501)
-            return _opt_page(page2, 501)
+            if "push2.eastmoney.com" in url:
+                calls.append(params.get("pn"))
+                rows, total = pages[params.get("pn")]
+                return _opt_page(rows, total)
+            if "hq.sinajs.cn" in url:
+                codes = [c.replace("CON_OP_", "") for c in url.split("list=CON_OP_")[1].split(",")]
+                out = []
+                for c in codes:
+                    cp = "P" if c == "999" else "C"
+                    cols = ["x"] * 46
+                    cols[41] = "10" if c != "999" else "500"
+                    cols[45] = cp
+                    out.append(f'var hq_str_CON_OP_{c}="{",".join(cols)}";')
+                return "\n".join(out)
+            return ""
 
         monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         out = fc.fetch_option_pcr()
         assert out["contracts"] == 501
         assert out["call_vol"] == 5000
         assert out["put_vol"] == 500
         assert calls == [1, 2]
 
-    def test_failed_page_keeps_partial_stats(self, monkeypatch):
-        page1 = [{"f12": "1", "f14": "50ETF购8月2900", "f5": 100},
-                 {"f12": "2", "f14": "50ETF沽8月2900", "f5": 100}]
+    def test_failed_roster_page_aborts(self, monkeypatch):
+        """名单页失败 → 名单不全 → 覆盖必然不足 → 宁缺毋假整体放弃。
+
+        （旧东货行情源语义是"按已拉页统计"，换源后部分名单无行情可查，
+        语义改为整体放弃；2026-09-02。）
+        """
+        page1 = [{"f12": "1", "f14": "50ETF购8月2900"},
+                 {"f12": "2", "f14": "50ETF沽8月2900"}]
 
         def fake_get(url, params=None, **kw):
-            if params.get("pn") == 1:
-                return _opt_page(page1, 300)
-            return ""  # 第2页失败 → 中止按已拉统计
+            if "push2.eastmoney.com" in url:
+                if params.get("pn") == 1:
+                    return _opt_page(page1, 300)
+                return ""  # 第2页失败
+            if "hq.sinajs.cn" in url:
+                return _sina_lines({"1": (100, "C"), "2": (100, "P")})
+            return ""
 
         monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        assert fc.fetch_option_pcr() == {}
+
+    def test_sina_batch_failure_aborts_on_partial_coverage(self, monkeypatch):
+        """新浪行情批失败 → 覆盖不足 → 整体放弃。"""
+        roster = [{"f12": str(100 + i), "f14": "50ETF购8月2900"} for i in range(120)]
+        quotes = {str(100 + i): (10, "C") for i in range(60)}  # 仅首批有效
+
+        def fake_get(url, params=None, **kw):
+            if "push2.eastmoney.com" in url:
+                return _opt_page(roster, 120)
+            if "hq.sinajs.cn" in url:
+                return _sina_lines({c: q for c, q in quotes.items()
+                                    if f"CON_OP_{c}," in url or url.endswith(f"CON_OP_{c}")})
+            return ""
+
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        assert fc.fetch_option_pcr() == {}
+
+    def test_cp_fallback_by_name_when_flag_invalid(self, monkeypatch):
+        """[45] C/P 缺失时按名称"购/沽"兜底分类。"""
+        roster = [{"f12": "1", "f14": "50ETF购8月2900"},
+                  {"f12": "2", "f14": "50ETF沽8月2900"}]
+        self._install(monkeypatch, {1: (roster, 2)},
+                      {"1": (100, ""), "2": (100, "")})
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         out = fc.fetch_option_pcr()
         assert out["pcr"] == 1.0
-        assert out["contracts"] == 2
+        assert out["call_vol"] == 100
+
+    def test_no_trade_dash_counts_as_zero_and_keeps_coverage(self, monkeypatch):
+        """[41]='-'（当日无成交）按 0 计入覆盖，对齐旧东财 f5=0 口径。
+
+        远月虚值合约常态无成交；若误判缺失 → 覆盖不足 → 整体拒绝。
+        """
+        roster = [{"f12": "1", "f14": "50ETF购8月2900"},
+                  {"f12": "2", "f14": "50ETF沽8月2900"},
+                  {"f12": "3", "f14": "50ETF购12月3000"}]
+        self._install(monkeypatch, {1: (roster, 3)},
+                      {"1": (300, "C"), "2": (100, "P"), "3": ("-", "C")})
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        out = fc.fetch_option_pcr()
+        assert out["contracts"] == 3  # 无成交合约计入覆盖
+        assert out["call_vol"] == 300  # 无成交合约按 0 计，对比值无贡献
+        assert out["pcr"] == pytest.approx(100 / 300, abs=0.001)
+
+    def test_missing_quote_row_rejects_coverage(self, monkeypatch):
+        """响应行缺失（名单有、行情无）= 数据缺失 → 覆盖不足 → 整体拒绝。"""
+        roster = [{"f12": "1", "f14": "50ETF购8月2900"},
+                  {"f12": "2", "f14": "50ETF沽8月2900"}]
+        self._install(monkeypatch, {1: (roster, 2)}, {"1": (100, "C")})  # 2 无行情行
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        assert fc.fetch_option_pcr() == {}
 
 
 # ============================================================
