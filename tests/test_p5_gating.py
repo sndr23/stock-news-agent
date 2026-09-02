@@ -282,7 +282,7 @@ class TestConfidenceTiering:
         assert 0.5 <= abs(state["weak_direction"]["score"]) < fc.STRONG_DIR_THRESHOLD
         # 快照含数据健康度（mock 环境 6/14 源成功：行情/期货/汇率/K线/波动率/宽度；
         # P7 后源总数 11→13（资金面利率/期权PCR），P8 后 13→14（分钟K线））
-        assert state["snapshot"]["sources"]["total"] == 14
+        assert state["snapshot"]["sources"]["total"] == 13  # 期权PCR 影子因子下线（OPTION_PCR_ENABLED=False）后 13 源
         assert state["snapshot"]["sources"]["ok"] == 6
 
     def test_weak_then_strong_escalates(self, tmp_path, monkeypatch):
@@ -354,7 +354,7 @@ class TestDataHealth:
         fc.run_once(push=True)
         snap = fc._load_state()["snapshot"]
         # P8 后源总数 13→14（分钟K线）
-        assert snap["sources"]["total"] == 14
+        assert snap["sources"]["total"] == 13  # 期权PCR 影子因子下线（OPTION_PCR_ENABLED=False）后 13 源
         assert snap["sources"]["ok"] == 5
 
     def test_run_once_alerts_after_three_failed_rounds(self, tmp_path, monkeypatch):

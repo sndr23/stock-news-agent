@@ -40,7 +40,7 @@
 
 - 单元：`pytest -m unit`
 - 集成抽查：运行 `python scripts/run_chinext_timing.py --dry-run`，检查 399006、旭创、因子快照和估值缺失时的降级提示
-- 回归：择时系统 `python scripts/run_chinext_timing.py --backtest` 使用 d-1 最近完整收盘信息，输出结果可复现并如实记录；不以历史宽松口径收益作为硬门槛
+- 回归：择时系统 `python scripts/run_chinext_timing.py --backtest` 使用 d 日完整收盘近似 14:45 盘中快照，输出结果可复现并如实记录；不以历史宽松口径收益作为硬门槛
 
 ## 风险 / 注意
 

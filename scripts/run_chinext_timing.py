@@ -148,7 +148,12 @@ def gather_context(df) -> dict:
     # 缠论需 high/low（新浪全量链提供；备用链缺则退化跳过缠论）
     highs = (df["high"].tolist() if "high" in df else [])
     lows = (df["low"].tolist() if "low" in df else [])
-    today_s = datetime.now(BJT).strftime("%Y-%m-%d")
+    now_bj = datetime.now(BJT)
+    today_s = now_bj.strftime("%Y-%m-%d")
+    intraday_snapshot_required = (
+        now_bj.weekday() < 5
+        and dt_time(9, 30) <= now_bj.time() <= dt_time(15, 0)
+    )
 
     intraday = 0.0
     try:
@@ -161,6 +166,7 @@ def gather_context(df) -> dict:
     citic_net = None
     citic_day = ""
     events = []
+    news_state_error = False
     try:
         fs = nl.load_factor_state()
         snapshot = fs.get("snapshot") or {}
@@ -181,12 +187,16 @@ def gather_context(df) -> dict:
         logger.warning("citic 状态读取失败: %s", type(e).__name__)
     try:
         rt = nl.load_realtime_state()
+        if not isinstance(rt, dict) or not any(
+                key in rt for key in ("pushed_events", "candidate_events")):
+            news_state_error = True
         today = datetime.now(BJT).strftime("%Y-%m-%d")
         # 资讯输入覆盖全部重大候选：已推送强档 ∪ 当日预筛候选（P7-1）。
         # 收敛点：资讯维度只看当日真实候选（含方向），不看历史事件。
         events = nl.today_news_events(rt, today)
     except Exception as e:
         logger.warning("资讯事件读取失败: %s", type(e).__name__)
+        news_state_error = True
 
     # 外盘 t-1 隔夜跌幅（硬风控盘中急跌的同源确认，缺源降级为 0 不阻断）
     overseas_drop = 0.0
@@ -226,9 +236,9 @@ def gather_context(df) -> dict:
     except Exception as e:
         logger.warning("中际旭创数据读取失败（跳过双确认）: %s", type(e).__name__)
 
-    # 当日实时量能单独记录 day_amount_ratio 供盘面判断，不进量价因子分位。
-    # （末根若为当日 14:45 partial，则 amounts[-1]=当日累计量、amounts[-2]=昨日完整量，
-    #   两者比值为当日量能进度参考；缓存命中（末根为昨日完整量）时 ratio 语义不存在，置 0）
+    # 当日实时量能单独记录 day_amount_ratio 供报告展示；v5.1 盘中快照口径下，
+    # amounts[-1] 的当日累计量也会进入核心量价因子，回测需明确这是完整日量的近似。
+    # （缓存命中、末根为昨日完整量时 ratio 语义不存在，置 0。）
     day_amount_ratio = 0.0
     if dates and dates[-1] == today_s:
         _amt_raw = (df["amount"].tolist() if "amount" in df else [])
@@ -237,10 +247,20 @@ def gather_context(df) -> dict:
     return {"closes": closes, "amounts": amounts, "dates": dates,
             "highs": highs, "lows": lows,
             "history_bars": len(closes),
+            "complete_history_bars": _completed_bar_count(df),
             "history_last_date": dates[-1] if dates else "",
+            "complete_history_last_date": (
+                dates[-2] if len(dates) >= 2 and dates[-1] == today_s
+                else dates[-1] if dates else ""),
+            "intraday_snapshot": bool(dates and dates[-1] == today_s),
+            "intraday_snapshot_time": datetime.now(BJT).strftime("%H:%M")
+                if dates and dates[-1] == today_s else "",
+            "intraday_snapshot_required": intraday_snapshot_required,
+            "chan_structure_date": dates[-2] if len(dates) >= 2 else "",
             "intraday": intraday, "snapshot": snapshot,
             "snapshot_ts": snapshot_ts, "snapshot_stale": snapshot_stale,
             "citic_net": citic_net, "citic_day": citic_day, "events": events,
+            "news_state_error": news_state_error,
             "overseas_drop": overseas_drop, "stock_ctx": stock_ctx,
             "day_amount_ratio": day_amount_ratio,
             "erp_pctile": _load_erp_basis(dates)}
@@ -403,7 +423,7 @@ def score_all(ctx: dict) -> dict:
     caps = cf.defensive_state(closes, vol_pctile, glass)
     # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
     # 历史宽松信息集下该约束曾表现为净负贡献（旧对照：+291.9% → +188.8%）。
-    # 当前严格回测结果以 backtest_metrics 的 d-1 信息集为准，不能把旧对照当作生产基线。
+    # 当前严格回测以 d 日完整收盘近似 14:45 快照，不能把旧对照当作生产基线。
     _erp_series = ctx.get("erp_pctile") or []
     if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -627,7 +647,8 @@ def strategy_health(hist: list, window: int = 20,
     recs = [r for r in hist if isinstance(r.get("next_ret"), (int, float))]
     if len(recs) < window:
         return {"ok": True, "level": "insufficient",
-                "reasons": [f"有效样本 {len(recs)}/{window}，不触发熔断（安全默认）"],
+                "reasons": [f"有效样本 {len(recs)}/{window}，观察期，健康度尚未验证"
+                            "（样本不足不触发熔断）"],
                 "stats": {"n": len(recs), "window": window}}
     win = recs[-window:]
     nav = bh = peak = 1.0
@@ -733,8 +754,8 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
     lines.append("  核心："
                  f"趋势{_fmt(sig['trend_ma20_60'], sig['trend_momentum_60'])}"
                  f"｜量价{_fmt(sig['volprice_quadrant'], sig['volprice_amihud'])}"
-                 f"｜波动{_fmt(sig['vol_regime'], sig['vol_term'])}"
-                 f"｜估值{sig['value_erp']:+.2f}"
+                  f"｜波动{_fmt(sig['vol_regime'], sig['vol_term'])}"
+                  f"｜估值评分关闭({sig['value_erp']:+.2f})"
                  f"｜落袋{_fmt(sig['pullback_52w'], sig['dd60'])}")
     # 旭创从修正行移除，改由下方"旭创确认"行承载（避免 -0.10 与明细 -0.14 重复且打架）
     # 数据健康度（2026-08-27）：快照源缺失时该子项降级 0，+0.00 无法区分"真实中性"
@@ -745,28 +766,45 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
         tag = "(缺)" if (raw_h is not None and raw_h.get(key) is None) else ""
         return f"{label}{val:+.2f}{tag}"
 
+    news_tag = "(缺)" if ctx.get("news_state_error") else ""
     lines.append("  修正："
                  f"{_h('贴水', mods['basis'], 'basis_min_ap')}"
                  f"｜{_h('资金', mods['flow'], 'main_net')}"
                  f"｜{_h('情绪', mods['mood'], 'down_pct')}"
-                 f"｜资讯{mods['news']:+.2f}"
+                 f"｜资讯{mods['news']:+.2f}{news_tag}"
                  f"｜缠论{mods['chan'].get('score', 0.0):+.2f}")
     lines.append("  注：X/Y＝该因子主信号/副信号（双口径），单值因子仅取主信号。")
     stock_detail = (mods.get("stock") or {}).get("detail", "")
     if stock_detail and "跳过" not in stock_detail:
         net = (mods.get("stock") or {}).get("score", 0.0)
-        lines.append(f"  旭创确认（净{net:+.2f}）：{stock_detail}")
+        if abs(float(net or 0.0)) < 1e-9 and "同向，主信号已覆盖" in stock_detail:
+            lines.append(f"  旭创确认（同向，不重复计分）：{stock_detail}")
+        else:
+            lines.append(f"  旭创确认（净{net:+.2f}）：{stock_detail}")
     if (mods.get("chan") or {}).get("detail") and "中性" not in (mods["chan"] or {}).get("detail", ""):
-        lines.append(f"  {mods['chan']['detail']}（{mods['chan']['bi_dir']}/{mods['chan']['zone']}）")
+        chan_detail = mods["chan"]["detail"]
+        if chan_detail.startswith("缠论:"):
+            chan_detail = chan_detail[len("缠论:"):]
+        chan_day = ctx.get("chan_structure_date") or "最近确认K线"
+        lines.append(f"  缠论代理（日线简化，结构截至{chan_day}）：{chan_detail}"
+                     f"（{mods['chan']['bi_dir']}/{mods['chan']['zone']}）")
     od = ctx.get("overseas_drop") or 0.0
     if od <= -0.03:
         lines.append(f"■ 外围：SOX/纳指/标普 t-1 最差 {od:.1%}（外围大幅下杀）")
     lines.append(f"■ 盘中：创业板指 {ctx['intraday']:+.2f}%")
     dar = ctx.get("day_amount_ratio") or 0.0
     if dar:
-        lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子用昨日完整量）")
-    lines.append(f"■ 数据：399006完整日线：{ctx.get('history_bars', len(ctx.get('closes') or []))}根，"
-                 f"截至{ctx.get('history_last_date') or '-'}")
+        lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子使用当日盘中累计量）")
+    if ctx.get("intraday_snapshot"):
+        lines.append(
+            f"■ 数据：399006完整日线：{ctx.get('complete_history_bars', '-')}根，"
+            f"截至{ctx.get('complete_history_last_date') or '-'}；"
+            f"{ctx.get('intraday_snapshot_time') or '当日'}盘中快照已纳入核心评分")
+    else:
+        fallback = ("；⚠ 当日盘中快照未获取，核心评分使用最近完整日线"
+                    if ctx.get("intraday_snapshot_required") else "")
+        lines.append(f"■ 数据：399006完整日线：{ctx.get('history_bars', len(ctx.get('closes') or []))}根，"
+                     f"截至{ctx.get('history_last_date') or '-'}{fallback}")
     if caps["triggers"]:
         lines.append("■ 硬风控：" + "；".join(caps["triggers"]))
         # 澄清主因：档位基准未越封顶线时，硬风控只是背景约束而非空仓/降档主因
@@ -780,6 +818,8 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
     if ctx.get("snapshot_stale"):
         lines.append(f"⚠ 修正层数据源停更于 {ctx.get('snapshot_ts', '')}，"
                      f"贴水/资金/情绪基于旧快照，请结合盘中走势谨慎参考")
+    if ctx.get("news_state_error"):
+        lines.append("⚠ 资讯状态读取失败，本次资讯修正按 0 处理")
     if dec["note"] and not chg and "确认" not in dec["note"][0]:
         lines.append("■ " + "；".join(dec["note"]))
     # 策略失效熔断（P1-2，2026-08-29）：只告警不改仓位，样本不足时标注进度
@@ -894,8 +934,8 @@ def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
     因此窗口开始前必须保留至少 60 根 warmup 日线。``initial_prev`` 可传入
     窗口边界的 ``{"position": float, "pending": ...}`` 状态，用于 walk-forward
     跨折继承实际仓位。返回值除指标外还包含 ``navs``、``daily_rets``、
-    ``bh_navs``、``final_state`` 等审计字段。时序为：信号日 d 只用 ≤d-1
-    收盘，仓位吃 d+1 收益（对齐场外基金 T+1）；实时修正层和缠论不可回测。"""
+    ``bh_navs``、``final_state`` 等审计字段。时序为：信号日 d 使用 d 日完整收盘
+    近似 14:45 盘中快照，仓位吃 d+1 收益（对齐场外基金 T+1）；实时修正层和缠论不可回测。"""
     # 回测只接受完整历史日线；当前日期/未来日期的 bar 可能仍是盘中或异常数据，
     # 一律排除，避免把未收盘价格当成历史收盘价并污染最后一笔收益。
     frame = df.copy()

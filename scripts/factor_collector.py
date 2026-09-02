@@ -1164,6 +1164,16 @@ _EM_CLIST_HOSTS = (
     "https://push2delay.eastmoney.com",
 )
 
+# 期权PCR 影子因子开关（2026-09-02 用户拍板：暂时下线、保留代码）。
+# 下线原因：云端 GitHub Actions 海外出口访问不到东财期权名单（主域返空
+# data、push2delay 镜像不可达），已迭代 5 版（276cb1f→a779d40，含新浪
+# CON_OP 行情换源、批量抗限流、名单按日缓存、主机池命中判定修正），
+# 本地端到端 PCR=0.999 覆盖 668/668 证明代码正确——属云端环境问题。
+# 下线期间不请求、不注册健康度（简报不再报"期权PCR 缺失"，区别于源故障）。
+# 恢复条件：任一数据源对云端可达，或因子改在内网/本地运行。置 True 即恢复，
+# 首次运行自动重建名单缓存（state["option_roster"]）。
+OPTION_PCR_ENABLED = False
+
 
 def _sina_option_quotes(codes: list, batch: int = 200) -> dict:
     """新浪 hq.sinajs.cn 批量期权行情：{code: (成交量, "C"/"P")}。
@@ -1245,8 +1255,17 @@ def fetch_option_pcr(max_pages: int = 30, notes: dict = None,
     total = 0
     if (isinstance(roster_cache, dict) and roster_cache.get("date") == today
             and roster_cache.get("roster")):
-        roster = [tuple(x) for x in roster_cache["roster"] if isinstance(x, (list, tuple))]
-        total = int(roster_cache.get("total") or len(roster))
+        cached_total = int(roster_cache.get("total") or 0)
+        cached_roster = roster_cache.get("roster")
+        valid_cache = (
+            cached_total > 0 and isinstance(cached_roster, list)
+            and all(isinstance(x, (list, tuple)) and len(x) == 2
+                    and str(x[0]).strip() for x in cached_roster)
+            and len(cached_roster) >= cached_total
+        )
+        if valid_cache:
+            roster = [tuple(x) for x in cached_roster]
+            total = cached_total
     else:
         for pn in range(1, max_pages + 1):
             rows = []
@@ -1278,7 +1297,7 @@ def fetch_option_pcr(max_pages: int = 30, notes: dict = None,
                     roster.append((code, name))
             if roster and total > 0 and len(roster) >= total:
                 break
-        if roster and total > 0 and isinstance(roster_cache, dict):
+        if roster and total > 0 and len(roster) >= total and isinstance(roster_cache, dict):
             roster_cache.update({"date": today, "total": total,
                                  "roster": [list(x) for x in roster]})
     if not roster or total <= 0:
@@ -2959,7 +2978,10 @@ def run_once(push: bool, collect: bool = False) -> dict:
     # 期权合约名单为日频元数据：当日缓存复用（state["option_roster"]），
     # 避免东财名单接口偶发不可用时整源陪挂；行情每轮实时请求。
     _roster_cache = state.setdefault("option_roster", {}) if persist else None
-    option = fetch_option_pcr(notes=_opt_notes, roster_cache=_roster_cache)
+    if OPTION_PCR_ENABLED:
+        option = fetch_option_pcr(notes=_opt_notes, roster_cache=_roster_cache)
+    else:
+        option = {}  # 影子因子下线：不请求数据源（云端不可达，见模块常量注释）
     # P8（2026-08-19）：因子池扩展——日线衍生因子（复用上证日K零请求）+
     # 分钟级因子（m5×48 当日全量，腾讯 ifzq 源）。均为影子维度。
     daily_factors = calc_daily_derived_factors(sh_kline)
@@ -2989,9 +3011,15 @@ def run_once(push: bool, collect: bool = False) -> dict:
         "涨停情绪": _complete_sentiment(sentiment),
         "行业资金流": _complete_sector_flows(sector_flows),
         "资金面利率": _complete_liquidity(liquidity),
-        "期权PCR": _complete_option(option),
         "分钟K线": _complete_minute_kline(minute),
     }
+    if OPTION_PCR_ENABLED:
+        sources_ok["期权PCR"] = _complete_option(option)
+    else:
+        # 影子因子下线（2026-09-02 用户拍板）：不注册健康度、清理遗留连败
+        # 计数——恢复（置 True）时从 0 重建，避免历史 78 轮连败误导告警。
+        state.setdefault("source_health", {}).pop("期权PCR", None)
+        _opt_notes.clear()
     health = {"ok": sum(sources_ok.values()), "total": len(sources_ok)}
     health["ratio"] = round(health["ok"] / health["total"], 2) if health["total"] else 0.0
     failed = [k for k, v in sources_ok.items() if not v]

@@ -19,12 +19,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from src.strategy.state_io import get_gist_config
+from src.strategy.state_io import get_gist_config, read_gist_json
 
 from .data_freshness import BJT, is_recent_data_date
 
@@ -108,29 +107,8 @@ def _read_gist_file(filename: str, strict: bool = False) -> dict:
     语义的状态使用，读取异常必须抛出，且成功但缺文件仍明确返回空状态。
     """
     gist_token, gist_id = get_gist_config()
-    if not (gist_token and gist_id):
-        return {}
-    try:
-        url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-        req = Request(url, headers={"Authorization": f"token {gist_token}",
-                                    "Accept": "application/vnd.github+json",
-                                    "User-Agent": "strategy-news-link"})
-        with urlopen(req, timeout=15) as resp:
-            g = json.loads(resp.read().decode("utf-8"))
-        fobj = (g.get("files") or {}).get(filename)
-        if fobj is not None:
-            content = fobj.get("content")
-            if strict and (not isinstance(content, str) or not content.strip()):
-                raise ValueError(f"Gist 状态文件 {filename} 内容为空")
-            state = json.loads(content or "{}")
-            if strict and not isinstance(state, dict):
-                raise ValueError(f"Gist 状态文件 {filename} 根节点不是对象")
-            return state
-    except Exception as e:
-        logger.warning("Gist 状态文件 %s 读取失败: %s", filename, type(e).__name__)
-        if strict:
-            raise RuntimeError(f"Gist 状态文件 {filename} 读取失败，拒绝回退本地") from e
-    return {}
+    return read_gist_json(filename, gist_token, gist_id, strict=strict,
+                           user_agent="strategy-news-link")
 
 
 def _read_local(path: Path) -> dict:

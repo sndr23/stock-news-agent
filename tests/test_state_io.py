@@ -42,6 +42,49 @@ def test_atomic_write_json_preserves_old_file_when_replace_fails(monkeypatch, tm
     assert json.loads(path.read_text(encoding="utf-8")) == {"position": 1.0}
 
 
+class _FakeUrlResp:
+    def __init__(self, body):
+        self._body = body if isinstance(body, bytes) else body.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_read_gist_json_falls_back_to_raw_url_when_content_is_truncated(monkeypatch):
+    """Gist content 截断时必须下载 raw_url 的完整 JSON。"""
+    metadata = {
+        "files": {
+            "real_time_state.json": {
+                "content": '{"pushed_events": [',
+                "truncated": True,
+                "raw_url": "https://raw.example/real_time_state.json",
+            }
+        }
+    }
+    calls = []
+
+    def fake_urlopen(req, timeout=15):
+        url = req.full_url
+        calls.append(url)
+        if "raw.example" in url:
+            return _FakeUrlResp('{"pushed_events": [{"id": 1}]}')
+        return _FakeUrlResp(json.dumps(metadata))
+
+    monkeypatch.setattr(state_io, "urlopen", fake_urlopen)
+
+    out = state_io.read_gist_json("real_time_state.json", "tok", "gid", strict=True)
+
+    assert out == {"pushed_events": [{"id": 1}]}
+    assert len(calls) == 2
+    assert "ts=" in calls[0] and "ts=" in calls[1]
+
+
 @pytest.mark.parametrize(
     ("token", "gist_id"),
     [("tok123", ""), ("", "gid123")],

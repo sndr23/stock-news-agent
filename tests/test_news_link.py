@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """资讯<->策略三层协同桥（src/strategy/news_link.py）单元测试"""
+import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.strategy import news_link as nl  # noqa: E402
+from src.strategy import state_io  # noqa: E402
 
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
 
@@ -184,7 +186,7 @@ def test_load_factor_state_does_not_fallback_to_local_when_gist_file_missing(
         def read(self):
             return b'{"files": {}}'
 
-    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+    monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: _MissingFileResp())
 
     assert nl.load_factor_state() == {}
 
@@ -197,7 +199,7 @@ def test_load_factor_state_rejects_gist_failure_instead_of_using_local_snapshot(
     monkeypatch.setattr(nl, "_FACTOR_STATE_PATH", tmp_path / "factor_state.json")
     nl._FACTOR_STATE_PATH.write_text(
         '{"snapshot": {"flows": {"main_net_yi": -120}}}', encoding="utf-8")
-    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
+    monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
         OSError("network down")))
 
     with pytest.raises(RuntimeError, match="Gist 状态文件 factor_state.json"):
@@ -223,7 +225,7 @@ def test_load_realtime_state_does_not_fallback_to_local_when_gist_file_missing(
         def read(self):
             return b'{"files": {}}'
 
-    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+    monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: _MissingFileResp())
 
     assert nl.load_realtime_state() == {}
 
@@ -236,11 +238,48 @@ def test_load_realtime_state_rejects_gist_failure_instead_of_using_local_state(
     monkeypatch.setattr(nl, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
     nl._REALTIME_STATE_PATH.write_text(
         '{"pushed_events": [{"t": "2026-08-28 10:00:00"}]}', encoding="utf-8")
-    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
+    monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(
         OSError("network down")))
 
     with pytest.raises(RuntimeError, match="Gist 状态文件 real_time_state.json"):
         nl.load_realtime_state()
+
+
+def test_load_realtime_state_reads_raw_url_after_gist_content_truncation(monkeypatch):
+    """资讯状态文件较大时，必须绕过截断 content 读取完整 raw_url。"""
+    monkeypatch.setenv("GIST_TOKEN", "tok123")
+    monkeypatch.setenv("GIST_ID", "gid123")
+    metadata = {
+        "files": {
+            "real_time_state.json": {
+                "content": '{"pushed_events": [',
+                "truncated": True,
+                "raw_url": "https://raw.example/real_time_state.json",
+            }
+        }
+    }
+
+    class _Resp:
+        def __init__(self, body):
+            self.body = body if isinstance(body, bytes) else body.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body
+
+    def fake_urlopen(req, timeout=15):
+        if "raw.example" in req.full_url:
+            return _Resp('{"pushed_events": [{"id": 1}]}')
+        return _Resp(json.dumps(metadata))
+
+    monkeypatch.setattr(state_io, "urlopen", fake_urlopen)
+
+    assert nl.load_realtime_state() == {"pushed_events": [{"id": 1}]}
 
 
 def test_load_citic_pos_state_does_not_fallback_to_local_when_gist_file_missing(
@@ -263,7 +302,7 @@ def test_load_citic_pos_state_does_not_fallback_to_local_when_gist_file_missing(
         def read(self):
             return b'{"files": {}}'
 
-    monkeypatch.setattr(nl, "urlopen", lambda *args, **kwargs: _MissingFileResp())
+    monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: _MissingFileResp())
 
     assert nl.load_citic_pos_state() == {}
 

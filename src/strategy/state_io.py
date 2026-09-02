@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,65 @@ def _gist_headers(token: str) -> dict:
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
     }
+
+
+def read_gist_json(filename: str, token: str, gist_id: str, *,
+                   strict: bool = False, user_agent: str = "stock-news-agent-state",
+                   timeout: float = 15.0) -> dict:
+    """读取 Gist JSON，并在 API content 被截断时回退 raw_url。
+
+    Gist 元数据接口对大文件只返回截断的 ``content``；raw_url 才是完整文件。
+    ``strict`` 保留各调用方现有语义：严格状态读取失败直接抛错，非严格读取返回空对象。
+    """
+    if not token or not gist_id:
+        if strict:
+            raise RuntimeError("Gist 配置缺失，拒绝静默回退本地状态")
+        return {}
+
+    filename = str(filename)
+    headers = {**_gist_headers(token), "User-Agent": user_agent}
+    try:
+        api_url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
+        req = Request(api_url, headers=headers)
+        with urlopen(req, timeout=timeout) as resp:
+            gist = json.loads(resp.read().decode("utf-8"))
+        fobj = (gist.get("files") or {}).get(filename)
+        if fobj is None:
+            return {}
+
+        content = fobj.get("content")
+        raw_url = fobj.get("raw_url")
+        state = None
+        parse_error = None
+        if not fobj.get("truncated") and isinstance(content, str) and content.strip():
+            try:
+                state = json.loads(content)
+            except (json.JSONDecodeError, TypeError) as e:
+                parse_error = e
+
+        if state is None:
+            if not raw_url:
+                if parse_error is not None:
+                    raise parse_error
+                raise ValueError(f"Gist 状态文件 {filename} 内容为空")
+            sep = "&" if "?" in raw_url else "?"
+            raw_req = Request(
+                f"{raw_url}{sep}ts={int(time.time() * 1000)}",
+                headers=headers,
+            )
+            with urlopen(raw_req, timeout=max(timeout, 30.0)) as resp:
+                state = json.loads(resp.read().decode("utf-8"))
+            logger.warning("Gist 文件 %s 使用 raw_url 回退读取完整内容", filename)
+
+        if not isinstance(state, dict):
+            raise ValueError(f"Gist 状态文件 {filename} 根节点不是对象")
+        return state
+    except Exception as e:
+        logger.warning("Gist 状态文件 %s 读取失败: %s", filename, type(e).__name__)
+        if strict:
+            raise RuntimeError(
+                f"Gist 状态文件 {filename} 读取失败，拒绝回退本地") from e
+        return {}
 
 
 def patch_gist_file(filename: str, content: str, token: str, gist_id: str,

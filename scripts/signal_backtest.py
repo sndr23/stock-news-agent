@@ -32,7 +32,6 @@ import json
 import logging
 import os
 import sys
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,7 +45,7 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".ENV")
 
 from src.tools.push import push_via_wecom, push_via_pushplus
-from src.strategy.state_io import get_gist_config
+from src.strategy.state_io import get_gist_config, read_gist_json
 
 logger = logging.getLogger("signal_backtest")
 
@@ -198,20 +197,8 @@ def _load_realtime_state() -> dict:
     """已推事件状态（配置 Gist 时云端唯一来源）；失败返回 {}"""
     gist_token, gist_id = get_gist_config()
     if gist_token and gist_id:
-        try:
-            url = f"https://api.github.com/gists/{gist_id}?ts={int(time.time() * 1000)}"
-            headers = {"Authorization": f"token {gist_token}",
-                       "Accept": "application/vnd.github+json",
-                       "User-Agent": "stock-news-agent-backtest"}
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            fobj = (resp.json().get("files") or {}).get(REALTIME_STATE_FILENAME)
-            if fobj is not None:
-                state = json.loads(fobj.get("content") or "{}")
-                return state if isinstance(state, dict) else {}
-        except Exception as e:
-            logger.warning(f"Gist 状态读取失败，回测统计降级为空: {e}")
-        return {}
+        return read_gist_json(REALTIME_STATE_FILENAME, gist_token, gist_id,
+                              user_agent="stock-news-agent-backtest")
     try:
         state = json.loads(_REALTIME_STATE_PATH.read_text(encoding="utf-8"))
         return state if isinstance(state, dict) else {}

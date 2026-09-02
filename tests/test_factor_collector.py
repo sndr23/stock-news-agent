@@ -331,7 +331,7 @@ def test_partial_fx_is_recorded_as_health_failure(tmp_path, monkeypatch):
     fc.run_once(push=True)
 
     assert captured["sources"]["ok"] == 0
-    assert captured["sources"]["total"] == 14
+    assert captured["sources"]["total"] == 13  # 期权PCR 影子因子下线（OPTION_PCR_ENABLED=False）后 13 源
 
 
 def test_health_helpers_require_complete_structured_dimensions():

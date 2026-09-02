@@ -203,6 +203,24 @@ class TestFetchOptionPcr:
         monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         assert fc.fetch_option_pcr() == {}
 
+    def test_failed_roster_page_does_not_poison_same_day_cache(self, monkeypatch):
+        """分页中断后的部分名单不得写入当日缓存，下一轮必须允许重拉。"""
+        cache = {}
+        page1 = [{"f12": "1", "f14": "50ETF购8月2900"}]
+
+        def fake_get(url, params=None, **kw):
+            if "eastmoney.com" in url:
+                if params.get("pn") == 1:
+                    return _opt_page(page1, 2)
+                return ""
+            return ""
+
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+
+        assert fc.fetch_option_pcr(roster_cache=cache) == {}
+        assert cache == {}
+
     def test_sina_batch_failure_aborts_on_partial_coverage(self, monkeypatch):
         """新浪行情批失败 → 覆盖不足 → 整体放弃。"""
         roster = [{"f12": str(100 + i), "f14": "50ETF购8月2900"} for i in range(120)]

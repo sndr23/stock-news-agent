@@ -952,6 +952,72 @@ def test_render_report_shows_index_data_window():
     assert "399006完整日线：1857根，截至2026-08-26" in txt
 
 
+def test_render_report_distinguishes_intraday_snapshot_from_complete_daily_bars():
+    """盘中信号必须说明完整日线数量及当日快照，不能把 partial bar 叫完整日线。"""
+    rct = _import_rct()
+    res = {
+        "score": -0.56,
+        "core": {"score": -0.48, "signals": {
+            "trend_ma20_60": -0.4, "trend_momentum_60": -0.81,
+            "volprice_quadrant": -0.3, "volprice_amihud": -0.16,
+            "vol_regime": 0.0, "vol_term": 0.2, "value_erp": 0.0,
+            "pullback_52w": -0.95, "dd60": -1.0}},
+        "mods": {"basis": -0.02, "flow": 0.0, "mood": 0.0, "news": 0.0,
+                 "chan": {"score": -0.06, "bustop": True,
+                           "bi_dir": "down", "zone": "upper",
+                           "detail": "缠论:顶背驰,S1"},
+                 "stock": {"score": 0.0,
+                           "detail": "个股方向-1.15/指数-0.40(盘中-4.1%)（同向，主信号已覆盖）"}},
+        "caps": {"cap": 0.3, "triggers": ["宏观风险状态risk_off封顶3成"]},
+    }
+    ctx = {"intraday": -2.16, "day_amount_ratio": 0.78,
+           "history_bars": 3001, "complete_history_bars": 3000,
+           "history_last_date": "2026-09-02",
+           "complete_history_last_date": "2026-09-01",
+           "intraday_snapshot": True, "intraday_snapshot_time": "14:46",
+           "chan_structure_date": "2026-09-01",
+           "overseas_drop": 0.0}
+    dec = {"position": 0.0, "changed": False, "direction": "hold", "note": []}
+
+    txt = rct.render_report("2026-09-02", res, ctx, dec, prev_pos=0.0,
+                            health={"level": "insufficient",
+                                    "reasons": ["有效样本 5/20，观察期，健康度尚未验证"]})
+
+    assert "完整日线：3000根，截至2026-09-01" in txt
+    assert "14:46盘中快照已纳入核心评分" in txt
+    assert "量价因子使用当日盘中累计量" in txt
+    assert "完整日线：3001根" not in txt
+    assert "缠论代理（日线简化，结构截至2026-09-01）" in txt
+    assert "估值评分关闭(+0.00)" in txt
+    assert "同向，不重复计分" in txt
+    assert "观察期，健康度尚未验证" in txt
+
+
+def test_render_report_warns_when_intraday_snapshot_is_missing_during_session():
+    """盘中窗口内未拿到 partial bar 时，报告必须显式披露 d-1 回退。"""
+    rct = _import_rct()
+    res = {
+        "score": -0.4,
+        "core": {"score": -0.4, "signals": {
+            "trend_ma20_60": -0.4, "trend_momentum_60": -0.4,
+            "volprice_quadrant": 0.0, "volprice_amihud": 0.0,
+            "vol_regime": 0.0, "vol_term": 0.0, "value_erp": 0.0,
+            "pullback_52w": 0.0, "dd60": 0.0}},
+        "mods": {"basis": 0.0, "flow": 0.0, "mood": 0.0, "news": 0.0,
+                 "chan": {"score": 0.0, "detail": "缠论:中性"},
+                 "stock": {"score": 0.0, "detail": "跳过"}},
+        "caps": {"cap": 1.0, "triggers": []},
+    }
+    ctx = {"intraday": -1.0, "overseas_drop": 0.0,
+           "history_bars": 3000, "history_last_date": "2026-09-01",
+           "intraday_snapshot": False, "intraday_snapshot_required": True}
+    dec = {"position": 0.0, "changed": False, "direction": "hold", "note": []}
+
+    txt = rct.render_report("2026-09-02", res, ctx, dec, prev_pos=0.0)
+
+    assert "当日盘中快照未获取，核心评分使用最近完整日线" in txt
+
+
 def test_render_report_mods_health_marker():
     """2026-08-27 数据健康度：快照源缺失时修正行标注(缺)，区分"真实中性"与"降级0"。
 

@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import factor_collector as fc  # noqa: E402
 import real_time_push as rtp  # noqa: E402
 import signal_backtest as sb  # noqa: E402
+from src.strategy import state_io  # noqa: E402
 
 pytestmark = pytest.mark.unit  # 纯单元测试：mock 数据源，无网络无推送
 
@@ -236,9 +237,41 @@ class TestComputeWinrate:
         def _fail(*args, **kwargs):
             raise OSError("network down")
 
-        monkeypatch.setattr(sb.requests, "get", _fail)
+        monkeypatch.setattr(state_io, "urlopen", lambda *args, **kwargs: _fail())
 
         assert sb._load_realtime_state() == {}
+
+    def test_gist_content_truncation_falls_back_to_raw_url(self, monkeypatch):
+        """回测统计必须能读取 Gist 截断文件的 raw_url 完整内容。"""
+        monkeypatch.setenv("GIST_TOKEN", "tok123")
+        monkeypatch.setenv("GIST_ID", "gid123")
+        metadata = {"files": {"real_time_state.json": {
+            "content": '{"pushed_events": [',
+            "truncated": True,
+            "raw_url": "https://raw.example/real_time_state.json",
+        }}}
+
+        class _Resp:
+            def __init__(self, body):
+                self.body = body if isinstance(body, bytes) else body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return self.body
+
+        def fake_urlopen(req, timeout=15):
+            if "raw.example" in req.full_url:
+                return _Resp('{"pushed_events": [{"id": 1}]}')
+            return _Resp(json.dumps(metadata))
+
+        monkeypatch.setattr(state_io, "urlopen", fake_urlopen)
+
+        assert sb._load_realtime_state() == {"pushed_events": [{"id": 1}]}
 
     def test_non_object_local_state_degrades_to_empty(self, tmp_path, monkeypatch):
         """本地回测状态根节点不是对象时，应安全降级为空。"""
