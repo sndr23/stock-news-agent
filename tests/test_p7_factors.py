@@ -296,7 +296,30 @@ class TestFetchOptionPcr:
         out = fc.fetch_option_pcr(roster_cache=stale)
         assert out["contracts"] == 2
         assert stale["date"] != "2020-01-01"  # 成功拉取后原地回写当日名单
-        assert [list(x) for x in zip(*[[r["f12"], r["f14"]] for r in roster])] is not None
+
+    def test_primary_host_empty_data_falls_back_to_delay_mirror(self, monkeypatch):
+        """主域返回 HTTP 200 但 data 为空时必须降级镜像，不得误判命中。
+
+        2026-09-02 云端实证：主域对 fs=m:10 返回空 data（响应非空），
+        原 `if text: break` 直接采纳主域空结果 → roster=0 → 名单失败。
+        """
+        roster = [{"f12": "1", "f14": "50ETF购8月2900"},
+                  {"f12": "2", "f14": "50ETF沽8月2900"}]
+
+        def fake_get(url, params=None, **kw):
+            if "push2delay.eastmoney.com" in url:
+                return _opt_page(roster, 2)  # 镜像有数据
+            if "push2.eastmoney.com" in url:
+                return json.dumps({"data": None})  # 主域空 data
+            if "hq.sinajs.cn" in url:
+                return _sina_lines({"1": (300, "C"), "2": (100, "P")})
+            return ""
+
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        out = fc.fetch_option_pcr()
+        assert out["contracts"] == 2
+        assert out["pcr"] == pytest.approx(100 / 300, abs=0.001)
 
 
 # ============================================================

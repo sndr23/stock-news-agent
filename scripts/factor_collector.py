@@ -1155,7 +1155,10 @@ def fetch_liquidity() -> dict:
 
 
 # 东财 clist 主机池（2026-09-02）：期权名单无实时性要求，主域被拒（连接重置/
-# 反爬）时降级 push2delay 延迟镜像——仅用于合约名单，行情一律走新浪。
+# 反爬）或返回空 data 时降级 push2delay 延迟镜像——仅用于合约名单，行情一律
+# 走新浪。注意：命中判定必须是"解析出有效 diff 行"，不能只看响应非空
+# （主域会返回 HTTP 200 + data:null，此前误判命中致名单 roster=0，云端
+# run#422 起连续失败）。
 _EM_CLIST_HOSTS = (
     "https://push2.eastmoney.com",
     "https://push2delay.eastmoney.com",
@@ -1246,22 +1249,24 @@ def fetch_option_pcr(max_pages: int = 30, notes: dict = None,
         total = int(roster_cache.get("total") or len(roster))
     else:
         for pn in range(1, max_pages + 1):
-            text = ""
+            rows = []
             for host in _EM_CLIST_HOSTS:
                 text = _http_get(f"{host}/api/qt/clist/get", params={
                     "fid": "f6", "po": "1", "pz": "500", "pn": pn, "np": "1",
                     "fltt": "2", "invt": "2", "fs": "m:10", "fields": "f12,f14",
                 })
-                if text:
-                    break
-            try:
-                data = json.loads(text).get("data") or {}
-                if not isinstance(data, dict):
-                    break
-                rows = data.get("diff") or []
-                total = int(data.get("total") or 0)
-            except (AttributeError, TypeError, ValueError):
-                break
+                if not text:
+                    continue
+                try:
+                    data = json.loads(text).get("data") or {}
+                    if not isinstance(data, dict):
+                        continue
+                    rows = data.get("diff") or []
+                    total = int(data.get("total") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if rows:
+                    break  # 该主机拿到有效行才算命中；空 data 继续试下一个主机
             if not isinstance(rows, list) or not rows:
                 break
             for r in rows:
