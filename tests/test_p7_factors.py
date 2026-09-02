@@ -255,6 +255,49 @@ class TestFetchOptionPcr:
         monkeypatch.setattr(fc.time, "sleep", lambda s: None)
         assert fc.fetch_option_pcr() == {}
 
+    def test_today_roster_cache_skips_em_request(self, monkeypatch):
+        """当日名单缓存命中：不再请求东财名单，直接走行情。"""
+        cache = {"date": fc.datetime.now(fc.BJT).date().isoformat(),
+                 "total": 2, "roster": [["1", "50ETF购8月2900"], ["2", "50ETF沽8月2900"]]}
+        calls = []
+
+        def fake_get(url, params=None, **kw):
+            if "push2.eastmoney.com" in url:
+                calls.append("em")  # 命中缓存时不应发生
+                return ""
+            if "hq.sinajs.cn" in url:
+                codes = [c.replace("CON_OP_", "") for c in url.split("list=CON_OP_")[1].split(",")]
+                q = {"1": (300, "C"), "2": (100, "P")}
+                lines = []
+                for c in codes:
+                    if c not in q:
+                        continue
+                    cols = ["x"] * 46
+                    cols[41] = str(q[c][0])
+                    cols[45] = q[c][1]
+                    lines.append(f'var hq_str_CON_OP_{c}="{",".join(cols)}";')
+                return "\n".join(lines)
+            return ""
+
+        monkeypatch.setattr(fc, "_http_get", fake_get)
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        out = fc.fetch_option_pcr(roster_cache=cache)
+        assert out["contracts"] == 2
+        assert out["pcr"] == pytest.approx(100 / 300, abs=0.001)
+        assert calls == []  # 未请求东财名单
+
+    def test_yesterday_roster_cache_is_refetched(self, monkeypatch):
+        """跨日缓存失效：必须重新拉名单（合约挂牌/到期按日变）。"""
+        stale = {"date": "2020-01-01", "total": 9, "roster": [["z", "旧合约"]]}
+        roster = [{"f12": "1", "f14": "50ETF购8月2900"},
+                  {"f12": "2", "f14": "50ETF沽8月2900"}]
+        self._install(monkeypatch, {1: (roster, 2)}, {"1": (300, "C"), "2": (100, "P")})
+        monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+        out = fc.fetch_option_pcr(roster_cache=stale)
+        assert out["contracts"] == 2
+        assert stale["date"] != "2020-01-01"  # 成功拉取后原地回写当日名单
+        assert [list(x) for x in zip(*[[r["f12"], r["f14"]] for r in roster])] is not None
+
 
 # ============================================================
 # 影子维度：打分记录但不影响综合分

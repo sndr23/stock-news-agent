@@ -1214,7 +1214,8 @@ def _sina_option_quotes(codes: list, batch: int = 200) -> dict:
     return out
 
 
-def fetch_option_pcr(max_pages: int = 30, notes: dict = None) -> dict:
+def fetch_option_pcr(max_pages: int = 30, notes: dict = None,
+                     roster_cache: dict = None) -> dict:
     """期权成交量 PCR（P7-2 2026-08-19）：全市场场内期权 认沽/认购 成交量比
 
     恐慌/贪婪温度计：PCR≥1.3 恐慌对冲占优（机构买保险），≤0.55 看涨占优。
@@ -1227,39 +1228,54 @@ def fetch_option_pcr(max_pages: int = 30, notes: dict = None) -> dict:
     名单为准）。
     宁缺毋假不变：名单拉不到、行情批量全失败或覆盖不足（contracts < total）
     均判定失败，不拿部分覆盖冒充全市场 PCR。
+
+    ``roster_cache``（2026-09-02 云端不稳实证）：合约名单是日频元数据（挂牌
+    /到期只按日变），但东财 push2 域对 GitHub Actions 出口时通时断（18:00
+    拉到 668、19:00 起 roster=0），每轮都赌名单接口会让源整体不可用。
+    传入 dict 后按当日复用缓存，拉取成功时原地回写（由调用方持久化到
+    state["option_roster"]）；跨日缓存自动失效需重拉。行情始终实时请求。
     返回 {"pcr", "call_vol", "put_vol", "contracts", "total"}；无认购量返回 {}。
     """
-    # 1) 东财合约名单（代码+名称，fs=m:10 与旧口径一致；主域被拒时降级延迟镜像）
+    # 1) 合约名单：当日缓存优先，未命中才走东财（主域被拒时降级延迟镜像）
+    today = datetime.now(BJT).date().isoformat()
     roster = []  # [(code, name)]
     total = 0
-    for pn in range(1, max_pages + 1):
-        text = ""
-        for host in _EM_CLIST_HOSTS:
-            text = _http_get(f"{host}/api/qt/clist/get", params={
-                "fid": "f12", "po": "1", "pz": "500", "pn": pn, "np": "1",
-                "fltt": "2", "invt": "2", "fs": "m:10", "fields": "f12,f14",
-            })
-            if text:
+    if (isinstance(roster_cache, dict) and roster_cache.get("date") == today
+            and roster_cache.get("roster")):
+        roster = [tuple(x) for x in roster_cache["roster"] if isinstance(x, (list, tuple))]
+        total = int(roster_cache.get("total") or len(roster))
+    else:
+        for pn in range(1, max_pages + 1):
+            text = ""
+            for host in _EM_CLIST_HOSTS:
+                text = _http_get(f"{host}/api/qt/clist/get", params={
+                    "fid": "f6", "po": "1", "pz": "500", "pn": pn, "np": "1",
+                    "fltt": "2", "invt": "2", "fs": "m:10", "fields": "f12,f14",
+                })
+                if text:
+                    break
+            try:
+                data = json.loads(text).get("data") or {}
+                if not isinstance(data, dict):
+                    break
+                rows = data.get("diff") or []
+                total = int(data.get("total") or 0)
+            except (AttributeError, TypeError, ValueError):
                 break
-        try:
-            data = json.loads(text).get("data") or {}
-            if not isinstance(data, dict):
+            if not isinstance(rows, list) or not rows:
                 break
-            rows = data.get("diff") or []
-            total = int(data.get("total") or 0)
-        except (AttributeError, TypeError, ValueError):
-            break
-        if not isinstance(rows, list) or not rows:
-            break
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            code = str(r.get("f12", "") or "")
-            name = str(r.get("f14", "") or "")
-            if code:
-                roster.append((code, name))
-        if roster and total > 0 and len(roster) >= total:
-            break
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                code = str(r.get("f12", "") or "")
+                name = str(r.get("f14", "") or "")
+                if code:
+                    roster.append((code, name))
+            if roster and total > 0 and len(roster) >= total:
+                break
+        if roster and total > 0 and isinstance(roster_cache, dict):
+            roster_cache.update({"date": today, "total": total,
+                                 "roster": [list(x) for x in roster]})
     if not roster or total <= 0:
         if notes is not None:
             notes["期权PCR"] = f"东财名单失败（roster={len(roster)} total={total}，主域+延迟镜像均不可用）"
@@ -2926,11 +2942,19 @@ def run_once(push: bool, collect: bool = False) -> dict:
     # P4（2026-08-19）：涨停情绪温度计 / 行业资金流 TOP
     sentiment = fetch_zt_sentiment()
     sector_flows = fetch_sector_flows()
+    # 2026-09-02：state 加载提前到数据抓取之前——期权合约名单按日缓存
+    # （state["option_roster"]）需要在 fetch_option_pcr 时就拿到 state；
+    # 下方不再重复加载（_load_state 无副作用，仅读 Gist）。
+    state = _load_state()
+    persist = push or collect
     # P7（2026-08-19）：资金面利率（GC007）/ 期权成交量 PCR（影子因子：展示+记录，
     # 不参与方向合成，IC 回测达标后升级正式维度）
     liquidity = fetch_liquidity()
     _opt_notes = {}
-    option = fetch_option_pcr(notes=_opt_notes)
+    # 期权合约名单为日频元数据：当日缓存复用（state["option_roster"]），
+    # 避免东财名单接口偶发不可用时整源陪挂；行情每轮实时请求。
+    _roster_cache = state.setdefault("option_roster", {}) if persist else None
+    option = fetch_option_pcr(notes=_opt_notes, roster_cache=_roster_cache)
     # P8（2026-08-19）：因子池扩展——日线衍生因子（复用上证日K零请求）+
     # 分钟级因子（m5×48 当日全量，腾讯 ifzq 源）。均为影子维度。
     daily_factors = calc_daily_derived_factors(sh_kline)
@@ -2972,8 +2996,6 @@ def run_once(push: bool, collect: bool = False) -> dict:
     print(f"[数据健康度] {health['ok']}/{health['total']}"
           + (f"（缺：{'、'.join(failed)}）" if failed else ""))
 
-    state = _load_state()
-    persist = push or collect
     health_alert_sent = maybe_push_source_health_alert(
         state, sources_ok, allow_alert=persist, notes=_opt_notes)
     signals, new_history = detect_anomalies(tech, basis, fx, state.get("basis_history"))
