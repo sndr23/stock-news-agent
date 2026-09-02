@@ -1,4 +1,4 @@
-# Status（2026-09-02）
+# Status（2026-09-03）
 
 > 权威职责：当前阶段 / 当前事实 / 唯一 NEXT。由 Coordinator 维护。
 
@@ -20,7 +20,7 @@
 - **远程遗留分支已清理（2026-08-29 用户拍板）**：`codex/ranking-improvements-and-fixes`、`codex/tech-keyword-boundary-and-fixes`、`arena/01a028c8-stock-news-agent` 三分支均已删除（GitHub 删除后 90 天内可从 reflog 恢复）。删除前核查：均无未合入的有效工作（arena 的 2 个 commit 内容已在 main，codex/ranking 所改旧架构文件已不存在）。远程现仅剩 `main`。
 - **P1-1 波动率目标：暂不实施**——动态仓位缩放会改变仓位逻辑，触及"OOS 期间不调整核心权重/档位线"纪律；待 v5.1 留出样本观察期（≈20 个交易日）后再评估。
 - **P0-3 修正层 IC 验门：脚本就绪，数据不足**。验门脚本 `scripts/_exp_modifier_ic.py` 已可用（各修正项 vs next_ret/r3/r5/r10 的 Spearman IC，门槛 |IC|≥0.05 且样本≥10）。但云端影子 history **仅 5 条**（2026-08-24~28，系统 08-22 上线以来全部交易日），`next_ret` 仅 3 条有效、`r3/r5/r10` 全部未到期 → **不作任何结论**，各修正项维持原样。约需 5 个交易日（≈09-04）达 10 条门槛后可出结论。
-- 测试门禁：本轮最终结果为 **1106 passed, 21 deselected**（P0-2 +3、P1-2 +5、P1-3 +4），执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
+- 测试门禁：本轮全量结果为 **1160 passed, 21 deselected**（含盘中快照/回放、严格门禁、缓存刷新与量纲回归），执行命令为 `python -m pytest tests/ -q -m "unit" -p no:cacheprovider`。
 - **生产级审查 P0 批次（2026-08-29 凌晨）**：
   - **P0-0 生产可用性（严重缺陷已修）**：`src/strategy/data_freshness.py`、`src/strategy/state_io.py` 此前**从未提交且未被 .gitignore 排除**，而 `data.py`/`index_pe.py`/`overseas.py`/`news_link.py`/`factor_collector.py` 均依赖二者——任何 git clone 环境（含 CI）都会 ImportError。已补提交（commit `fc9ee7c`）+ 10 个新增测试 + 3 篇文档。
   - **P0-1 技术债已清理**：原 56 文件未提交（+4680/-1495）+ 48 未跟踪 → 已拆为 5 个语义 commit（`fc9ee7c` 生产可用性 / `b2490b2` 择时 v5.1 / `d742742` 数据源加固 / `bac8493` 测试 / `87c4842` 文档）。仅保留保护项未提交：`scripts/_*.py` 临时研究脚本、`_jetson_state.json`、`tmp_csindex.html`、`findings.md`、`progress.md`（其他 Agent 工作笔记）。**未 push**（待用户决定）。
@@ -37,13 +37,14 @@
 - 状态读取边界：配置 Gist 时，实时推送、因子和中信持仓状态以云端为唯一来源；云端请求失败直接 fail-stop，云端文件缺失明确为空，不回退本地旧状态。基金轮动只消费最近一个交易日内的中信持仓记录。
 - **Gist 大文件读取已加固（2026-09-02）**：API 元数据返回截断 `content` 时，统一通过 `raw_url` 读取完整 JSON，并保留严格读取失败即 fail-stop；资讯读取失败会在择时报告标记 `(缺)` 和告警，不再把读取错误伪装成中性。
 - **盘中快照口径已加固（2026-09-02）**：交易时段通过腾讯实时接口补齐 399006 当日 close/high/low/累计 amount，核心量价直接使用该 partial bar；报告区分完整历史根数和当日快照，盘中补齐失败时显式披露完整日线回退。
+- **盘中快照审计与回放已加固（2026-09-03）**：快照统一校验 `date/close/amount/amount_unit/high/low/source/captured_at`，每条择时 history 保存 `index_snapshot` 及原始价量；有快照的影子主收益按“d 收盘成交到 d+1 完整收盘”回填，旧记录明确标为 `daily_bar_proxy`，另保存快照到下一快照诊断值，净值/健康度不混算两种主收益口径。新增 `--snapshot-only` 严格门禁，缺快照时不评分、不推送、不写状态；新增 `scripts/backtest_intraday_snapshots.py`，默认拒绝缺交易日归档，允许缺口必须显式 `--allow-gaps`。
 - 生产冒烟发现：2026-08-28 本地 dry-run 读取到的 `factor_state` 快照停留在 `2026-08-25 15:53`，已按规则整体降级，不参与修正层。已为 `realtime-factor.yml` 增加北京时间 14:15 的 GitHub schedule 兜底；创业板 signal workflow 保持仅外部 14:45 触发，避免提前 schedule 写入 `last_date` 抢跑主信号；仍需核验外部定时服务和 Actions 实际运行记录。
 - 本轮最终复核：中金所异常/非 DataFrame/缺列响应均按单日失败继续回看免费链，相关回归与全量 unit 均通过；主回测和 OOS 基线未改变。
 - 本轮新增生产防线：中金所 XML 截断、字段缺失、非法数值或缺少中信多/空记录时按品种失败；目标日 IF/IH/IC/IM 不完整返回退出码 2，不推送、不写持仓历史。新浪指数全量响应的日期、收盘或成交额任一历史行非法时回退免费短链；中信日报入口统一替换 Windows 非 UTF-8 控制台无法编码的报告字符。
 - 本轮继续审核：基金轮动与择时对账入口均加载项目 `.ENV` 且保留外部环境优先；对账 `--gist-only`、损坏 Gist 状态和中信最后一次重试均已补边界保护，相关回归已通过。
 - 本轮新增 Gist 配置一致性门禁：`GIST_TOKEN` 与 `GIST_ID` 必须同时配置；完全未配置允许本地模式，只配置一个会拒绝运行，避免静默读取本地旧状态。
 - 本轮缓存边界复核：个股首次全量响应增加末根新鲜度门禁；缓存统一拒绝字符串索引和最新日期必要列无效，避免增量日期运算异常或旧值穿透；新增 3 条回归。
-- 上一轮最终复跑：`1093 passed, 21 deselected`；本次改动后的单测、主回测与 walk-forward 将在本轮验收结果中更新。历史文档中的旧回测数字不作为当前基线。
+- 上一轮最终复跑：`1093 passed, 21 deselected`；本轮已复跑完整单测、主回测与 walk-forward。历史文档中的旧回测数字不作为当前基线。
 - 本轮补充状态回归：Gist 已完整配置但读取失败时，无论本地还是 CI 均直接 fail-stop，禁止回退本地旧状态，定向与全量 unit 均通过。
 - **2026-08-28 生产链路核验**：云端 Gist `factor_state.ts=2026-08-28 05:31`(UTC) 含当日盘中数据（涨停71/主力净流出-199.5亿），健康度 12/14——**因子采集已恢复按交易日更新**；`chinext_timing_state.last_date=2026-08-27`、中信 8-26 已推、pushed_events 35 条均正常。cron-job.org 14:45 触发记录需用户在 Actions 控制台确认。
 - **2026-08-28 策略缺陷实验（严格口径，未改生产）**：① 换手优化——fee=0.3% 下 V2（CONFIRM=3）OOS +23.3%（基线 +20.3%）、OOS 回撤 -32.7%（基线 -35.5%）、换手 131（基线 262，-50%）；但 fee=0 下 C3 为负贡献（+72.1% vs +105.3%）——收益改善主要来自省摩擦成本。② 阴跌期降档——月度仓位路径证明最大回撤根因是"中继反弹高位接盘"（2017-09/10 仓位 90%、2018-04 80%）；简单趋势门收益↑回撤↑，金叉确认回撤↓但收益↓↓，**候选均不满足合入门槛**。详见 `docs/策略缺陷实验报告_20260828.md`。
@@ -54,6 +55,6 @@
 
 ## 唯一 NEXT
 
-**当前 NEXT**：v5.1（d 日快照口径 + T.35/P.25 权重）已合入工作区；当前复核基线为严格回测 +145.6% / OOS +83.7%，门禁 `1137 passed, 21 deselected` 全绿。继续观察 2026-08-29 之后的留出样本/影子期；OOS 期间不再调整核心权重/档位线。剩余人工核验项（用户侧）：在 GitHub Actions 控制台确认 cron-job.org 14:45 主触发与 `realtime-factor.yml` 外部定时实际运行记录。STR-02（不同源避险信号）保持 BACKLOG。
+**当前 NEXT**：v5.1（d 日快照口径 + T.35/P.25 权重）继续观察 2026-08-29 之后的留出样本；优先积累完整盘中快照归档并运行真实回放回测，再决定是否调整任何因子/权重/档位线。日线代理回测与真实盘中回放不得混作同一验收数字。OOS 期间不再调整核心权重/档位线。剩余人工核验项（用户侧）：在 GitHub Actions 控制台确认 cron-job.org 14:45 主触发与 `realtime-factor.yml` 外部定时实际运行记录。STR-02（不同源避险信号）保持 BACKLOG。
 
 ## 待用户决策

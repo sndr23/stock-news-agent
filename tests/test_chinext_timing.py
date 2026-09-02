@@ -745,6 +745,10 @@ def test_gather_context_keeps_intraday_snapshot(monkeypatch):
     assert len(ctx_a["highs"]) == len(ctx_a["closes"])
     assert len(ctx_a["lows"]) == len(ctx_a["closes"])
     assert ctx_a["day_amount_ratio"] > 0, "当日量能比应单独记录"
+    assert ctx_a["snapshot_quality"]["ok"] is True
+    assert ctx_a["intraday_snapshot_meta"]["date"] == "2026-08-24"
+    assert ctx_a["intraday_snapshot_meta"]["capture_time_type"] == \
+        "local_observation_time"
 
     # 情形 B：末根非当日（缓存命中，末根为昨日完整收盘）→ 不剔除，末根仍为昨日
     df_b = _make_gather_df("2026-08-21", n=70)

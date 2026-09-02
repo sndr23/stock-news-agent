@@ -2,14 +2,14 @@
 """
 创业板择时 · 核心层纯因子计算（chinext_factors.py）
 ====================================================
-v4 方案核心层：9 个注册的可回测因子，全部只依赖 399006 日线（close + amount）。
+当前核心层：9 个注册的可回测因子，全部只依赖 399006 日线（close + amount）。
 其中 value_erp 保留为估值字段，但生产核心打分不注入 ERP，因此当前实际参与核心分数的是 8 个因子，
 纯函数、无网络、无状态，可被回测与实时打分共用同一实现（杜绝两套口径）。
 
 与打分层解耦：本模块只产出"因子值（原始刻度 + 方向归一化分）"，不决定仓位。
 方向归一化分统一映射到 [-1, 1]：越大越看多，越小越看空，0=中性。
 
-因子清单（v4 定稿）：
+因子清单（注册清单，权重由下方 v5.1 配置统一提供）：
   趋势  ×2 : trend_ma20_60（双均线状态）, trend_momentum_60（60日时序动量）
   量价  ×2 : volprice_quadrant（量能分位四象限）, volprice_amihud（非流动性）
   波动  ×2 : vol_regime（20日年化vol的1年分位）, vol_term（5日/20日波动期限结构）
@@ -296,8 +296,8 @@ def defensive_state(close: Sequence[float], vol_pctile: Optional[float] = None,
 def core_signals(close: Sequence[float], amount: Sequence[float],
                  erp_pctile: Optional[Sequence[float]] = None,
                  vol_pctile_override: Optional[float] = None) -> dict:
-    """计算 v4 全部 9 个注册核心因子并列名。返回 {factor_name: [score...]}。
-    因子维度权重（v4 定稿）：趋势 0.35 量价 0.20 波动 0.20 估值 0.10 落袋 0.15。"""
+    """计算全部 9 个注册核心因子并列名，返回 ``{factor_name: [score...]}``。
+    本函数只计算因子；维度权重由 ``dimension_score`` 的调用方统一决定。"""
     return {
         "trend_ma20_60": factor_trend_ma20_60(close),
         "trend_momentum_60": factor_momentum_60(close),
@@ -309,6 +309,17 @@ def core_signals(close: Sequence[float], amount: Sequence[float],
         "pullback_52w": factor_pullback_52w(close),
         "dd60": factor_dd60(close),
     }
+
+
+# v5.1 d 日快照口径的生产权重。入口回测与盘中快照回放都从这里读取，
+# 防止“生产信号”和“回放验证”因重复字面量发生参数漂移。
+CHINEXT_V51_WEIGHTS = {
+    "趋势": 0.35,
+    "量价": 0.20,
+    "波动": 0.20,
+    "估值": 0.00,
+    "落袋": 0.25,
+}
 
 
 # ---------------- 候选因子（未接入权重，验门通过后建议接入） ----------------
@@ -333,11 +344,8 @@ def factor_short_reversal(close: Sequence[float], horizon: int = 5) -> list:
 
 
 def dimension_score(signals: dict, weights: dict = None) -> list:
-    """按 v4 维度权重合成核心综合分。signals: {name: [score...]}。返回 [score...]。
-    维度权重：趋势0.35 量价0.20 波动0.20 估值0.10 落袋0.15。"""
-    w = weights or {
-        "趋势": 0.35, "量价": 0.20, "波动": 0.20, "估值": 0.10, "落袋": 0.15,
-    }
+    """按维度权重合成核心综合分，默认使用当前 v5.1 生产配置。"""
+    w = dict(CHINEXT_V51_WEIGHTS if weights is None else weights)
     groups = {
         "趋势": ["trend_ma20_60", "trend_momentum_60"],
         "量价": ["volprice_quadrant", "volprice_amihud"],

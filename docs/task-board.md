@@ -1,4 +1,4 @@
-# Task Board（2026-08-28）
+# Task Board（2026-09-03）
 
 > 权威职责：Task / Owner / 依赖 / Allowed Paths / Acceptance。由 Coordinator 维护。
 > 状态语义：BACKLOG → READY → IN_PROGRESS → REVIEW → DONE；异常：BLOCKED。
@@ -16,6 +16,7 @@
 | STR-04 | v5.1 d日快照口径 + 权重重配 T.35/P.25 | **DONE**（2026-08-29 用户拍板；工作区已验收未单独提交） | agent | — | `scripts/run_chinext_timing.py`, `tests/**`, `docs/**` | 新基线回测 +156.0%/夏普0.60/回撤-42.5%；OOS +89.5%/夏普0.54/回撤-27.0%，卡玛差距-0.08；门禁 1092 passed + 2 个周末日期敏感既有失败（非本次回归） |
 | STR-02 | 阴跌期降档：需与趋势因子不同源的避险信号研究 | **BACKLOG**（本轮候选均不达门槛；事件硬信号 IC 验门亦未通过） | agent | STR-01 | `scripts/_*.py`（研究） | 回撤显著下降且收益不劣化；walk-forward OOS 验证；unit 全绿 |
 | STR-03 | v5 权重合入：趋势 .35→.50、落袋 .15→.10、估值死权重清零 | **DONE**（2026-08-28 用户拍板合入；工作区已验收未单独提交，与 SNA-03/05 同模式） | agent | — | `scripts/run_chinext_timing.py:755`, `docs/**` | 新基线严格回测 +153.0%/夏普0.58/回撤-41.1%；OOS +106.1%/夏普0.59/回撤-27.0%；拐点倒U+邻域高原+分折胜率6/9；门禁 `1094 passed` 全绿 |
+| STR-05 | 盘中快照审计、严格门禁与真实回放回测 | **DONE**（2026-09-03） | agent | STR-04 | `src/strategy/intraday_snapshot.py`, `src/strategy/intraday_replay.py`, `scripts/run_chinext_timing.py`, `scripts/backtest_intraday_snapshots.py`, `tests/**`, `docs/**` | 快照元数据/质量校验；`--snapshot-only` 缺快照不推送不写状态；盘中输入无前视回放且主收益对齐收盘成交→次日；缺日默认拒绝；定向与全量 unit 全绿 |
 
 ## 领取规则
 

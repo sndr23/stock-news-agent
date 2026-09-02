@@ -125,6 +125,19 @@ def _cache_frame_has_valid_close(frame: object) -> bool:
 
 _STOCK_CACHE_COLUMNS = ("open", "close", "high", "low", "volume", "amount", "turnover")
 
+_INDEX_AMOUNT_UNITS = {
+    "sina_volume": "shares",
+    "tencent_volume": "hands",
+    "eastmoney_hist": "yuan",
+    "eastmoney_push2his": "yuan",
+    "eastmoney_push2his_akshare": "yuan",
+}
+
+
+def _index_amount_unit(source: Optional[str]) -> str:
+    """返回指数 amount 的量纲，未知源不允许与已知量纲增量拼接。"""
+    return _INDEX_AMOUNT_UNITS.get(str(source or "").strip(), "unknown")
+
 
 def _last_bar_is_fresh(frame: pd.DataFrame, max_lag_days: int = 3) -> bool:
     """按最后交易日判断行情缓存是否仍可作为当前数据使用。"""
@@ -408,7 +421,7 @@ def _fetch_tencent_daily(code: str, start: str, end: str) -> Optional[pd.DataFra
 def _fetch_index_full_frame(symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """指数日线（close+amount），供量能维度使用。五级降级：
     东财hist(akshare) → push2his直连 → 腾讯日K直连 → push2his(akshare) → 新浪(无amount)。
-    amount 语义随源记录在 DataFrame.attrs 中；不同源之间禁止增量拼接。"""
+    amount 语义和量纲记录在 DataFrame.attrs 中；不同源之间禁止增量拼接。"""
     import akshare as ak
     pre = "sh" if symbol.startswith(("000", "950")) else "sz"
     secid = f"{'1' if pre == 'sh' else '0'}.{symbol}"
@@ -502,6 +515,7 @@ def _fetch_index_full_frame(symbol: str, start: str, end: str) -> Optional[pd.Da
         return None
     df = df.set_index("date").sort_index()
     df.attrs["strategy_data_source"] = source or "unknown"
+    df.attrs["strategy_amount_unit"] = _index_amount_unit(source)
     return df[df.index >= pd.Timestamp(start)]
 
 
@@ -625,6 +639,8 @@ def load_index_sina(symbol: str = "399006", datalen: int = 3000,
         # （8-31 与 9-1 核心分完全相同即铁证）。工作日口径 lag≤1 = 末根必须是
         # 今天或上一工作日；长假多拉一次全量无害，宁可重拉不可用旧数据。
         if _last_bar_is_fresh(cached, max_lag_days=1):
+            cached.attrs.setdefault("strategy_data_source", "sina_volume")
+            cached.attrs.setdefault("strategy_amount_unit", "shares")
             return cached
     url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={tsec}&scale=240&ma=no&datalen={datalen}")
@@ -679,6 +695,8 @@ def load_index_sina(symbol: str = "399006", datalen: int = 3000,
     if not _last_bar_is_fresh(df):
         logger.warning("新浪全量指数 %s 返回末根已过期，回退短链", symbol)
         return load_index_daily_full(symbol, "20190101")
+    df.attrs["strategy_data_source"] = "sina_volume"
+    df.attrs["strategy_amount_unit"] = "shares"
     _cache_set(key, df)
     return df
 
@@ -693,6 +711,8 @@ def fetch_intraday_bar_tencent(symbol: str = "399006") -> Optional[dict]:
 
     单位对齐（2026-09-01 实测）：新浪日线 amount=成交量（股）；腾讯 [36] 为
     成交量（手）→ ×100 对齐。字段位：[3]现价 [33]最高 [34]最低 [36]成交量(手)。
+    返回额外的 ``amount_unit=shares``，供快照归档审计量纲；若腾讯字段提供
+    成交额，还附带 ``amount_yuan``，用于与成交额历史源对齐。
     """
     import requests
 
@@ -727,7 +747,11 @@ def fetch_intraday_bar_tencent(symbol: str = "399006") -> Optional[dict]:
         if close is None or vol_shares is None or vol_shares < 0:
             logger.warning("腾讯实时 %s 价格/成交量非法，放弃拼当日 bar", symbol)
             return None
-        bar = {"close": close, "amount": vol_shares * 100.0}
+        bar = {"close": close, "amount": vol_shares * 100.0,
+               "amount_unit": "shares"}
+        amount_yuan = _num(37)
+        if amount_yuan is not None and amount_yuan >= 0:
+            bar["amount_yuan"] = amount_yuan
         if high is not None and low is not None and high >= close >= low:
             bar["high"] = high
             bar["low"] = low
@@ -749,14 +773,25 @@ def load_index_daily_full(symbol: str = "399006", start: str = "20220101") -> pd
         last = cached.index.max()
         inc_start = (last + timedelta(days=1)).strftime("%Y%m%d")
         cached_source = cached.attrs.get("strategy_data_source")
+        cached_unit = (cached.attrs.get("strategy_amount_unit")
+                       or _index_amount_unit(cached_source))
+        if cached_unit != "unknown":
+            cached.attrs["strategy_amount_unit"] = cached_unit
         if inc_start <= end and cached_source:
             inc = _fetch_index_full_frame(symbol, inc_start, end)
             inc_source = (inc.attrs.get("strategy_data_source")
                           if isinstance(inc, pd.DataFrame) else None)
-            if inc is not None and not inc.empty and inc_source == cached_source:
+            inc_unit = (inc.attrs.get("strategy_amount_unit")
+                        if isinstance(inc, pd.DataFrame) else None)
+            inc_unit = inc_unit or _index_amount_unit(inc_source)
+            if (inc is not None and not inc.empty
+                    and inc_source == cached_source
+                    and inc_unit == cached_unit
+                    and cached_unit != "unknown"):
                 cached = pd.concat([cached, inc])
                 cached = cached[~cached.index.duplicated(keep="last")].sort_index()
                 cached.attrs["strategy_data_source"] = cached_source
+                cached.attrs["strategy_amount_unit"] = cached_unit
                 _cache_set(key, cached)
             elif inc is not None and not inc.empty:
                 # 成交额（元）与成交量（手）不可共存于同一量价窗口，源切换时全量重建。

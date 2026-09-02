@@ -28,6 +28,7 @@ pytestmark = pytest.mark.unit
 import pandas as pd
 
 import run_chinext_timing as rct
+from src.strategy import data as sdata
 
 
 class _FakeDT(_dt.datetime):
@@ -237,6 +238,17 @@ def test_e2e_push_with_shadow_flag(monkeypatch):
     assert len(sent) == 1, "--push --shadow 必须推送"
     assert states, "--push --shadow 必须写状态"
     assert states[-1]["last_date"] == "2026-08-24"
+
+
+def test_e2e_snapshot_only_blocks_d_minus_1_fallback(monkeypatch):
+    """严格盘中模式缺当日 bar 时不推送、不写状态，禁止静默跑 d-1。"""
+    sent, states = _patch_all(monkeypatch)
+    monkeypatch.setattr(sdata, "fetch_intraday_bar_tencent", lambda *args: None)
+
+    _run(["--push", "--snapshot-only"])
+
+    assert sent == []
+    assert states == []
 
 
 def test_e2e_shadow_report_only(monkeypatch):

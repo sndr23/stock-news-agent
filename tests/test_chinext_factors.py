@@ -6,6 +6,7 @@ import pytest
 
 from src.strategy.chinext_factors import (
     defensive_state, core_signals, dimension_score,
+    CHINEXT_V51_WEIGHTS,
     factor_trend_ma20_60, factor_momentum_60, factor_volprice_quadrant,
     factor_amihud, factor_vol_regime, factor_vol_term,
     factor_pullback_52w, factor_dd60, factor_short_reversal,
@@ -63,6 +64,7 @@ def test_dimension_score_respects_weights():
     c, a = _synth_close()
     sig = core_signals(c, a, erp_pctile=[0.5] * len(c))
     comp = dimension_score(sig)
+    assert comp == dimension_score(sig, CHINEXT_V51_WEIGHTS)
     assert len(comp) == len(c)
     assert all(-1.0001 <= x <= 1.0001 for x in comp)
     # 无估值源时估值维置0，分数不应包含该维贡献（comp 在非极端处应 < 全正假设）

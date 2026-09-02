@@ -99,6 +99,8 @@ def test_index_sina_cache_fresh_hits(monkeypatch):
     df = sdata.load_index_sina("399006", datalen=10)
     assert df is fresh
     assert not hit["net"]
+    assert df.attrs["strategy_data_source"] == "sina_volume"
+    assert df.attrs["strategy_amount_unit"] == "shares"
 
 
 def test_index_sina_cache_stale_refetch(monkeypatch):
@@ -467,6 +469,8 @@ def test_fetch_index_full_frame_accepts_datetime_index_fallback(monkeypatch):
     assert out is not None
     assert out.index[-1] == today
     assert out["close"].iloc[-1] == 100.0
+    assert out.attrs["strategy_data_source"] == "tencent_volume"
+    assert out.attrs["strategy_amount_unit"] == "hands"
 
 
 def test_fetch_stock_daily_rejects_invalid_historical_field(monkeypatch):

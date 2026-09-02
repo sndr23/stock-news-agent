@@ -15,6 +15,7 @@
   python scripts/run_chinext_timing.py --dry-run    # 本地打印
   python scripts/run_chinext_timing.py --push       # 推送 + 写状态（云端）
   python scripts/run_chinext_timing.py --push --force  # 忽略同日去重，强推（复验用，如周六）
+  python scripts/run_chinext_timing.py --push --snapshot-only  # 缺盘中快照则不推送
   python scripts/run_chinext_timing.py --backtest   # 核心层历史回测验证
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -47,6 +49,11 @@ from src.strategy.data import (load_index_daily_full, load_index_sina,
                                load_stock_sina)  # noqa: E402
 from src.strategy.fund_data import get_quotes  # noqa: E402
 from src.strategy.data_freshness import BJT, _is_workday  # noqa: E402
+from src.strategy.intraday_snapshot import (  # noqa: E402
+    make_snapshot_record,
+    snapshot_time,
+    validate_snapshot,
+)
 from src.strategy.state_io import (atomic_write_json, get_gist_config,  # noqa: E402
                                    patch_gist_file)
 
@@ -139,8 +146,8 @@ def gather_context(df) -> dict:
     不用 d-1 收盘（对当日加减仓更有意义）。14:45→15:00 收盘的 15 分钟价差接受为近似。
     - 核心层 closes/amounts/highs/lows 含当日 14:45 快照（末根=当日 partial）；
     - 当日盘中信息仍走 intraday（指数涨跌幅）进入修正层/硬风控；
-    - 影子 next_ret 回填在次日运行时用 closes[i+1]/closes[i]（末根为当日快照价），
-      属"快照到快照"的近似信号评估口径，非完整收盘收益。
+    - 影子 next_ret 在 d+1 完整收盘可用后回填 closes[i+1]/closes[i]，对齐
+      场外基金的 d 收盘成交→d+1 收益；快照到下一快照只作为辅助诊断字段。
     """
     closes = df["close"].tolist()
     amounts = (df["amount"].tolist() if "amount" in df else [0.0] * len(closes))
@@ -154,6 +161,19 @@ def gather_context(df) -> dict:
         now_bj.weekday() < 5
         and dt_time(9, 30) <= now_bj.time() <= dt_time(15, 0)
     )
+    intraday_snapshot_meta = None
+    snapshot_quality = {"ok": False, "reason": "snapshot_missing",
+                        "date": None, "source": None}
+    if dates and dates[-1] == today_s:
+        intraday_snapshot_meta = _snapshot_meta_from_frame(
+            df, today_s, now_bj,
+            default_source=(df.attrs.get("strategy_data_source")
+                            if hasattr(df, "attrs") else None)
+                            or "same_day_daily_source",
+        )
+        snapshot_quality = validate_snapshot(
+            intraday_snapshot_meta or {}, expected_date=today_s)
+    intraday_snapshot_ok = bool(snapshot_quality.get("ok"))
 
     intraday = 0.0
     try:
@@ -252,9 +272,11 @@ def gather_context(df) -> dict:
             "complete_history_last_date": (
                 dates[-2] if len(dates) >= 2 and dates[-1] == today_s
                 else dates[-1] if dates else ""),
-            "intraday_snapshot": bool(dates and dates[-1] == today_s),
-            "intraday_snapshot_time": datetime.now(BJT).strftime("%H:%M")
-                if dates and dates[-1] == today_s else "",
+            "intraday_snapshot": intraday_snapshot_ok,
+            "intraday_snapshot_time": snapshot_time(intraday_snapshot_meta or {}),
+            "intraday_snapshot_source": (intraday_snapshot_meta or {}).get("source"),
+            "intraday_snapshot_meta": intraday_snapshot_meta,
+            "snapshot_quality": snapshot_quality,
             "intraday_snapshot_required": intraday_snapshot_required,
             "chan_structure_date": dates[-2] if len(dates) >= 2 else "",
             "intraday": intraday, "snapshot": snapshot,
@@ -380,7 +402,7 @@ def _chan_signal(ctx: dict) -> dict:
 def score_all(ctx: dict) -> dict:
     """v5 打分：核心层(9个注册因子、8个有效因子、五维) + 修正层(有界) + 缠论(结构) + 硬风控。"""
     closes, amounts = ctx["closes"], ctx["amounts"]
-    # 核心层：9 个注册因子 → 五维合成（v5 权重 T.50：趋势.50/量价.20/波动.20/估值0/落袋.10；
+    # 核心层：9 个注册因子 → 五维合成（v5.1 权重 T.35：趋势.35/量价.20/波动.20/估值0/落袋.25；
     # 估值维打分关闭，value_erp 不注入 → 恒为 0 不干扰总分）。
     signals = cf.core_signals(closes, amounts, erp_pctile=None)
     core_series = cf.dimension_score(signals, _default_weights(0.10))
@@ -433,7 +455,39 @@ def score_all(ctx: dict) -> dict:
     if chan["bustop"]:
         caps["cap"] = min(caps["cap"], 0.6)
         caps.setdefault("triggers", []).append("缠论顶背驰封顶6成")
-    return {"core": core, "mods": mods, "score": score, "caps": caps}
+    result = {"core": core, "mods": mods, "score": score, "caps": caps}
+    result["data_quality"] = signal_data_quality(ctx, score)
+    return result
+
+
+def signal_data_quality(ctx: dict, score: float = None) -> dict:
+    """返回输入质量，不把质量标签伪装成市场预测概率。"""
+    flags = []
+    required = bool(ctx.get("intraday_snapshot_required"))
+    snapshot_ok = bool(ctx.get("intraday_snapshot"))
+    if required and not snapshot_ok:
+        flags.append("盘中快照缺失")
+    if ctx.get("snapshot_stale"):
+        flags.append("增强快照过期")
+    if ctx.get("news_state_error"):
+        flags.append("资讯源缺失")
+    if required and snapshot_ok:
+        source = ctx.get("intraday_snapshot_source") or "unknown"
+        flags.append(f"盘中快照:{source}")
+    thresholds = [float(item[0]) for item in ct.TIERS]
+    try:
+        margin = min(abs(float(score) - threshold) for threshold in thresholds) \
+            if score is not None else None
+    except (TypeError, ValueError):
+        margin = None
+    degraded = [flag for flag in flags if not flag.startswith("盘中快照:")]
+    if required and not snapshot_ok:
+        level = "D"
+    elif degraded:
+        level = "B"
+    else:
+        level = "A"
+    return {"level": level, "flags": flags, "tier_margin": margin}
 
 
 # ---------------- 影子验证记录 ----------------
@@ -466,16 +520,38 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
     hist = state.setdefault("history", [])
     closes, dates = ctx["closes"], ctx["dates"]
     idx = {d: i for i, d in enumerate(dates)}
+    snapshot_closes = _shadow_snapshot_close_map(hist, ctx, today)
     for h in hist:
+        h_day = str(h.get("date") or "")[:10]
+        h_snapshot_close = h.get("snapshot_close")
+        try:
+            h_snapshot_close = float(h_snapshot_close)
+        except (TypeError, ValueError):
+            h_snapshot_close = None
         if h.get("next_ret") is None:
-            i = idx.get(str(h.get("date") or ""))
-            if i is not None and i + 1 < len(closes) and dates[i] < today:
+            i = idx.get(h_day)
+            next_day = dates[i + 1] if i is not None and i + 1 < len(dates) \
+                else None
+            # 快照只进入 d 日评分；影子主收益仍按 d 收盘成交→d+1 完整收盘，
+            # 因此必须等 next_day 已经不是当前盘中日后再回填。
+            if h_snapshot_close is not None:
+                if next_day and next_day < today and i + 1 < len(closes):
+                    h["next_ret"] = round(closes[i + 1] / closes[i] - 1.0, 4)
+                    h["next_ret_basis"] = "execution_close_to_next_close"
+                    next_snapshot = snapshot_closes.get(next_day)
+                    if next_snapshot is not None:
+                        h["snapshot_next_ret"] = round(
+                            next_snapshot / h_snapshot_close - 1.0, 4)
+            elif i is not None and i + 1 < len(closes) and next_day and \
+                    next_day < today:
+                # 兼容历史记录：旧记录没有快照原始值，只能明确标为日线代理。
                 h["next_ret"] = round(closes[i + 1] / closes[i] - 1.0, 4)
+                h.setdefault("next_ret_basis", "daily_bar_proxy")
         # 回填当日收盘涨幅（P1-3 执行滑点，2026-08-29）：与 14:45 的 intraday_pct
         # 配对，二者之差即"信号→成交"的 15 分钟价差。当日 14:45 运行时拿到的是
         # 盘中快照，收盘价要等次日才能取到完整值，故在这里回填（与 next_ret 同机制）。
         if h.get("close_pct") is None:
-            i = idx.get(str(h.get("date") or ""))
+            i = idx.get(h_day)
             if i is not None and i > 0 and dates[i] < today:
                 h["close_pct"] = round(closes[i] / closes[i - 1] - 1.0, 4)
         # 多期前瞻：记录"还需等几根"递减，0 时用 close 前缀补实际收益
@@ -483,17 +559,34 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                             ("fwd10_off", "r10", 10)):
             off = h.get(offk)
             if isinstance(off, (int, float)) and h.get(rk) is None:
-                i = idx.get(str(h.get("date") or ""))
+                i = idx.get(h_day)
                 if i is None:
                     continue
                 move = int(off)
+                if h_snapshot_close is not None:
+                    target_day = dates[i + k] if i + k < len(dates) else None
+                    if target_day and target_day < today:
+                        h[rk] = round(closes[i + k] / closes[i] - 1.0, 4)
+                        h[f"{rk}_basis"] = "execution_close_to_next_close"
+                        target_snapshot = snapshot_closes.get(target_day)
+                        if target_snapshot is not None:
+                            h[f"snapshot_{rk}"] = round(
+                                target_snapshot / h_snapshot_close - 1.0, 4)
+                    # 快照记录不回退到“当前盘中价”作为成交结果；缺完整收盘
+                    # 就保留待验证状态。
+                    continue
                 if move <= 0 and i + k < len(closes) and dates[i] < today:
                     base = closes[i]
                     h[rk] = round(closes[i + k] / base - 1.0, 4)
+                    h.setdefault(f"{rk}_basis", "daily_bar_proxy")
                 elif dates[i] < today:
                     h[offk] = move - 1  # 尚未到期，递减等待
     # 净值埋点（2026-08-29 P1-2）：截至本条之前的策略/基准累计净值
     _nav, _bh_nav = _cumulative_nav(hist)
+    snapshot_meta = ctx.get("intraday_snapshot_meta")
+    snapshot_quality = ctx.get("snapshot_quality") or {}
+    snapshot_record = dict(snapshot_meta) if (
+        isinstance(snapshot_meta, dict) and snapshot_quality.get("ok")) else None
     hist.append({"date": today, "score": score, "core": core_s,
                  "basis": m.get("basis", 0.0), "flow": m.get("flow", 0.0),
                  "mood": m.get("mood", 0.0), "news": m.get("news", 0.0),
@@ -503,6 +596,13 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                  "nav": _nav, "bh_nav": _bh_nav,
                  "fwd3_off": 3, "fwd5_off": 5, "fwd10_off": 10,
                  "r3": None, "r5": None, "r10": None,
+                 "index_snapshot": snapshot_record,
+                 "snapshot_quality": snapshot_quality,
+                 "snapshot_close": (snapshot_record or {}).get("close"),
+                 "snapshot_amount": (snapshot_record or {}).get("amount"),
+                 "snapshot_source": (snapshot_record or {}).get("source"),
+                 "next_ret_basis": ("execution_close_to_next_close"
+                                     if snapshot_record else "daily_bar_proxy"),
                  # 原始输入（验门增益：离散档分对 Spearman IC 分辨力弱，补原始量可直接做
                  # 原始 IC / 分层 IC，不依赖档位；snapshot 缺失的指标记 None）
                  "raw": _shadow_raw(ctx),
@@ -597,6 +697,25 @@ def _shadow_raw(ctx: dict) -> dict:
             "main_net": _mn, "down_pct": _dp, "pcr": _pcr}
 
 
+def _shadow_snapshot_close_map(hist: list, ctx: dict, today: str) -> dict:
+    """收集影子期的快照收盘价，用于严格的快照到快照前瞻收益。"""
+    out = {}
+    for item in hist:
+        day = str(item.get("date") or "")[:10]
+        value = item.get("snapshot_close")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if day and value > 0:
+            out[day] = value
+    meta = ctx.get("intraday_snapshot_meta") or {}
+    quality = validate_snapshot(meta, expected_date=today)
+    if quality.get("ok"):
+        out[today] = float(meta["close"])
+    return out
+
+
 # ---------------- 报告 ----------------
 
 def _git_commit() -> str:
@@ -621,13 +740,19 @@ def _cumulative_nav(hist: list) -> tuple:
     共同基础——从埋点日起累积，样本足够后即可量化"策略 vs 买入持有"。
     """
     nav = bh = 1.0
-    for r in hist:
+    for r in _shadow_return_records(hist):
         nr = r.get("next_ret")
-        if not isinstance(nr, (int, float)):
-            continue
         bh *= (1.0 + nr)
         nav *= (1.0 + (r.get("position") or 0.0) * nr)
     return round(nav, 6), round(bh, 6)
+
+
+def _shadow_return_records(hist: list) -> list:
+    """选取同一收益时点的影子记录，避免代理与实时口径混算。"""
+    valid = [r for r in hist if isinstance(r.get("next_ret"), (int, float))]
+    snapshot = [r for r in valid
+                if r.get("next_ret_basis") == "execution_close_to_next_close"]
+    return snapshot or valid
 
 
 def strategy_health(hist: list, window: int = 20,
@@ -644,7 +769,7 @@ def strategy_health(hist: list, window: int = 20,
         {"ok": bool, "level": "ok"|"alert"|"insufficient",
          "reasons": [str], "stats": dict}
     """
-    recs = [r for r in hist if isinstance(r.get("next_ret"), (int, float))]
+    recs = _shadow_return_records(hist)
     if len(recs) < window:
         return {"ok": True, "level": "insufficient",
                 "reasons": [f"有效样本 {len(recs)}/{window}，观察期，健康度尚未验证"
@@ -796,15 +921,26 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
     if dar:
         lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子使用当日盘中累计量）")
     if ctx.get("intraday_snapshot"):
+        snapshot_source = ctx.get("intraday_snapshot_source") or "unknown"
         lines.append(
             f"■ 数据：399006完整日线：{ctx.get('complete_history_bars', '-')}根，"
             f"截至{ctx.get('complete_history_last_date') or '-'}；"
-            f"{ctx.get('intraday_snapshot_time') or '当日'}盘中快照已纳入核心评分")
+            f"{ctx.get('intraday_snapshot_time') or '当日'}盘中快照已纳入核心评分"
+            f"（来源 {snapshot_source}）")
     else:
         fallback = ("；⚠ 当日盘中快照未获取，核心评分使用最近完整日线"
                     if ctx.get("intraday_snapshot_required") else "")
+        reason = (ctx.get("snapshot_quality") or {}).get("reason")
+        if fallback and reason and reason != "snapshot_missing":
+            fallback += f"（校验:{reason}）"
         lines.append(f"■ 数据：399006完整日线：{ctx.get('history_bars', len(ctx.get('closes') or []))}根，"
                      f"截至{ctx.get('history_last_date') or '-'}{fallback}")
+    quality = res.get("data_quality") or signal_data_quality(ctx, res.get("score"))
+    quality_note = "；".join(quality.get("flags") or []) or "核心输入可用"
+    margin = quality.get("tier_margin")
+    if isinstance(margin, (int, float)):
+        quality_note += f"；距最近档位线{margin:.2f}"
+    lines.append(f"■ 数据质量：{quality.get('level', 'B')}（{quality_note}）")
     if caps["triggers"]:
         lines.append("■ 硬风控：" + "；".join(caps["triggers"]))
         # 澄清主因：档位基准未越封顶线时，硬风控只是背景约束而非空仓/降档主因
@@ -891,6 +1027,84 @@ def _snapshot_is_stale(snapshot: dict, today_s: str = None) -> bool:
     return parsed.strftime("%Y-%m-%d") != today_s
 
 
+_AMOUNT_UNIT_BY_SOURCE = {
+    "sina_volume": "shares",
+    "tencent_volume": "hands",
+    "eastmoney_hist": "yuan",
+    "eastmoney_push2his": "yuan",
+    "eastmoney_push2his_akshare": "yuan",
+}
+
+
+def _frame_amount_unit(df) -> str:
+    """读取指数历史 amount 量纲；旧/测试 DataFrame 按项目默认股数处理。"""
+    attrs = getattr(df, "attrs", {})
+    unit = str(attrs.get("strategy_amount_unit") or "").strip().lower()
+    if unit in ("shares", "hands", "yuan"):
+        return unit
+    source = str(attrs.get("strategy_data_source") or "").strip()
+    return _AMOUNT_UNIT_BY_SOURCE.get(source, "shares")
+
+
+def _convert_snapshot_amount(bar: dict, target_unit: str) -> float | None:
+    """把腾讯快照量转换为完整日线相同量纲，无法转换则返回 None。"""
+    try:
+        amount = float(bar.get("amount"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount) or amount < 0:
+        return None
+    source_unit = str(bar.get("amount_unit") or "shares").strip().lower()
+    if source_unit == target_unit:
+        return amount
+    if source_unit == "shares" and target_unit == "hands":
+        return amount / 100.0
+    if source_unit == "hands" and target_unit == "shares":
+        return amount * 100.0
+    if target_unit == "yuan":
+        try:
+            value = float(bar.get("amount_yuan"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+    return None
+
+
+def _snapshot_meta_from_frame(df, day: str, captured_at,
+                              default_source: str) -> dict | None:
+    """从日线末根或拼接结果提取可审计的当日快照元数据。"""
+    existing = getattr(df, "attrs", {}).get("intraday_snapshot_meta")
+    if isinstance(existing, dict) and str(existing.get("date") or "")[:10] == day:
+        return dict(existing)
+    try:
+        if df.empty or pd.Timestamp(df.index.max()).strftime("%Y-%m-%d") != day:
+            return None
+        row = df.iloc[-1]
+        return make_snapshot_record(
+            date=day,
+            close=row.get("close"),
+            amount=row.get("amount"),
+            high=row.get("high"),
+            low=row.get("low"),
+            source=default_source,
+            captured_at=captured_at,
+            capture_time_type="local_observation_time",
+            amount_unit=_frame_amount_unit(df),
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def snapshot_gate(ctx: dict, strict: bool = False) -> dict:
+    """严格盘中模式的纯门禁；默认模式仍允许免费源降级。"""
+    if not strict or not ctx.get("intraday_snapshot_required"):
+        return {"ok": True, "reason": "not_required"}
+    quality = ctx.get("snapshot_quality") or {}
+    if ctx.get("intraday_snapshot") and quality.get("ok"):
+        return {"ok": True, "reason": "ok"}
+    return {"ok": False, "reason": quality.get("reason") or "snapshot_missing"}
+
+
 def _completed_bar_count(df) -> int:
     """统计当前日期之前的完整日线根数，排除盘中、未来和非法日期。"""
     try:
@@ -917,8 +1131,7 @@ def _default_weights(val_w: float) -> dict:
     T.35/P.25 OOS +96.8%/夏普0.60/回撤-23.6% vs T.50 +83.8%/0.55/-25.4%——
     d 日快照已含当日涨跌，趋势因子时效性已够，提权趋势反而追当日涨跌；
     落袋（反向离场）在快照口径下更有价值。详见 docs/策略缺陷实验报告_20260828.md 第七章。"""
-    return {"趋势": 0.35, "量价": 0.20, "波动": 0.20,
-            "估值": 0.00, "落袋": 0.25}
+    return dict(cf.CHINEXT_V51_WEIGHTS)
 
 
 def backtest_metrics(df, fee: float = 0.0, pe_map: Optional[dict] = None,
@@ -1038,7 +1251,7 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
     ds, s = m["dates"], m["start"]
     dodge = m["down_dodge"]
     return "\n".join([
-        f"创业板仓位信号·v5核心层回测（{ds[s].date()} ~ {ds[-1].date()}，"
+        f"创业板仓位信号·v5.1核心层回测（{ds[s].date()} ~ {ds[-1].date()}，"
         f"{m['n_navs']}个交易日，成本{fee:.1%}/次）", "",
         f"策略累计 {m['total']:+.1%} / 年化 {m['cagr']:+.1%} / 夏普 {m['sharpe']:.2f} / "
         f"最大回撤 {m['mdd']:.1%} / 卡玛 {m['calmar']:.2f}",
@@ -1055,13 +1268,14 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
 # ---------------- 主流程 ----------------
 
 def _append_intraday_bar_if_needed(df, symbol: str):
-    """盘中拿不到当日日线 bar 时，用腾讯实时构造当日 partial bar 拼到末尾。
+    """交易时段用腾讯实时刷新/构造当日 partial bar，拼入核心输入。
 
     背景（2026-09-01 排查）：GitHub Actions 海外出口盘中拉新浪全量拿不到当日
     实时 bar（末根最多到昨日收盘）——v5.1"信号日 d 用 d 日 14:45 快照"口径
     （ND-004 拍板）在云端从未生效，实盘一直跑 d-1 收盘口径。本守卫把实盘
     信息集对齐回已拍板口径：仅交易日 09:30~15:00 且 df 末根早于今天时拼接；
-    腾讯失败则保持 d-1 口径原样返回（宁可滞后不要假数据）。
+    即使缓存已有当天末根也必须刷新；腾讯失败则移除未确认的当天末根，
+    保持 d-1 口径（宁可滞后不要假数据）。
     """
     from src.strategy.data import fetch_intraday_bar_tencent
 
@@ -1070,23 +1284,77 @@ def _append_intraday_bar_if_needed(df, symbol: str):
         return df
     if not (dt_time(9, 30) <= now.time() <= dt_time(15, 0)):
         return df
-    if df.index.empty or pd.Timestamp(df.index.max()).normalize() >= pd.Timestamp(now.date()):
-        return df  # 已含当日 bar（本地国内出口新浪盘中本就含），无需拼接
+    today_ts = pd.Timestamp(now.date())
+    has_today = bool(
+        not df.index.empty
+        and pd.Timestamp(df.index.max()).normalize() == today_ts
+    )
+    source_attrs = getattr(df, "attrs", {})
+    has_loader_provenance = bool(
+        source_attrs.get("strategy_data_source")
+        or source_attrs.get("intraday_snapshot_meta")
+    )
+    if has_today and not has_loader_provenance:
+        # 外部传入的当天 bar 没有数据源元数据时，视为调用方已完成快照注入；
+        # 生产加载器会显式写入来源，只有带来源的缓存才走下面的实时刷新。
+        return df
+    if not df.index.empty and pd.Timestamp(df.index.max()).normalize() > today_ts:
+        return df  # 已含未来 bar，无法用当前时钟判断其是否为快照
+
+    # 即使缓存已经有当天末根，交易时段也必须重新取一次实时源；否则缓存
+    # 可能来自早盘/上一次运行，却会被误报成当前 14:45 快照。
     bar = fetch_intraday_bar_tencent(symbol)
     if not bar:
+        if has_today:
+            # 未确认的当天末根不进入核心评分，默认模式回到最近完整日线；
+            # 严格模式随后由 snapshot_gate 拒绝，避免静默使用旧盘中值。
+            out = df.loc[df.index.normalize() != today_ts].copy()
+            out.attrs.update(getattr(df, "attrs", {}))
+            out.attrs["intraday_snapshot_unverified"] = True
+            logger.warning("当日盘中 bar 刷新失败，移除未确认的当日末根，保持 d-1 收盘口径")
+            return out
         logger.warning("当日盘中 bar 拼接失败，保持 d-1 收盘口径（新浪海外出口拿不到当日实时 bar）")
         return df
-    today_ts = pd.Timestamp(now.date())
-    row = {"close": bar["close"], "amount": bar["amount"]}
+    meta = make_snapshot_record(
+        date=today_ts.strftime("%Y-%m-%d"),
+        close=bar.get("close"),
+        amount=_convert_snapshot_amount(bar, _frame_amount_unit(df)),
+        high=bar.get("high"), low=bar.get("low"),
+        source=bar.get("source") or "tencent_realtime",
+        captured_at=now,
+        amount_unit=_frame_amount_unit(df),
+    )
+    quality = validate_snapshot(meta, expected_date=today_ts.strftime("%Y-%m-%d"))
+    if not quality.get("ok"):
+        if has_today:
+            out = df.loc[df.index.normalize() != today_ts].copy()
+            out.attrs.update(getattr(df, "attrs", {}))
+            out.attrs["intraday_snapshot_unverified"] = True
+        else:
+            out = df
+        logger.warning("当日盘中 bar 校验失败（%s），保持 d-1 收盘口径", quality["reason"])
+        return out
+    base = df.copy()
+    if has_today:
+        base = base.loc[base.index.normalize() != today_ts].copy()
+    # 低级回退源有时只有 close/amount；把腾讯快照的高低价补成列，
+    # 否则验证层会在拼接后看不到刚拿到的高低价而错误拒绝快照。
+    for col in ("high", "low"):
+        if col in bar and col not in base.columns:
+            base[col] = float("nan")
+    row = {"close": bar["close"], "amount": meta["amount"]}
     if "high" in bar:
         row["high"] = bar["high"]
     if "low" in bar:
         row["low"] = bar["low"]
-    for col in df.columns:
+    for col in base.columns:
         row.setdefault(col, float("nan"))
-    appended = pd.DataFrame(row, index=[today_ts])[df.columns.tolist()]
-    out = pd.concat([df, appended])
+    appended = pd.DataFrame(row, index=[today_ts])[base.columns.tolist()]
+    out = pd.concat([base, appended])
     out.index = pd.to_datetime(out.index)
+    out.attrs.update(getattr(df, "attrs", {}))
+    out.attrs.pop("intraday_snapshot_unverified", None)
+    out.attrs["intraday_snapshot_meta"] = meta
     logger.info("已拼接当日盘中快照 bar（%s close=%.2f amount=%.0f）——实盘信息集对齐 d 日快照口径",
                 today_ts.date(), bar["close"], bar["amount"])
     return out
@@ -1100,6 +1368,10 @@ def main():
     ap.add_argument("--push", action="store_true", help="推送 + 写状态（云端定时）")
     ap.add_argument("--backtest", action="store_true", help="核心层历史回测")
     ap.add_argument("--shadow", action="store_true", help="影子期因子IC报告")
+    ap.add_argument(
+        "--snapshot-only", action="store_true",
+        help="严格盘中模式：交易时段缺少有效当日快照时不评分、不推送、不写状态",
+    )
     ap.add_argument("--force", action="store_true",
                     help="忽略同日去重，强制推送（手动复验用，如周六再验一次）")
     args = ap.parse_args()
@@ -1169,6 +1441,11 @@ def main():
 
     today = datetime.now(BJT).strftime("%Y-%m-%d")
     ctx = gather_context(df)
+    gate = snapshot_gate(ctx, strict=args.snapshot_only)
+    if not gate["ok"]:
+        logger.error("严格盘中模式拒绝执行：快照校验失败（%s）", gate["reason"])
+        print(f"（snapshot-only：未推送、未写状态；原因 {gate['reason']}）")
+        return
     res = score_all(ctx)
 
     state = load_state()

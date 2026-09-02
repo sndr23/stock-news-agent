@@ -24,6 +24,11 @@ on:
         required: false
         default: false
         type: boolean
+      snapshot_only:
+        description: "严格盘中模式（缺当日快照则不评分、不推送、不写状态）"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: chinext-timing
@@ -68,11 +73,14 @@ jobs:
 
       - name: 执行仓位信号推送
         run: |
+          args="--push --shadow"
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            python scripts/run_chinext_timing.py --push --shadow --force
-          else
-            python scripts/run_chinext_timing.py --push --shadow
+            args="$args --force"
           fi
+          if [ "${{ github.event.inputs.snapshot_only }}" = "true" ]; then
+            args="$args --snapshot-only"
+          fi
+          python scripts/run_chinext_timing.py $args
 
       - name: 上传日志（调试用）
         if: always()
