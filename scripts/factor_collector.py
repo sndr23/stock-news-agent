@@ -1162,7 +1162,7 @@ _EM_CLIST_HOSTS = (
 )
 
 
-def _sina_option_quotes(codes: list, batch: int = 60) -> dict:
+def _sina_option_quotes(codes: list, batch: int = 200) -> dict:
     """新浪 hq.sinajs.cn 批量期权行情：{code: (成交量, "C"/"P")}。
 
     2026-09-02 换源实证：CON_OP_ 响应（GBK，约 48 列）中 [41]=成交量（张）、
@@ -1171,14 +1171,25 @@ def _sina_option_quotes(codes: list, batch: int = 60) -> dict:
     [41]='-'（当日无成交，远月虚值合约常态）按 0 计入覆盖，对齐旧东财 f5=0
     口径；仅响应行缺失/列数不足才视为数据缺失（不计覆盖，宁缺毋假）。
     新浪系规则：Referer 必须 finance.sina.com.cn，rotate_ua=False。
+
+    批量节奏（2026-09-02 云端限流实证）：hq.sinajs.cn 对 GitHub Actions
+    海外出口在连续 5 次请求后断流（60/批×12 批 → quotes=300/668 即 5 批），
+    本地不限。batch 200（URL 实测 3225B，4 批覆盖 668 合约全量返回）+
+    批间 2s + 失败批退避重试（8s/16s），把请求数压到限流阈值之下。
     """
     out = {}
     for i in range(0, len(codes), batch):
         part = codes[i:i + batch]
-        text = _http_get(
-            "https://hq.sinajs.cn/list=" + ",".join(f"CON_OP_{c}" for c in part),
-            headers={"Referer": "https://finance.sina.com.cn"},
-            encoding="gbk", rotate_ua=False)
+        text = ""
+        for attempt in range(3):  # 失败批退避重试：0s/8s/16s
+            if attempt:
+                time.sleep(8 * attempt)
+            text = _http_get(
+                "https://hq.sinajs.cn/list=" + ",".join(f"CON_OP_{c}" for c in part),
+                headers={"Referer": "https://finance.sina.com.cn"},
+                encoding="gbk", rotate_ua=False)
+            if text:
+                break
         if not text:
             continue
         for line in text.splitlines():
@@ -1199,7 +1210,7 @@ def _sina_option_quotes(codes: list, batch: int = 60) -> dict:
                 vol = 0.0
             out[code] = (vol, cp if cp in ("C", "P") else None)
         if i + batch < len(codes):
-            time.sleep(0.3)  # 分批间隔，降低批量请求风控压力
+            time.sleep(2)  # 批间间隔，压在云端限流阈值之下
     return out
 
 
