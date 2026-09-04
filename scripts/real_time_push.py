@@ -651,6 +651,20 @@ _NOISE_INDEX_NAMES = _INDEX_TOKENS + ["KOSPI", "恒生指数", "综合指数"] +
     # "柴油"用"柴油期货/柴油价格"避免误伤"柴油车/柴油发电机"类标题。
     "美元指数", "美元兑日元", "日元", "WTI", "原油期货", "柴油期货", "柴油价格",
 ]
+# 外盘科技龙头个股行情播报（2026-09-04 验收回放实证："SK海力士涨幅扩大至5%
+# 三星电子涨逾3%"被推送——外盘公司不在指数名单漏网）。
+# 公司名有事件语义（"台积电营收上涨10%"是产业信号），不能进 _NOISE_INDEX_NAMES
+# 用宽泛词表（"上涨/下跌"会误伤财务新闻），改用严格数字涨幅措辞组合：
+# 仅"公司名 + 盘中涨跌幅播报措辞"同时命中才拦，"SK海力士扩产 HBM"类
+# 事件新闻不含严格措辞不误拦。
+_NOISE_OVERSEAS_STOCK_NAMES = [
+    "SK海力士", "三星电子", "台积电", "美光", "铠侠", "英伟达", "AMD", "英特尔",
+]
+_NOISE_OVERSEAS_STOCK_MOVE = [
+    "涨超", "跌超", "涨逾", "跌逾", "涨幅扩大", "跌幅扩大", "涨幅扩大至",
+    "跌幅扩大至", "现报", "开涨", "开跌", "收涨", "收跌", "涨幅超过", "跌幅超过",
+    "涨幅超", "跌幅超", "创新高", "创新低", "盘中涨", "盘中跌",
+]
 
 # 同实体跨日报道的事件短语锚（2026-08-11 修复：索尼×台积电合资 48h 三推实证——
 # "拟合资建厂" vs "批准成立合资企业" 实体顺序相反（索尼在前 vs 台积电在前），
@@ -833,6 +847,12 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
         return "栏目汇总"
     if any(i in title for i in _NOISE_INDEX_NAMES) and any(m in title for m in _NOISE_INDEX_MOVE):
         return "指数播报"
+    # 2026-09-04 验收回放实证："SK海力士涨幅扩大至5% 三星电子涨逾3%"被推送——
+    # 外盘科技龙头不在指数名单漏网。公司名+严格数字涨幅措辞组合拦截；
+    # 事件性新闻（"SK海力士扩产 HBM""台积电营收上涨10%"）不含严格措辞不误拦。
+    if (any(i in title for i in _NOISE_OVERSEAS_STOCK_NAMES)
+            and any(m in title for m in _NOISE_OVERSEAS_STOCK_MOVE)):
+        return "外盘个股播报"
     if any(m in title for m in _NOISE_INTRADAY_MARKERS):
         is_leader = bool(judge.get("is_leader_stock")) or _hit_watchlist(news, leader_watchlist)
         if not is_leader:
@@ -1376,10 +1396,14 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
     If-Match 头自上线起即被 GitHub 一律拒绝（400），曾致云端零写入 62+ 小时。
     并发安全依赖 workflow concurrency 串行 + 单文件提交；patch_gist_file
     内部自带重试。禁止给 Gist PATCH 加 If-Match/If-None-Match。
+    2026-09-04 验收修复：去掉 indent=2——缩进空格使 743KB 的 JSON 膨胀到
+    917KB，超出 Gist GET content 截断线（~900KB，实测 917KB 文件 content
+    截到 70.8 万字符），每轮 load 被迫走 raw_url 回退慢路径；继续增长逼近
+    1MB 硬限将致 PATCH 写入直接失败。紧凑序列化立省 ~174KB（19%）。
     """
     patch_gist_file(
         GIST_STATE_FILENAME,
-        json.dumps(state, ensure_ascii=False, indent=2),
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
         token, gist_id,
     )
 
