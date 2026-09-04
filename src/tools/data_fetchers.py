@@ -693,6 +693,91 @@ def _fetch_em_industry_news():
     return news
 
 
+# 持仓公告例行程过滤（2026-09-04）：H股每日/每月披露报表、会议资料、
+# 投资者关系记录等高频零信息公告，源级剔除降低下游 LLM 判定负担。
+_WATCHLIST_ROUTINE_MARKERS = (
+    "翌日披露报表", "月报表", "会议资料", "投资者关系管理信息", "投资者关系活动记录",
+)
+
+
+def _watchlist_codes() -> list:
+    """读取 watchlist.json 的持仓股票代码（供持仓公告定向查询）"""
+    try:
+        wl_path = Path(__file__).resolve().parent.parent.parent / "watchlist.json"
+        wl = json.loads(wl_path.read_text(encoding="utf-8"))
+        codes, names = [], {}
+        for s in wl.get("stocks", []) or []:
+            code = str(s.get("code", "") or "").strip() if isinstance(s, dict) else ""
+            name = str(s.get("name", "") or "").strip() if isinstance(s, dict) else str(s).strip()
+            if code:
+                codes.append(code)
+                names[code] = name
+        return [{"code": c, "name": names[c]} for c in codes]
+    except Exception:
+        return []
+
+
+def _fetch_watchlist_announcements():
+    """持仓个股公告 (东财公告API按代码定向, 免费)
+
+    2026-09-04 新增：按 watchlist.json 代码批量直查持仓公告（单次调用拉全部
+    持仓 ~50 条）。既有 get_announcements 拉全市场公告（1000+ 条/天）从未进
+    推送管线（噪声过大），东财 col=349 公告频道是全市场流（每轮仅 10 条，
+    持仓公告极易滚出窗口）——本源按代码定向，无窗口滚出风险，直接命中
+    用户核心关注（质押/回购/订单/业绩预告等持仓事件）。
+    例行程（H股报表/会议资料/投资者关系记录）源级剔除。
+    """
+    stocks = _watchlist_codes()
+    if not stocks:
+        logger.warning("watchlist.json 无持仓代码，跳过持仓公告源")
+        return []
+    code_list = ",".join(s["code"] for s in stocks)
+    name_by_code = {s["code"]: s["name"] for s in stocks}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://data.eastmoney.com/",
+    }
+    url = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+    params = {
+        "sr": -1, "page_size": 50, "page_index": 1, "ann_type": "A",
+        "client_source": "web", "stock_list": code_list,
+    }
+    news = []
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=(3, 8))
+        resp.raise_for_status()
+        data = resp.json()
+        items = (data.get("data") or {}).get("list") or []
+        for item in items:
+            title = str(item.get("title", "") or item.get("title_ch", "") or "").strip()
+            if not title:
+                continue
+            if any(m in title for m in _WATCHLIST_ROUTINE_MARKERS):
+                continue
+            pub_time = str(item.get("display_time") or item.get("notice_date") or "").strip()
+            if not _in_news_window(pub_time, look_back_days=1):
+                continue
+            codes = [str(c.get("stock_code", "") or "") for c in (item.get("codes") or [])]
+            code = codes[0] if codes else ""
+            art_code = str(item.get("art_code", "") or "")
+            link = (f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
+                    if code and art_code else "")
+            news.append({
+                "title": title,
+                "source": "持仓公告",
+                "content": title,
+                "published_at": pub_time,
+                "url": link,
+                "affected_stocks": [name_by_code.get(code, "")] if name_by_code.get(code) else [],
+                "category": "news",
+                "sentiment": "neutral",
+            })
+        logger.info(f"持仓公告: 原始{len(items)}条, 当日{len(news)}条")
+    except Exception as e:
+        logger.warning(f"持仓公告获取失败: {e}")
+    return news
+
+
 # Google News RSS 查询词（持仓相关定向，when:1d 限定当日）
 # 2026-09-04 P1-2：由宏观类（global economy/Fed/crude oil/gold）改为持仓产业链定向，
 # 与 watchlist（中际旭创/新易盛/生益科技等光模块-PCB-CCL 产业链）对齐。
@@ -1182,6 +1267,7 @@ def get_stock_news(data_mode: str = "live") -> list:
         _fetch_jin10_news: "金十数据",
         _fetch_yicai_news: "第一财经",
         _fetch_em_industry_news: "东财行业资讯",
+        _fetch_watchlist_announcements: "持仓公告",
         _fetch_google_news: "Google News",
     })
 
