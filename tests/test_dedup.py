@@ -454,3 +454,89 @@ class TestNewSources0904:
         src = inspect.getsource(fn)
         assert "_fetch_yicai_news" in src
         assert "_fetch_em_industry_news" in src
+        assert "_fetch_watchlist_announcements" in src
+
+
+# ============================================================
+# 2026-09-04 持仓公告定向源（watchlist 代码批量直查）
+# ============================================================
+
+class TestWatchlistAnnouncements:
+    """持仓公告源：按代码定向 + 例行程过滤 + 窗口过滤（mock，无网络）。"""
+
+    def _today(self):
+        return datetime.now(BJT).strftime("%Y-%m-%d")
+
+    def _fake_resp(self, payload):
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+        return FakeResp()
+
+    def test_parses_and_carries_stock_name(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        payload = {"data": {"list": [{
+            "title": "新易盛:关于回购公司股份的公告",
+            "display_time": f"{self._today()} 18:30:00",
+            "notice_date": f"{self._today()} 00:00:00",
+            "art_code": "AN202609041234",
+            "codes": [{"stock_code": "300502"}],
+        }]}}
+        monkeypatch.setattr(df, "_watchlist_codes",
+                            lambda: [{"code": "300502", "name": "新易盛"}])
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: self._fake_resp(payload))
+        out = df._fetch_watchlist_announcements()
+        assert len(out) == 1
+        assert out[0]["source"] == "持仓公告"
+        assert out[0]["affected_stocks"] == ["新易盛"]
+        assert "300502" in out[0]["url"] and "AN202609041234" in out[0]["url"]
+
+    def test_routine_announcements_filtered(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        payload = {"data": {"list": [
+            {"title": "中际旭创:H股公告(翌日披露报表)",
+             "display_time": f"{self._today()} 08:00:00", "codes": [{"stock_code": "300308"}]},
+            {"title": "南亚新材:2026年第三次临时股东会会议资料",
+             "display_time": f"{self._today()} 08:00:00", "codes": [{"stock_code": "688519"}]},
+            {"title": "中际旭创:关于实际控制人部分股票解除质押的公告",
+             "display_time": f"{self._today()} 09:00:00", "codes": [{"stock_code": "300308"}]},
+        ]}}
+        monkeypatch.setattr(df, "_watchlist_codes",
+                            lambda: [{"code": "300308", "name": "中际旭创"}])
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: self._fake_resp(payload))
+        out = df._fetch_watchlist_announcements()
+        assert len(out) == 1 and "解除质押" in out[0]["title"]
+
+    def test_old_announcements_filtered(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        old = (datetime.now(BJT) - timedelta(days=10)).strftime("%Y-%m-%d")
+        payload = {"data": {"list": [{
+            "title": "新易盛:重大合同公告",
+            "display_time": f"{old} 10:00:00", "codes": [{"stock_code": "300502"}],
+        }]}}
+        monkeypatch.setattr(df, "_watchlist_codes",
+                            lambda: [{"code": "300502", "name": "新易盛"}])
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: self._fake_resp(payload))
+        assert df._fetch_watchlist_announcements() == []
+
+    def test_empty_watchlist_skips(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        called = []
+        monkeypatch.setattr(df, "_watchlist_codes", lambda: [])
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: called.append(1))
+        assert df._fetch_watchlist_announcements() == []
+        assert not called
+
+    def test_api_failure_returns_empty(self, monkeypatch):
+        from src.tools import data_fetchers as df
+
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(df, "_watchlist_codes",
+                            lambda: [{"code": "300308", "name": "中际旭创"}])
+        monkeypatch.setattr(df.requests, "get", boom)
+        assert df._fetch_watchlist_announcements() == []

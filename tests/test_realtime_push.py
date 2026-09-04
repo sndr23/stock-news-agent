@@ -2516,3 +2516,35 @@ class TestGistCompactSerialization:
         compact = len(_json.dumps(state, ensure_ascii=False, separators=(",", ":")))
         indent2 = len(_json.dumps(state, ensure_ascii=False, indent=2))
         assert compact < indent2 * 0.85, "紧凑序列化应显著小于 indent 版本"
+
+
+# ============================================================
+# 2026-09-04 持仓公告源配套：预筛直通扩展 watchlist 持仓名
+# ============================================================
+
+class TestPrefilterWatchlistDirectPass:
+    """持仓名直通预筛（公告标题常无高信号词，不直通会被 0.14 分静默丢弃）。"""
+
+    def test_holdings_titles_direct_pass(self, monkeypatch):
+        monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", ["新易盛", "源杰科技"])
+        for t in [
+            "源杰科技:关于完成工商变更登记并换发营业执照的公告",
+            "新易盛:关于向特定对象发行股票的公告",
+        ]:
+            _, hit = rtp._prefilter({"title": t, "content": "", "category": "news"})
+            assert hit, f"持仓公告应直通 LLM 判定: {t}"
+
+    def test_generic_company_still_not_bypassed(self, monkeypatch):
+        monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", ["新易盛", "源杰科技"])
+        _, hit = rtp._prefilter({"title": "某公司召开例行股东大会",
+                                 "content": "", "category": "news"})
+        assert not hit
+
+    def test_empty_watchlist_degrades_to_original(self, monkeypatch):
+        monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", [])
+        assert not rtp._hit_headline_entity("生益科技:半年度利润分配实施公告")
+
+    def test_headline_entity_hit_via_watchlist_name(self, monkeypatch):
+        monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", ["生益科技"])
+        assert rtp._hit_headline_entity("生益科技:半年度利润分配实施公告")
+        assert not rtp._hit_headline_entity("无主体词的普通标题")

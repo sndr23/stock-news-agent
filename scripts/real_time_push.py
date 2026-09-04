@@ -1710,11 +1710,33 @@ _PREFILTER_HEADLINE_ENTITIES = [
 ]
 
 
+_PREF_WATCHLIST_NAMES_CACHE: list | None = None
+
+
+def _pref_watchlist_names() -> list:
+    """预筛直通用持仓名单（懒加载缓存；watchlist.json 缺失时为空表退化为原行为）"""
+    global _PREF_WATCHLIST_NAMES_CACHE
+    if _PREF_WATCHLIST_NAMES_CACHE is None:
+        try:
+            _PREF_WATCHLIST_NAMES_CACHE = sorted(_load_leader_watchlist())
+        except Exception:
+            _PREF_WATCHLIST_NAMES_CACHE = []
+    return _PREF_WATCHLIST_NAMES_CACHE
+
+
 def _hit_headline_entity(text: str) -> bool:
-    """是否命中预筛直通主体词（科技龙头/重要主体）"""
+    """是否命中预筛直通主体词（科技龙头/重要主体）
+
+    2026-09-04 扩展：watchlist 持仓股名同样直通——持仓公告源（质押/回购/
+    订单等）标题常无高信号词（"源杰科技:关于完成工商变更登记的公告"），
+    不直通会被预筛静默丢弃，与"资讯聚焦持仓"的产品定位冲突。
+    直通仅跳过预筛门槛，最终是否推送仍由 LLM 判定把关。
+    """
     if not text:
         return False
-    return any(e in text for e in _PREFILTER_HEADLINE_ENTITIES)
+    if any(e in text for e in _PREFILTER_HEADLINE_ENTITIES):
+        return True
+    return any(w in text for w in _pref_watchlist_names())
 
 
 def _prefilter(news: dict) -> tuple:
