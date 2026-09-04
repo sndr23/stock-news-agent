@@ -2537,6 +2537,11 @@ class TestAudit0904NightFixes:
         ]:
             assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
 
+    def test_capital_flow_column_blocked(self):
+        """资金流向数据播报栏目拦截（近一周审核实证 9-01 推送）。"""
+        title = "主力资金流向前十大个股 金十数据9月1日讯 截至2026年09月01日"
+        assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()) == "栏目汇总"
+
 
 class TestGistCompactSerialization:
     """Gist 写入必须紧凑序列化（无 indent），防 state 膨胀超 Gist content 截断线。"""
