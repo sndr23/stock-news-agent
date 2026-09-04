@@ -2463,3 +2463,56 @@ class TestPushedEventsSource:
         assert pushed, "应至少推送一条"
         assert all(e.get("source") for e in pushed), "pushed_events 必须带 source 字段"
         assert pushed[0]["source"] == "财联社"
+
+
+# ============================================================
+# 2026-09-04 验收修复：外盘个股行情播报拦截 + Gist 紧凑序列化
+# ============================================================
+
+class TestOverseasStockNoise:
+    """外盘科技龙头个股纯行情播报拦截（验收实证："SK海力士涨幅扩大至5%"被推送）。"""
+
+    def test_overseas_stock_move_blocked(self):
+        for title in [
+            "SK海力士涨幅扩大至5% 三星电子涨逾3%",
+            "美光盘初涨超4%",
+            "台积电现报1020新台币",
+            "英伟达收跌3.2%",
+        ]:
+            assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+    def test_overseas_stock_event_not_blocked(self):
+        """事件性新闻不误拦（公司名有事件语义，宽泛词"上涨"不得触发）。"""
+        for title in [
+            "SK海力士宣布扩产HBM 产能翻倍",
+            "台积电二季度营收上涨10% AI需求超预期",
+            "英伟达发布新一代AI芯片",
+            "美光计划年内大幅扩产HBM",
+            "英特尔获美国政府10亿美元芯片补贴",
+        ]:
+            assert not rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+
+class TestGistCompactSerialization:
+    """Gist 写入必须紧凑序列化（无 indent），防 state 膨胀超 Gist content 截断线。"""
+
+    def test_gist_save_compact_no_indent(self, monkeypatch):
+        captured = {}
+
+        def fake_patch(fname, content, token, gist_id):
+            captured["content"] = content
+
+        monkeypatch.setattr(rtp, "patch_gist_file", fake_patch)
+        rtp._gist_save("tok", "gid", {"seen": {"a": {"t": "1", "pushed": True}},
+                                      "pending": {}, "pushed_events": []})
+        content = captured["content"]
+        assert "\n" not in content and ": " not in content, "Gist 写入不得带缩进/换行"
+        assert json.loads(content)["seen"]["a"]["pushed"] is True  # 可正常解析
+
+    def test_compact_saves_bytes_vs_indent(self):
+        import json as _json
+        state = {"seen": {f"fp{i}": {"t": "2026-09-04 10:00:00", "pushed": False,
+                                     "title": "示例标题" * 4} for i in range(1000)}}
+        compact = len(_json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+        indent2 = len(_json.dumps(state, ensure_ascii=False, indent=2))
+        assert compact < indent2 * 0.85, "紧凑序列化应显著小于 indent 版本"
