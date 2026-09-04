@@ -2288,3 +2288,178 @@ class TestPruneSeen:
 
     def test_empty_ok(self):
         assert rtp._prune_seen({}) == {}
+
+
+# ============================================================
+# P1-1 pending 主动重注入（2026-09-04）
+# ============================================================
+
+class TestPendingReinject:
+    """pending 挂起条目存全量 payload，滚出源窗口后主动重注入候选流。"""
+
+    def test_pend_payload_keeps_judge_fields(self):
+        n = {"title": "中际旭创获大额订单 800G 光模块放量",
+             "content": "公司公告称获得海外大客户订单",
+             "source": "财联社", "published_at": "2026-09-04 10:00:00",
+             "url": "https://x", "category": "news"}
+        p = rtp._pend_payload(n)
+        assert p["title"] == n["title"]
+        assert p["content"] == n["content"]
+        assert p["source"] == "财联社"
+        assert p["published_at"] == "2026-09-04 10:00:00"
+        # 截断防 Gist 体积膨胀
+        long = {"title": "长" * 200, "content": "长" * 300}
+        p2 = rtp._pend_payload(long)
+        assert len(p2["title"]) <= 80
+        assert len(p2["content"]) <= 120
+
+    def test_reinject_skips_seen_and_fetched(self):
+        item_a = {"title": "A 事件", "content": "a", "source": "财联社",
+                  "published_at": "2026-09-04 10:00:00"}
+        item_b = {"title": "B 事件", "content": "b", "source": "财联社",
+                  "published_at": "2026-09-04 10:00:00"}
+        item_c = {"title": "C 事件", "content": "c", "source": "财联社",
+                  "published_at": "2026-09-04 10:00:00"}
+        fp_a, fp_b, fp_c = (rtp._news_fingerprint(x) for x in (item_a, item_b, item_c))
+        pending = {
+            fp_a: {"t": "2026-09-04 10:00:00", "retry": 2, "title": "A",
+                   "payload": rtp._pend_payload(item_a)},
+            fp_b: {"t": "2026-09-04 10:00:00", "retry": 1, "title": "B",
+                   "payload": rtp._pend_payload(item_b)},
+            fp_c: {"t": "2026-09-04 10:00:00", "retry": 0, "title": "C",
+                   "payload": rtp._pend_payload(item_c)},
+        }
+        # fp_b 本轮已重新抓到（走正常增量检测），fp_c 已落 seen → 都不重注入
+        news_list = [item_b]
+        seen = {fp_c: {"t": "2026-09-04 10:00:00", "pushed": False}}
+        out = rtp._reinject_pending_items(pending, news_list, seen)
+        assert [n["_fp"] for n in out] == [fp_a]
+        assert out[0]["_pend_retry"] == 2
+        assert out[0]["_from_pending"] is True
+
+    def test_reinject_skips_records_without_payload(self):
+        """旧版 pending 记录（无 payload）跳过，等自然过期，不崩溃。"""
+        pending = {"fp_x": {"t": "2026-09-04 10:00:00", "retry": 3, "title": "X"}}
+        assert rtp._reinject_pending_items(pending, [], {}) == []
+
+    def test_reinject_empty_pending(self):
+        assert rtp._reinject_pending_items({}, [], {}) == []
+
+    def test_reinject_sorts_by_retry_desc(self):
+        pending = {
+            "fp1": {"retry": 1, "payload": {"title": "1", "content": "1", "source": "s",
+                                            "published_at": "2026-09-04 10:00:00"}},
+            "fp2": {"retry": 5, "payload": {"title": "2", "content": "2", "source": "s",
+                                            "published_at": "2026-09-04 10:00:00"}},
+            "fp3": {"retry": 3, "payload": {"title": "3", "content": "3", "source": "s",
+                                            "published_at": "2026-09-04 10:00:00"}},
+        }
+        out = rtp._reinject_pending_items(pending, [], {})
+        assert [n["_fp"] for n in out] == ["fp2", "fp3", "fp1"]
+
+    def test_pending_stores_payload_on_overflow(self, monkeypatch, tmp_path):
+        """候选溢出时 pending 记录必须带 payload（供下轮主动重注入）。"""
+        from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
+        from src.tools.calculators import _EVENT_KEYWORD_GROUPS
+        ev_kws = set()
+        for _g, kws in _EVENT_KEYWORD_GROUPS:
+            ev_kws.update(kws)
+        kws = [kw for kw in HIGH_SIGNAL_KEYWORDS if kw not in ev_kws][:45]
+        news_list = [{
+            "title": "主体%d %s 动态" % (i, kw),
+            "content": "%s 相关事项" % kw,
+            "source": "财联社",
+            "published_at": "2026-09-04 10:00:00",
+            "affected_stocks": ["主体%d" % i],
+        } for i, kw in enumerate(kws)]
+
+        news = type("T", (), {"func": staticmethod(lambda: news_list)})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
+            "push": True, "score": 8, "direction": "bullish", "scope": "market",
+            "sectors": [], "entities": [], "is_leader_stock": False,
+            "reason": "宏观"} for _ in items])
+        monkeypatch.setenv("RT_MAX_CANDIDATES", "40")
+
+        rtp.run_once(dry_run=False)
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert saved["pending"], "应有 pending 条目"
+        assert all("payload" in rec for rec in saved["pending"].values()), \
+            "pending 记录必须带 payload 供主动重注入"
+
+
+# ============================================================
+# P1-2 Google News 查询词定向化 + 关键词预筛（2026-09-04）
+# ============================================================
+
+class TestGoogleNewsTargeting:
+    """Google News 由宏观类查询改为持仓产业链定向，并做关键词预筛。"""
+
+    def test_queries_are_holdings_oriented(self):
+        import src.tools.data_fetchers as df
+        joined = " ".join(df.GOOGLE_NEWS_QUERIES).lower()
+        # 持仓相关主题词必须出现
+        for kw in ["optical", "cpo", "nvidia", "semiconductor", "pcb"]:
+            assert kw in joined, f"查询词缺少持仓相关主题: {kw}"
+        # 原宏观类查询词不得残留
+        for old in ["global economy", "crude oil", "gold price"]:
+            assert old not in joined, f"宏观类查询词应移除: {old}"
+        # 全部限定当日
+        for q in df.GOOGLE_NEWS_QUERIES:
+            assert "when:1d" in q
+
+    def test_keyword_prefilter_keeps_holdings_news(self):
+        import src.tools.data_fetchers as df
+        hay = "Nvidia unveils new AI chip for data centers".lower()
+        assert any(kw in hay for kw in df._GOOGLE_NEWS_KEYWORDS)
+
+    def test_keyword_prefilter_rejects_unrelated(self):
+        import src.tools.data_fetchers as df
+        hay = "Global economy slows as oil prices fall".lower()
+        assert not any(kw in hay for kw in df._GOOGLE_NEWS_KEYWORDS)
+
+
+# ============================================================
+# P1-3 pushed_events 补存 source（2026-09-04，每源贡献率可审计）
+# ============================================================
+
+class TestPushedEventsSource:
+    """已推事件记录必须带 source，供每源推送贡献率审计。"""
+
+    def test_pushed_events_carry_source(self, monkeypatch, tmp_path):
+        news_list = [{
+            "title": "中际旭创 800G 光模块获海外大单",
+            "content": "公司公告获得海外大客户订单",
+            "source": "财联社",
+            "published_at": "2026-09-04 10:00:00",
+            "affected_stocks": ["中际旭创"],
+        }]
+        news = type("T", (), {"func": staticmethod(lambda: news_list)})()
+        sig = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", sig)
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "_llm_judge", lambda items, **kw: [{
+            "push": True, "score": 8, "direction": "bullish", "scope": "market",
+            "sectors": [], "entities": [], "is_leader_stock": False,
+            "reason": "重大订单"} for _ in items])
+
+        rtp.run_once(dry_run=False)
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        pushed = saved.get("pushed_events") or []
+        assert pushed, "应至少推送一条"
+        assert all(e.get("source") for e in pushed), "pushed_events 必须带 source 字段"
+        assert pushed[0]["source"] == "财联社"

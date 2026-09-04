@@ -159,6 +159,11 @@ STATE_WINDOW_HOURS_UNPUSHED = 24
 # 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
 MAX_PENDING_RETRY = 3
 
+# pending 序列化字节上限（2026-09-04 P1-1 新增）：挂起条目带全量 payload 后
+# 体积上升，200 条 × ~700B ≈ 140KB，叠加 seen(700KB)+pushed/candidate(210KB)
+# 需守住 Gist 单文件 1MB 硬限。超限按时间裁剪到 150 条。
+PENDING_MAX_BYTES = 200_000
+
 # seen 指纹条数上限（2026-08-13 P0 新增）：48h 清理后仍超上限则按时间保留最新。
 # 此前 seen 无上限（峰值 4759 条 → 状态文件 0.72MB），Gist 写入截断损坏是
 # "状态被覆盖清空"事故的诱因。
@@ -186,6 +191,13 @@ def _est_seen_bytes(seen: dict, sample: int = 200) -> int:
     if not seen:
         return 0
     return len(json.dumps(seen, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def _est_pending_bytes(pending: dict) -> int:
+    """pending 序列化后的精确字节数（2026-09-04 P1-1：带 payload 后体积兜底用）"""
+    if not pending:
+        return 0
+    return len(json.dumps(pending, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
 def _prune_seen(seen: dict, max_items: int = SEEN_MAX,
@@ -1418,6 +1430,46 @@ def _pending_same_as_pushed(pend_title: str, pushed_title: str) -> bool:
     return shorter >= 6 and _lcs_len(pend_title, pushed_title) / shorter >= 0.5
 
 
+def _pend_payload(n: dict) -> dict:
+    """pending 挂起条目的全量 payload（2026-09-04 P1-1 主动重注入用）。
+
+    溢出条目滚出源窗口（如财联社 20 条滚动窗）后，此前只能等重新被抓取
+    （fp 相同）才重回判定，否则永久躺 pending 到 48h 过期。存全量 payload
+    供下轮主动重注入。只保留预筛/LLM 判定所需字段，截断控 Gist 体积
+    （中文 UTF-8 每字符 3 字节，200 条 × ~700B ≈ 140KB）。"""
+    return {
+        "title": str(n.get("title", "") or "")[:80],
+        "content": str(n.get("content", "") or "")[:120],
+        "source": str(n.get("source", "") or "")[:30],
+        "published_at": str(n.get("published_at", "") or "")[:30],
+    }
+
+
+def _reinject_pending_items(pending: dict, news_list: list, seen: dict) -> list:
+    """pending 主动重注入（2026-09-04 P1-1）：返回本轮未重新抓取到的挂起条目。
+
+    只重注入带 payload 的记录（旧版无 payload 的 pending 记录跳过，等自然过期）；
+    已在本轮 news_list 中重新抓到的条目走正常增量检测路径，不重复注入；
+    已落 seen 的条目跳过。按 retry 从大到小排序（老条目优先进入判定）。"""
+    if not pending:
+        return []
+    fetched_fps = {_news_fingerprint(n) for n in news_list}
+    reinject = []
+    for fp, rec in pending.items():
+        if fp in seen or fp in fetched_fps:
+            continue
+        payload = rec.get("payload")
+        if not payload:
+            continue
+        n = dict(payload)
+        n["_fp"] = fp
+        n["_pend_retry"] = int(rec.get("retry", 0))
+        n["_from_pending"] = True
+        reinject.append(n)
+    reinject.sort(key=lambda x: x["_pend_retry"], reverse=True)
+    return reinject
+
+
 def _event_sig_key(e: dict) -> str:
     """事件签名内容键（状态合并去重用）"""
     return ("|".join(sorted(e.get("entities") or [])) + "#"
@@ -1525,6 +1577,9 @@ def save_state(state: dict) -> None:
         pending.pop(fp, None)
     if len(pending) > 200:
         pending = dict(sorted(pending.items(), key=lambda kv: kv[1].get("t", ""))[-200:])
+    # 2026-09-04 P1-1：pending 带 payload 后按字节兜底（Gist 1MB 硬限）
+    if _est_pending_bytes(pending) > PENDING_MAX_BYTES:
+        pending = dict(sorted(pending.items(), key=lambda kv: kv[1].get("t", ""))[-150:])
     state["pending"] = pending
     if pend_expired or len(pending) != len(state.get("pending", {})):
         logger.info(f"清理过期挂起重试 {len(pend_expired)} 条，剩余 {len(pending)} 条")
@@ -2715,6 +2770,17 @@ def run_once(dry_run: bool = False) -> dict:
         n["_fp"] = fp
         n["_pend_retry"] = int((pending.get(fp) or {}).get("retry", 0))
         new_items.append(n)
+
+    # 2026-09-04 P1-1 修复：pending 条目主动重注入——滚出源窗口的挂起条目
+    # 此前只能等重新被抓取（fp 相同）才重回判定，财联社 20 条滚动窗内溢出
+    # 条目 1-2 轮后即永久躺 pending 到 48h 过期（实证：特斯拉 Cybercab retry=1
+    # 挂 18h 从未进判定）。溢出时已存全量 payload，这里把本轮未重新抓到的
+    # pending 条目按 retry 从大到小补注入候选流（老条目优先）。
+    reinject = _reinject_pending_items(pending, news_list, seen)
+    if reinject:
+        new_items = reinject + new_items
+        logger.info(f"pending 主动重注入 {len(reinject)} 条（滚出源窗口的挂起条目）")
+
     logger.info(f"增量检测: 新增 {len(new_items)} 条（已见 {len(news_list) - len(new_items)} 条）")
     if not new_items:
         logger.info("无新增资讯，本轮结束")
@@ -2766,8 +2832,10 @@ def run_once(dry_run: bool = False) -> dict:
                                   "title": str(n.get("title", ""))[:60] + "[溢出放弃]"}
                 logger.info(f"候选溢出重试{retry}轮仍无法进入判定，放弃: {n.get('title', '')[:40]}")
             else:
+                # 2026-09-04 P1-1：存全量 payload，滚出源窗口后下轮主动重注入
                 pending[n["_fp"]] = {"t": now_for_pend, "retry": retry,
-                                     "title": str(n.get("title", ""))[:60]}
+                                     "title": str(n.get("title", ""))[:60],
+                                     "payload": _pend_payload(n)}
         logger.info(f"候选超过上限({max_candidates})，溢出 {len(overflow)} 条进入挂起重试")
         overflow_fps = {n["_fp"] for n in overflow}
     else:
@@ -2975,8 +3043,10 @@ def run_once(dry_run: bool = False) -> dict:
             # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
+            # 2026-09-04 P1-3：补存 source，供每源推送贡献率审计。
             pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
-                                  "title": str(n.get("title", ""))[:60]})
+                                  "title": str(n.get("title", ""))[:60],
+                                  "source": str(n.get("source", "") or "")[:30]})
             pushed += 1
         else:
             # 推送标题直接用新闻原文标题（避免显示"重要资讯"占位符）
@@ -2986,7 +3056,8 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
                 pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
-                                      "title": str(n.get("title", ""))[:60]})
+                                      "title": str(n.get("title", ""))[:60],
+                                      "source": str(n.get("source", "") or "")[:30]})
                 pushed += 1
             else:
                 # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）

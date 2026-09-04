@@ -579,14 +579,23 @@ def _fetch_jin10_news():
     return []
 
 
-# Google News RSS 查询词（国际宏观/大宗商品/权威通讯社覆盖，when:1d 限定当日）
+# Google News RSS 查询词（持仓相关定向，when:1d 限定当日）
+# 2026-09-04 P1-2：由宏观类（global economy/Fed/crude oil/gold）改为持仓产业链定向，
+# 与 watchlist（中际旭创/新易盛/生益科技等光模块-PCB-CCL 产业链）对齐。
 GOOGLE_NEWS_QUERIES = [
-    "global economy when:1d",
-    "Federal Reserve when:1d",
-    "crude oil when:1d",
-    "gold price when:1d",
-    "china economy when:1d",
+    "optical transceiver OR optical module when:1d",
+    "co-packaged optics OR CPO when:1d",
+    "Nvidia AI chip data center when:1d",
+    "semiconductor China when:1d",
+    "PCB copper clad laminate when:1d",
 ]
+# Google News 关键词预筛：仅保留持仓相关（光模块/CPO/PCB/CCL/AI算力/半导体）
+# 英文 RSS 噪音多（"optical" 可命中光学镜片等无关内容），源级预筛降低下游 LLM 判定负担
+_GOOGLE_NEWS_KEYWORDS = (
+    "optical", "transceiver", "co-packaged", "cpo", "data center", "datacenter",
+    "nvidia", "ai chip", "semiconductor", "chip", "pcb", "copper clad", "laminat",
+    "hbm", "800g", "1.6t", "silicon photonic", "innolight", "eoptolink",
+)
 # 单次拉取上限：防止国际快讯淹没 A 股主体资讯
 GOOGLE_NEWS_MAX_ITEMS = 30
 
@@ -652,6 +661,11 @@ def _fetch_google_news():
             desc = _txt("description")
             desc = _re.sub(r"<[^>]+>", "", desc)
             desc = _html.unescape(desc).strip()
+
+            # 2026-09-04 P1-2：关键词预筛，仅保留持仓相关条目（光模块/CPO/PCB/CCL/AI算力）
+            haystack = f"{title} {desc}".lower()
+            if not any(kw in haystack for kw in _GOOGLE_NEWS_KEYWORDS):
+                continue
 
             news.append({
                 "title": title,
