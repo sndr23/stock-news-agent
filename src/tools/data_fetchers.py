@@ -579,6 +579,120 @@ def _fetch_jin10_news():
     return []
 
 
+def _fetch_yicai_news():
+    """第一财经资讯 (直接API, 免费, 国内可直连)
+
+    第一财经官方资讯流: 宏观政策/产业动态/公司公告/监管, 权威财经媒体。
+    与现有快讯源（东财/财联社/新浪等短平快）互补——提供完整新闻而非电报式
+    快讯，覆盖现有源缺失的深度/综合维度。API 返回最近 20 条, 无分页。
+    CreateDate 为 ISO 格式 (2026-09-04T19:14:32)，_in_news_window 已支持。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.yicai.com/",
+    }
+    url = "https://www.yicai.com/api/ajax/getlatest"
+    params = {"page": 1, "pagesize": 20}
+    _YICAI_TIMEOUT = (3, 5)  # connect 3s + read 5s, 最坏 3+5+2+3+5=18s < per_source_timeout=30s
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=_YICAI_TIMEOUT)
+            resp.raise_for_status()
+            items = resp.json()
+            if not isinstance(items, list) or not items:
+                logger.warning("第一财经: API返回空")
+                return []
+
+            news = []
+            for item in items:
+                title = str(item.get("NewsTitle", "") or "").strip()
+                if not title:
+                    continue
+                pub_time = str(item.get("CreateDate", "") or "").strip()
+                if not _in_news_window(pub_time, look_back_days=1):
+                    continue
+                content = str(item.get("NewsNotes", "") or "").strip()
+                source = str(item.get("NewsSource", "") or "").strip() or "第一财经"
+                news.append({
+                    "title": title,
+                    "source": source,
+                    "content": content,
+                    "published_at": pub_time,
+                    "url": str(item.get("NewsUrl", "") or "").strip(),
+                    "category": "news",
+                    "sentiment": "neutral",
+                })
+
+            logger.info(f"第一财经: 原始{len(items)}条, 当日{len(news)}条"
+                        + (f" (第{attempt+1}次尝试成功)" if attempt > 0 else ""))
+            return news
+        except Exception as e:
+            if attempt < max_retries:
+                import time as _time
+                _time.sleep(2)
+                logger.warning(f"第一财经第{attempt+1}次请求失败: {e}, 2s后重试...")
+            else:
+                logger.warning(f"第一财经获取失败(已重试{max_retries}次): {e}")
+    return []
+
+
+# 东财行业资讯频道（2026-09-04 新增）：column=348 科技/半导体/产业（命中持仓
+# 光模块/CPO/AI 主题），column=349 个股公告（命中持仓个股）。聚合财联社/
+# 证券时报/每经等多家媒体，与现有东财快讯（akshare 全球快讯）内容维度互补。
+_EM_INDUSTRY_COLUMNS = (348, 349)
+_EM_INDUSTRY_PAGE_SIZE = 10
+
+
+def _fetch_em_industry_news():
+    """东财行业资讯 (直接API, 免费, 国内可直连)
+
+    聚合多家媒体（财联社/证券时报/每经/中证网等）的行业资讯:
+    - column=348: 科技/半导体/产业动态（直接命中持仓光模块/CPO/AI 主题）
+    - column=349: 个股公告（直接命中持仓个股）
+    每频道返回最近 10 条, 无分页。showTime 为 "%Y-%m-%d %H:%M:%S"。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://finance.eastmoney.com/",
+    }
+    url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
+    news = []
+    for col in _EM_INDUSTRY_COLUMNS:
+        params = {
+            "client": "web", "biz": "web_news_col", "column": col,
+            "order": 1, "needInteractData": 0, "page_index": 1,
+            "page_size": _EM_INDUSTRY_PAGE_SIZE, "req_trace": 1,
+        }
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=(3, 5))
+            resp.raise_for_status()
+            data = resp.json()
+            items = (data.get("data") or {}).get("list") or []
+            for item in items:
+                title = str(item.get("title", "") or "").strip()
+                if not title:
+                    continue
+                pub_time = str(item.get("showTime", "") or "").strip()
+                if not _in_news_window(pub_time, look_back_days=1):
+                    continue
+                content = str(item.get("summary", "") or "").strip()
+                source = str(item.get("mediaName", "") or "").strip() or "东财行业"
+                news.append({
+                    "title": title,
+                    "source": source,
+                    "content": content,
+                    "published_at": pub_time,
+                    "url": str(item.get("url", "") or "").strip(),
+                    "category": "news",
+                    "sentiment": "neutral",
+                })
+        except Exception as e:
+            logger.warning(f"东财行业资讯(col={col})获取失败: {e}")
+    logger.info(f"东财行业资讯: 当日{len(news)}条")
+    return news
+
+
 # Google News RSS 查询词（持仓相关定向，when:1d 限定当日）
 # 2026-09-04 P1-2：由宏观类（global economy/Fed/crude oil/gold）改为持仓产业链定向，
 # 与 watchlist（中际旭创/新易盛/生益科技等光模块-PCB-CCL 产业链）对齐。
@@ -1066,6 +1180,8 @@ def get_stock_news(data_mode: str = "live") -> list:
         _fetch_futu_news: "富途全球快讯",
         _fetch_wallstreetcn_news: "华尔街见闻",
         _fetch_jin10_news: "金十数据",
+        _fetch_yicai_news: "第一财经",
+        _fetch_em_industry_news: "东财行业资讯",
         _fetch_google_news: "Google News",
     })
 

@@ -330,3 +330,127 @@ class TestDedupAndCapForDisplay:
         assert "草案" in out[0]["title"]
 
 pytestmark = pytest.mark.unit  # 纯单元测试：无网络/无真实 LLM 调用
+
+
+# ============================================================
+# 2026-09-04 新增新闻源：第一财经 + 东财行业资讯
+# ============================================================
+
+class TestNewSources0904:
+    """新增源解析与接入验证（mock requests，无网络）。"""
+
+    def _today(self):
+        return datetime.now(BJT).strftime("%Y-%m-%d")
+
+    def test_yicai_parses_items(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        payload = [{
+            "NewsTitle": "中际旭创：实控人解除质押135万股",
+            "CreateDate": f"{self._today()}T19:16:56",
+            "NewsNotes": "中际旭创公告摘要",
+            "NewsSource": "第一财经",
+            "NewsUrl": "https://www.yicai.com/news/1.html",
+        }]
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: FakeResp())
+        out = df._fetch_yicai_news()
+        assert len(out) == 1
+        assert out[0]["title"] == "中际旭创：实控人解除质押135万股"
+        assert out[0]["source"] == "第一财经"
+        assert out[0]["published_at"] == f"{self._today()}T19:16:56"
+
+    def test_yicai_empty_payload(self, monkeypatch):
+        from src.tools import data_fetchers as df
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: FakeResp())
+        assert df._fetch_yicai_news() == []
+
+    def test_yicai_filters_old_items(self, monkeypatch):
+        """超出当日窗口的条目被过滤。"""
+        from src.tools import data_fetchers as df
+        old = (datetime.now(BJT) - timedelta(days=10)).strftime("%Y-%m-%d")
+        payload = [{
+            "NewsTitle": "旧闻",
+            "CreateDate": f"{old}T10:00:00",
+            "NewsNotes": "",
+            "NewsSource": "第一财经",
+            "NewsUrl": "",
+        }]
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: FakeResp())
+        assert df._fetch_yicai_news() == []
+
+    def test_em_industry_parses_both_columns(self, monkeypatch):
+        """两个 column（科技+个股公告）都被抓取。"""
+        from src.tools import data_fetchers as df
+        payload = {"data": {"list": [{
+            "title": "群联：明年NAND Flash供应仍吃紧",
+            "showTime": f"{self._today()} 19:00:41",
+            "summary": "AI带动的半导体需求才刚开始",
+            "mediaName": "财联社",
+            "url": "http://finance.eastmoney.com/news/1.html",
+        }]}}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: FakeResp())
+        out = df._fetch_em_industry_news()
+        assert len(out) == len(df._EM_INDUSTRY_COLUMNS)  # 每个 column 各 1 条
+        assert out[0]["source"] == "财联社"
+        assert out[0]["title"] == "群联：明年NAND Flash供应仍吃紧"
+
+    def test_em_industry_filters_old_items(self, monkeypatch):
+        from src.tools import data_fetchers as df
+        old = (datetime.now(BJT) - timedelta(days=10)).strftime("%Y-%m-%d")
+        payload = {"data": {"list": [{
+            "title": "旧闻",
+            "showTime": f"{old} 10:00:00",
+            "summary": "",
+            "mediaName": "财联社",
+            "url": "",
+        }]}}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+
+        monkeypatch.setattr(df.requests, "get", lambda *a, **k: FakeResp())
+        assert df._fetch_em_industry_news() == []
+
+    def test_new_sources_registered_in_get_stock_news(self):
+        """两个新源已接入 get_stock_news 的并行抓取。"""
+        import inspect
+        from src.tools import data_fetchers as df
+        fn = df.get_stock_news.func if hasattr(df.get_stock_news, "func") else df.get_stock_news
+        src = inspect.getsource(fn)
+        assert "_fetch_yicai_news" in src
+        assert "_fetch_em_industry_news" in src
