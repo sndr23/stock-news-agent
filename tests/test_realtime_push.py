@@ -2493,6 +2493,51 @@ class TestOverseasStockNoise:
             assert not rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
 
 
+class TestAudit0904NightFixes:
+    """2026-09-04 晚推送日志审计三项修复的回归。"""
+
+    def test_precious_metals_index_noise_blocked(self):
+        """贵金属行情播报拦截（实证：现货黄金日内跌幅扩大至2% 被推送）。"""
+        for title in [
+            "现货黄金日内跌幅扩大至2%",
+            "伦敦金现短线走低0.5%",
+            "COMEX黄金期货收涨1.2%",
+        ]:
+            assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+    def test_precious_metals_event_not_blocked(self):
+        """黄金事件性新闻不误拦（不含涨跌措辞）。"""
+        for title in [
+            "央行增持黄金储备 持续买入黄金",
+            "现货黄金需求因央行购金创纪录",
+        ]:
+            assert not rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+    def test_intraday_phrase_variants_blocked(self):
+        """盘面措辞变体拦截（实证：集体高开/延续强势/连板 被推送）。"""
+        for title in [
+            "智能驾驶概念集体高开 大众交通2连板",
+            "AI应用概念延续强势 易点天下涨超10%",
+        ]:
+            assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+    def test_major_corporate_event_exempt_from_intraday(self):
+        """盘面词仅是背景、核心是重大治理事件时放行（防误拦）。"""
+        for title in [
+            "涨停芯片股背后藏雷！实控人、总经理双双被留置，控股股东的持股100%冻结",
+            "三连板妖股突遭立案调查 涉嫌信息披露违法违规",
+        ]:
+            assert not rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+    def test_pure_intraday_still_blocked_with_exempt_words_absent(self):
+        """无重大事件词的纯盘面异动仍拦（例外不得扩大化）。"""
+        for title in [
+            "液冷服务器概念持续下挫 浪潮信息逼近跌停",
+            "半导体巨头三安光电放量涨停",
+        ]:
+            assert rtp._is_noise_push({"title": title}, {"is_leader_stock": False}, set()), title
+
+
 class TestGistCompactSerialization:
     """Gist 写入必须紧凑序列化（无 indent），防 state 膨胀超 Gist content 截断线。"""
 
