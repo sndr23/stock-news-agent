@@ -1535,6 +1535,46 @@ class TestNoiseFilter:
         for t in ok:
             assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "", t
 
+    def test_foreign_market_quote_filtered(self):
+        """2026-09-04 审核实证：外盘行情播报漏网——美元指数/日元/美元兑日元/WTI/原油期货
+        纯报价无信息量（"日元涨幅超过1""WTI原油期货收涨0.79美元报91.01" 曾与事件性标题同分钟双推）。
+        补外盘行情基准词后，仅"基准名+涨跌措辞"同时命中才拦，不误伤事件性新闻。"""
+        cases = [
+            "美元指数3日下跌 现报101.5",
+            "美元兑日元跌幅扩大至2",
+            "日元涨幅超过1",
+            "WTI原油期货收涨0.79美元报91.01",
+            "柴油期货价格创新高",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "指数播报", t
+
+    def test_foreign_quote_not_overfiltered(self):
+        """外盘行情词不误伤事件性新闻：无涨跌措辞或含事件/实体 → 放行"""
+        ok = [
+            "日本央行行长植田和男称将考虑加息",          # 含"日元"但无涨跌措辞
+            "美元兑日元升破150 日本财务省或干预",        # "升破"非涨跌幅度措辞，事件性保留
+            "以色列空袭伊朗核设施",                      # 无栏目词/行情词
+            "柴油车销量大增 新能源替代加速",             # "柴油"用"柴油期货/价格"限定，不误伤
+        ]
+        for t in ok:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "", t
+
+    def test_foreign_column_markers_filtered(self):
+        """2026-09-04 审核实证：金十"期货热点追踪""局势跟踪"为日报式栏目（中东/俄乌各推一条的来源）。
+        剥离栏目词后仍含行情措辞 → 栏目汇总；无高信号词 → 栏目汇总（与"新闻精选"行为一致）。
+        "局势跟踪：中东局势持续紧张"因"中东"为高信号词走"栏目内嵌重大事件"放行语义，
+        由"中东局势/油价"主题槽位（test_mideast_oil_theme_saturated）饱和兜底。"""
+        cases = [
+            "金十数据期货热点追踪：原油期货涨超2%",
+            "局势跟踪：原油期货涨超2%",
+        ]
+        for t in cases:
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "栏目汇总", t
+        # "中东"高信号词放行 + 主题槽位兜底（不重复计为噪声过滤职责）
+        assert rtp._is_noise_push({"title": "局势跟踪：中东局势持续紧张"}, self._judge(), set()) == "" or \
+            rtp._market_theme_keys("局势跟踪：中东局势持续紧张") == {"中东局势/油价"}
+
 
 class TestEntityOverlapMerge:
     """修复2：实体模糊重叠 + 放宽 LCS → 跨日同事件合并（防 48h 重复推送）"""
@@ -2179,6 +2219,33 @@ class TestMarketThemeEntityScan20260825:
         """宏观数据发布仍豁免（即使实体非空）"""
         sig = self._sig("美国8月CPI同比3.2%高于预期", ["美国劳工统计局"])
         pushed = [self._pe("美国7月CPI同比3.4%符合预期", ["美国"], self._ts(5))] * 5
+        assert rtp._topic_saturated(sig, pushed) is False
+
+    def test_ru_ukraine_theme_saturated(self):
+        """2026-09-04 新增槽位：俄乌冲突 24h 内 3 条 → 饱和拦截（此前无槽位全逃逸）"""
+        sig = self._sig("俄乌冲突升级 乌克兰无人机袭击莫斯科", ["乌克兰"])
+        pushed = [self._pe("俄乌和谈陷入僵局", ["乌克兰"], self._ts(11)),
+                  self._pe("克里姆林宫回应西方制裁", ["俄罗斯"], self._ts(10)),
+                  self._pe("乌克兰东部战事再起", ["乌克兰"], self._ts(9))]
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_mideast_oil_theme_saturated(self):
+        """2026-09-04 新增槽位：中东局势/油价（含柴油期货/价格）24h 内 3 条 → 饱和拦截"""
+        sig = self._sig("柴油价格创新高 全球供应紧张", ["柴油"])
+        pushed = [self._pe("以色列空袭黎巴嫩南部", ["以色列", "黎巴嫩"], self._ts(11)),
+                  self._pe("中东局势紧张 油价走高", ["中东"], self._ts(10)),
+                  self._pe("原油期货收涨 供应担忧升温", ["原油"], self._ts(9))]
+        assert rtp._topic_saturated(sig, pushed) is True
+
+    def test_diesel_vehicle_not_theme(self):
+        """防误伤："柴油"限定为"柴油期货/柴油价格"，"柴油车"不命中油价主题"""
+        assert rtp._market_theme_keys("柴油车销量大增 新能源替代加速") == set()
+
+    def test_ru_theme_below_limit_pass(self):
+        """俄乌主题窗口内仅 2 条 → 不饱和放行"""
+        sig = self._sig("俄乌新一轮谈判即将举行", ["乌克兰"])
+        pushed = [self._pe("俄乌和谈陷入僵局", ["乌克兰"], self._ts(11)),
+                  self._pe("克里姆林宫回应西方制裁", ["俄罗斯"], self._ts(10))]
         assert rtp._topic_saturated(sig, pushed) is False
 
 
