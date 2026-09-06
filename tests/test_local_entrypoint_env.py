@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """本地脚本入口配置加载回归测试。"""
+import os
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,13 @@ def test_local_entrypoint_loads_project_env_without_overriding_process_env(
 
     assert module.os.environ["GIST_TOKEN"] == "file-token"
     assert module.os.environ["GIST_ID"] == "process-id"
+
+    # 2026-09-07 测试隔离修复：dotenv 写入的 os.environ 不受 monkeypatch 跟踪
+    # （delenv 时键不存在 → undo 不清理），GIST_TOKEN 泄漏 + GIST_ID 还原
+    # = 半配置，令后续 get_gist_config 抛 RuntimeError。显式清理泄漏值；
+    # 进程环境原本有值时 monkeypatch undo 会恢复原值。
+    if os.environ.get("GIST_TOKEN") == "file-token":
+        del os.environ["GIST_TOKEN"]
 
 
 def test_reconcile_gist_only_does_not_read_or_print_local_state(

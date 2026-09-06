@@ -125,9 +125,11 @@ def _in_news_window(published_at: str, look_back_days: int = 1) -> bool:
                 "%Y/%m/%d", "%Y%m%d %H:%M:%S"]:
         try:
             pub_time = datetime.strptime(text, fmt)
-            # strptime 返回 naive datetime，需加 BJT 时区才能与 aware now 比较
+            # strptime 返回 naive datetime，需加 BJT 时区才能与 aware now 比较。
+            # 上界按日期粒度：当天日期 + 晚于当前时刻的时间戳（源端时钟偏差/
+            # 凌晨时段）不算未来，只排除超出今天的日期（与 docstring 一致）。
             pub_time = pub_time.replace(tzinfo=BJT)
-            if start <= pub_time <= now:
+            if pub_time >= start and pub_time.date() <= now.date():
                 return True
             return False
         except ValueError:
