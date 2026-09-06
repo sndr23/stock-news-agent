@@ -2834,3 +2834,34 @@ class TestDailyPushLimit0907:
         rtp.run_once(dry_run=False)
         saved = _load_saved_state(state_path)
         assert len(saved["pushed_events"]) == 2, "默认 0=不启用，不得拦截"
+
+
+# ============================================================
+# 2026-09-07 回归：_normalize_title 保留数字间小数点
+# ============================================================
+
+class TestNormalizeTitleDecimal:
+    """title_norm 曾把"2.9个基点"吞成"29个基点"（2026-09-05 美债条目实测），
+    同一数字指纹分裂。修复后数字间小数点保留，非数字间的点仍剥除。"""
+
+    def test_decimal_kept_29(self):
+        assert rtp._normalize_title("美债收益率上行2.9个基点") == "美债收益率上行2.9个基点"
+
+    def test_decimal_kept_05(self):
+        assert rtp._normalize_title("央行宣布降准0.5个百分点") == "央行宣布降准0.5个百分点"
+
+    def test_decimal_kept_123(self):
+        assert rtp._normalize_title("纳指涨12.3%创近期新高") == "纳指涨12.3创近期新高"
+
+    def test_non_digit_dots_still_stripped(self):
+        # 英文句尾句点、非数字间的点仍剥除
+        assert rtp._normalize_title("Fed ended. Next move unclear") == "FedendedNextmoveunclear"
+        assert rtp._normalize_title("A.B 两公司合并") == "AB两公司合并"
+
+    def test_same_title_with_without_decimal_share_fingerprint(self):
+        # 小数点有无不应导致同一数字指纹分裂（旧版 "2.9"→"29" 与原文分叉）
+        assert rtp._normalize_title("上行2.9个基点") != rtp._normalize_title("上行29个基点")
+
+    def test_truncate_still_40(self):
+        out = rtp._normalize_title("涨" * 50 + "2.9")
+        assert len(out) == 40
