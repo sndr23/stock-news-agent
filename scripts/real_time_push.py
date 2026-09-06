@@ -243,6 +243,24 @@ SOURCE_HEALTH_ALERT_INTERVAL_HOURS = 24
 # Gist 内状态文件名
 GIST_STATE_FILENAME = "real_time_state.json"
 
+# ============================================================
+# Gist 状态体积守卫（2026-09-07 P1）
+# ============================================================
+# Gist 单文件 1MB 是硬限，超限 = 状态写失败 = 推送中断（云端状态已实测 917KB）。
+# 上传前检查序列化体积：>950KB 先压缩 seen（保留最近 1800 条）再传；
+# 压缩后仍超限则报错（含压缩前后体积），fail-stop 交由人工处理。
+GIST_STATE_LIMIT_BYTES = 950_000
+GIST_STATE_SEEN_KEEP = 1800
+
+
+def _compress_seen_for_gist(seen: dict, keep: int = GIST_STATE_SEEN_KEEP) -> dict:
+    """体积守卫压缩：按时间保留最近 keep 条指纹记录（体积优先于去重覆盖面）。"""
+    if len(seen) <= keep:
+        return seen
+    items = sorted(seen.items(), key=lambda kv: str(kv[1].get("t", "")))
+    return dict(items[len(items) - keep:])
+
+
 def _parse_bjt(value: str):
     """状态时间字符串（北京时间）转 aware datetime，失败返回 None"""
     try:
@@ -1518,10 +1536,29 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
     917KB，超出 Gist GET content 截断线（~900KB，实测 917KB 文件 content
     截到 70.8 万字符），每轮 load 被迫走 raw_url 回退慢路径；继续增长逼近
     1MB 硬限将致 PATCH 写入直接失败。紧凑序列化立省 ~174KB（19%）。
+    2026-09-07 P1 体积守卫：上传前检查序列化体积，>950KB 先压缩 seen
+    （保留最近 1800 条）再传；压缩后仍超限报错（含压缩前后体积），
+    宁可本轮失败也不静默写入失败导致推送中断。
     """
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    size_before = len(payload.encode("utf-8"))
+    if size_before > GIST_STATE_LIMIT_BYTES:
+        seen_n_before = len(state.get("seen") or {})
+        state["seen"] = _compress_seen_for_gist(state.get("seen") or {})
+        payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        size_after = len(payload.encode("utf-8"))
+        logger.warning(f"Gist 状态序列化超限（{size_before}B > {GIST_STATE_LIMIT_BYTES}B），"
+                       f"已压缩 seen: {seen_n_before} 条 → {len(state['seen'])} 条，"
+                       f"压缩后 {size_after}B")
+        if size_after > GIST_STATE_LIMIT_BYTES:
+            logger.error(f"Gist 状态压缩后仍超限: 压缩前 {size_before}B, "
+                         f"压缩后 {size_after}B, 上限 {GIST_STATE_LIMIT_BYTES}B")
+            raise RuntimeError(f"Gist 状态体积超限: 压缩前 {size_before}B, "
+                               f"压缩后 {size_after}B（上限 {GIST_STATE_LIMIT_BYTES}B），"
+                               "需人工清理状态文件")
     patch_gist_file(
         GIST_STATE_FILENAME,
-        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+        payload,
         token, gist_id,
     )
 

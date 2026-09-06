@@ -348,3 +348,55 @@ class TestWatchlistAnnounceDirectPass:
         assert items2 and not items2[0].get("_watch_announce")
 
 
+# ============================================================
+# 任务4：Gist 状态体积守卫
+# ============================================================
+
+def _big_seen(n, title_len=300, t_base=None):
+    t_base = t_base or datetime.now(BJT)
+    return {f"fp{i:05d}": {"t": (t_base - timedelta(minutes=n - i)).strftime("%Y-%m-%d %H:%M:%S"),
+                           "pushed": False, "title": "字" * title_len}
+            for i in range(n)}
+
+
+class TestGistStateSizeGuard:
+    def test_oversized_state_compresses_seen(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(rtp, "patch_gist_file",
+                            lambda name, content, token, gid, **kw:
+                            captured.update({"content": content}))
+        state = {"seen": _big_seen(2500, title_len=120), "pending": {}, "pushed_events": [],
+                 "candidate_events": [], "watch_announce": []}
+        rtp._gist_save("tok", "gid", state)
+        assert "content" in captured, "超限状态必须仍然上传（压缩后再传）"
+        payload_bytes = len(captured["content"].encode("utf-8"))
+        assert payload_bytes <= rtp.GIST_STATE_LIMIT_BYTES, "压缩后必须低于上限"
+        assert len(state["seen"]) == rtp.GIST_STATE_SEEN_KEEP
+        # 保留的是最近（t 最大）的记录
+        ts = sorted(rec["t"] for rec in state["seen"].values())
+        assert ts[-1] >= ts[0]
+
+    def test_small_state_not_compressed(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(rtp, "patch_gist_file",
+                            lambda name, content, token, gid, **kw:
+                            captured.update({"content": content}))
+        seen = _big_seen(50)
+        state = {"seen": seen, "pending": {}, "pushed_events": [],
+                 "candidate_events": [], "watch_announce": []}
+        rtp._gist_save("tok", "gid", state)
+        assert "content" in captured
+        assert state["seen"] is seen, "小状态不得触发压缩"
+        assert len(state["seen"]) == 50
+
+    def test_still_over_limit_after_compress_raises(self, monkeypatch):
+        monkeypatch.setattr(rtp, "patch_gist_file",
+                            lambda name, content, token, gid, **kw: pytest.fail(
+                                "压缩后仍超限必须报错，不得上传"))
+        # 1800 条压缩下限仍超 950KB：每条 ~1.2KB × 1800 ≈ 2.2MB
+        state = {"seen": _big_seen(2500, title_len=400), "pending": {},
+                 "pushed_events": [], "candidate_events": [], "watch_announce": []}
+        with pytest.raises(RuntimeError) as exc:
+            rtp._gist_save("tok", "gid", state)
+        msg = str(exc.value)
+        assert "压缩前" in msg and "压缩后" in msg, "报错必须含压缩前后体积"
