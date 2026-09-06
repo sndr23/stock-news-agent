@@ -14,6 +14,7 @@ KeyError 致状态不写/影子不积累；ERP 语义反转）全部逃过了纯
   5. --shadow 纯报告：打印多期影子 IC（不推送不写状态）
 """
 import datetime as _dt
+import os
 import sys
 from pathlib import Path
 
@@ -148,6 +149,14 @@ def test_local_env_loader_reads_project_env_without_overriding_process_env(
 
     assert rct.os.environ["GIST_TOKEN"] == "file-token"
     assert rct.os.environ["GIST_ID"] == "process-id"
+
+    # 2026-09-07 测试隔离修复：dotenv 写入的 os.environ 不受 monkeypatch 跟踪——
+    # delenv 记录时 GIST_TOKEN 键不存在，undo 不会清理 _load_local_env 注入的
+    # 值，泄漏到后续测试（GIST_ID 被正常还原 → 半配置令 get_gist_config
+    # 抛 RuntimeError，run_once 类 e2e 全量顺序下红）。进程环境原本无该变量
+    # 时显式清理；原本有值时 monkeypatch undo 会恢复原值。
+    if os.environ.get("GIST_TOKEN") == "file-token":
+        del os.environ["GIST_TOKEN"]
 
 
 def test_save_state_local_write_failure_is_reported(monkeypatch, tmp_path):
