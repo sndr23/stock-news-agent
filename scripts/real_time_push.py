@@ -3011,6 +3011,9 @@ def run_once(dry_run: bool = False) -> dict:
     risk_state = factor_state.get("risk_state")
     if risk_state not in ("risk_off", "neutral"):
         risk_state = "neutral"
+    # 全局日推送上限（2026-09-07 P0 审计 3.2）：0=不启用（默认，向后兼容）。
+    # 每轮读取 env（而非模块级缓存），便于测试与热调参。
+    daily_push_limit = _env_int("RT_MAX_PUSH_PER_DAY", 0)
     _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
         if not j.get("judged", True):
@@ -3108,6 +3111,20 @@ def run_once(dry_run: bool = False) -> dict:
                               "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
             skipped += 1
             continue
+
+        # 全局日推送上限（2026-09-07 P0 审计 3.2）：计数源=pushed_events 当日条数。
+        # 触顶后非高信号条目一律不推（保护 pushplus 200条/天限额与用户收件箱）；
+        # 高信号（has_signal_keyword 命中，宏观/监管级核心事件）豁免防漏推。
+        if daily_push_limit > 0 and not has_signal_keyword(
+                f"{n.get('title', '')} {n.get('content', '')}"):
+            today_pushed = sum(1 for pe in pushed_events
+                               if str(pe.get("t", ""))[:10] == now[:10])
+            if today_pushed >= daily_push_limit:
+                logger.info(f"已达日推送上限({daily_push_limit})，不推: {n.get('title', '')[:50]}")
+                seen[n["_fp"]] = {"t": now, "pushed": False,
+                                  "title": str(n.get("title", ""))[:52] + "[日限额不推]"}
+                skipped += 1
+                continue
 
         # P6-2：跨事件矛盾附注（近48h同主体反向已推事件）——叙事链"矛盾"环节
         opposite_note = _opposite_events_note(n["_sig"], str(j.get("direction") or ""),
