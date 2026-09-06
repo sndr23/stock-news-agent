@@ -1248,6 +1248,68 @@ def get_hs300_constituents() -> dict:
 
 
 # ============================================================
+# 源健康状态（2026-09-07 P1）：区分"没新闻"和"源挂了"
+# ============================================================
+# 每源最近拉取结果落本地状态（logs/source_health.json，已被 .gitignore 排除）：
+# {label: {"t": "YYYY-MM-DD HH:MM:SS", "count": int, "streak": int, "last_alert": str}}
+#   t        = 最近一轮记录时间
+#   count    = 最近一轮拉取条数（0=空）
+#   streak   = 连续空轮数（count==0 时 +1，非空清零）
+#   last_alert = 上次告警时间（供推送侧同源 24h 限频）
+# 注意：GitHub Actions 每轮全新环境，本地状态不跨轮保留——云端每轮 streak ≤1
+# 不会误报；"连续空轮"统计主要在本地 --loop 常驻模式生效。
+SOURCE_HEALTH_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "source_health.json"
+
+
+def load_source_health(path=None) -> dict:
+    """读取源健康状态（文件缺失/损坏返回空 dict，不抛异常）"""
+    p = Path(path) if path else SOURCE_HEALTH_PATH
+    try:
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning(f"源健康状态读取失败: {e}")
+        return {}
+
+
+def save_source_health(health: dict, path=None) -> None:
+    """写入源健康状态（失败仅告警，不影响抓取主流程）"""
+    p = Path(path) if path else SOURCE_HEALTH_PATH
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(health, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"源健康状态写入失败: {e}")
+
+
+def record_source_health(results: dict, path=None, now=None) -> dict:
+    """记录本轮每源拉取结果，更新连续空轮数，落本地状态并返回最新状态。
+
+    results 为 _parallel_fetch 的 {label: list} 输出——失败源也会以空列表
+    出现，因此异常/超时与"真没数据"统一按空轮计。
+    """
+    if not isinstance(results, dict):
+        return load_source_health(path)
+    now = now or datetime.now(BJT)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    health = load_source_health(path)
+    for label, data in results.items():
+        count = len(data) if isinstance(data, list) else 0
+        prev = health.get(label) if isinstance(health.get(label), dict) else {}
+        streak = 0 if count > 0 else int(prev.get("streak", 0) or 0) + 1
+        health[label] = {
+            "t": now_str,
+            "count": count,
+            "streak": streak,
+            "last_alert": str(prev.get("last_alert", "") or ""),
+        }
+    save_source_health(health, path)
+    return health
+
+
+# ============================================================
 # LangChain Tools
 # ============================================================
 
@@ -1272,6 +1334,13 @@ def get_stock_news(data_mode: str = "live") -> list:
         _fetch_watchlist_announcements: "持仓公告",
         _fetch_google_news: "Google News",
     })
+
+    # 源健康记录（2026-09-07 P1）：每源本轮拉取结果落本地状态，供推送主循环
+    # 统计"单源连续空轮"告警。记录失败不影响抓取主流程。
+    try:
+        record_source_health(results)
+    except Exception as e:
+        logger.warning(f"源健康记录失败(不影响抓取): {e}")
 
     all_news = []
     for label, data in results.items():
