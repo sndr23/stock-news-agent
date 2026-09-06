@@ -2598,3 +2598,77 @@ class TestPrefilterWatchlistDirectPass:
         monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", ["生益科技"])
         assert rtp._hit_headline_entity("生益科技:半年度利润分配实施公告")
         assert not rtp._hit_headline_entity("无主体词的普通标题")
+
+
+# ============================================================
+# PUSH-OPT-P0 批次（2026-09-07 审计修复）
+# ============================================================
+
+def _setup_run_round(monkeypatch, tmp_path, news_list, judge=None, alert_result=None):
+    """run_once 单轮测试公共桩：本地状态文件 + 固定 LLM 判定 + 可配置推送结果"""
+    news = type("T", (), {"func": staticmethod(lambda: list(news_list))})()
+    sig = type("T", (), {"func": staticmethod(lambda: [])})()
+    monkeypatch.setattr(rtp, "get_stock_news", news)
+    monkeypatch.setattr(rtp, "get_market_signals", sig)
+    monkeypatch.setenv("GIST_TOKEN", "")
+    monkeypatch.setenv("GIST_ID", "")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+    monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+    monkeypatch.setattr(rtp, "_send_alert_item",
+                        lambda cfg, t, c: alert_result if alert_result is not None else {"code": 200})
+    base_judge = {"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                  "sectors": [], "entities": [], "is_leader_stock": False,
+                  "reason": "重大事件"}
+    if judge:
+        base_judge.update(judge)
+    monkeypatch.setattr(rtp, "_llm_judge",
+                        lambda items, **kw: [dict(base_judge) for _ in items])
+    return tmp_path / "real_time_state.json"
+
+
+def _load_saved_state(state_path):
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+class TestMacroCapitalInjectDedup0907:
+    """审计缺口1：同事件多源重复——"注资/增资/特别国债"宏观动作词事件组缺失。
+
+    实证：财政部注资8家中央金融企业题材 17:02-21:02 五连推——
+    该类词不在 _EVENT_PHRASE_ANCHORS 也不在共享 _EVENT_KEYWORD_GROUPS，
+    指纹分裂走纯标题路径，轮内合并与跨轮 48h 拦截全部兜不住。
+    修复：锚表追加 + 推送层私有 _EXTRA_EVENT_GROUPS 叠加（不动共享表）。
+    """
+
+    def test_extra_event_groups_module_table(self):
+        assert ("注资", ["注资", "增资", "特别国债"]) in rtp._EXTRA_EVENT_GROUPS
+        # 共享表（calculators.py）不得被改动
+        import src.tools.calculators as calc
+        assert ("注资", ["注资", "增资", "特别国债"]) not in calc._EVENT_KEYWORD_GROUPS
+
+    def test_phrase_anchors_extended(self):
+        assert "注资" in rtp._EVENT_PHRASE_ANCHORS
+        assert "增资" in rtp._EVENT_PHRASE_ANCHORS
+
+    def test_two_sources_same_event_via_shared_group(self):
+        """两源不同措辞标题判同事件，且走 _same_event_shared_group 路径。"""
+        a = {"title": "财政部宣布注资8家中央金融企业", "content": "", "category": "news"}
+        b = {"title": "四部门部署向中央金融企业增资", "content": "", "category": "news"}
+        sig_a = rtp._push_event_sig(a, {"entities": ["财政部"], "scope": "market"})
+        sig_b = rtp._push_event_sig(b, {"entities": [], "scope": "market"})
+        assert "注资" in sig_a["events"], "标题含注资应抽到注资事件组"
+        assert "注资" in sig_b["events"], "标题含增资应归入同组"
+        ctx = rtp._same_event_ctx(sig_a, sig_b)
+        assert ctx.shared_ev == {"注资"}, "两源必须共享注资事件组（修复前为空集）"
+        assert rtp._is_same_event(sig_a, sig_b)
+
+    def test_rrj_cut_vs_zhu_zi_not_merged(self):
+        """反向锁死：央行降准与央行注资不得因实体重叠被误并。"""
+        c = {"title": "央行宣布降准0.5个百分点", "content": "", "category": "news"}
+        d = {"title": "央行注资两家股份制银行", "content": "", "category": "news"}
+        sig_c = rtp._push_event_sig(c, {"entities": ["央行"], "scope": "market"})
+        sig_d = rtp._push_event_sig(d, {"entities": ["央行"], "scope": "market"})
+        assert "注资" not in sig_c["events"]
+        assert "注资" in sig_d["events"]
+        assert not rtp._is_same_event(sig_c, sig_d)
+
