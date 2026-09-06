@@ -331,6 +331,12 @@ def _normalize_title(title: str) -> str:
     return t[:40]
 
 
+# 推送层私有事件组叠加（2026-09-07 P0 审计）：宏观资本运作动作词。
+# 仅本模块 _event_signature_light 扫描时与共享表合并使用，不回写
+# calculators._EVENT_KEYWORD_GROUPS（该表被 UI/推送多条管线共享，改动影响面大）。
+_EXTRA_EVENT_GROUPS = [("注资", ["注资", "增资", "特别国债"])]
+
+
 def _event_signature_light(news: dict) -> tuple:
     """轻量事件签名 (stocks, events, numbers)
 
@@ -347,7 +353,11 @@ def _event_signature_light(news: dict) -> tuple:
         stocks.add(name)
     text = f"{news.get('title', '')} {news.get('content', '')}"
     events = set()
-    for group_name, keywords in _EVENT_KEYWORD_GROUPS:
+    # 2026-09-07 P0 审计：叠加推送层私有事件组 _EXTRA_EVENT_GROUPS——
+    # "注资/增资/特别国债"类宏观动作词不在共享表（calculators.py 保持不动），
+    # 导致"财政部注资8家中央金融企业"题材多源报道事件组全空、指纹分裂走
+    # 纯标题路径，轮内合并与跨轮 48h 拦截全部兜不住（17:02-21:02 五连推实证）。
+    for group_name, keywords in list(_EVENT_KEYWORD_GROUPS) + _EXTRA_EVENT_GROUPS:
         if any(kw in text for kw in keywords):
             events.add(group_name)
     numbers = _extract_core_numbers(text)
@@ -696,6 +706,8 @@ _EVENT_PHRASE_ANCHORS = [
     "合资", "收购", "并购", "建厂", "成立", "融资", "回购", "入股",
     "签约", "中标", "停牌", "重组", "破产", "退市", "处罚", "立案",
     "增持", "减持",
+    # 2026-09-07 P0 审计：宏观资本运作动作词（财政部注资题材五连推实证）
+    "注资", "增资",
 ]
 
 # 宏观数据发布后的市场反应合并词（2026-08-12 实证：21:31"美国CPI符合预期美股高开"
@@ -1530,6 +1542,17 @@ def _day_key(e: dict) -> str:
     return str(e.get("t") or "")[:10]
 
 
+def _mark_candidate_pushed(state: dict, ck: tuple) -> None:
+    """推送成功后回填 candidate_events 的 pushed 标记（2026-09-07 P0 审计 1.4B）。
+
+    此前 pushed 字段写死 False 从无置 True 路径。按 (日期, 事件签名) 键回查
+    （勿持列表下标——_merge_state 重新去重后引用/顺序会变），命中即置 True。
+    """
+    for ce in state.get("candidate_events") or []:
+        if (_day_key(ce), _event_sig_key(ce)) == ck:
+            ce["pushed"] = True
+
+
 def _merge_state(local: dict, remote: dict) -> dict:
     """合并两份状态（Gist 读-改-写防并发覆盖）：取并集，pushed=True 优先
 
@@ -1640,7 +1663,12 @@ def save_state(state: dict) -> None:
     # 滚动清理过期当日预筛候选（P7-1，48h 窗口）+ 上限 300 条防爆胀
     ce = [e for e in (state.get("candidate_events") or []) if e.get("t", "") >= cutoff]
     if len(ce) > 300:
-        ce = sorted(ce, key=lambda e: e.get("t", ""))[-300:]
+        before_n = len(ce)
+        # 2026-09-07 P0 审计 2.3：纯按时间 FIFO 会把高流量日未推的强档候选挤出。
+        # 改为未推条目优先保留（pushed=True 先淘汰），同组内按时间保留最新。
+        ce = sorted(ce, key=lambda e: (0 if e.get("pushed") else 1, e.get("t", "")))[-300:]
+        logger.warning(f"candidate_events 超过上限（{before_n} 条 → 300 条），"
+                       "已推条目优先淘汰，未推候选优先保留")
     state["candidate_events"] = ce
 
     if gist_token and gist_id and not _merge_failed:
@@ -2998,6 +3026,9 @@ def run_once(dry_run: bool = False) -> dict:
     risk_state = factor_state.get("risk_state")
     if risk_state not in ("risk_off", "neutral"):
         risk_state = "neutral"
+    # 全局日推送上限（2026-09-07 P0 审计 3.2）：0=不启用（默认，向后兼容）。
+    # 每轮读取 env（而非模块级缓存），便于测试与热调参。
+    daily_push_limit = _env_int("RT_MAX_PUSH_PER_DAY", 0)
     _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
         if not j.get("judged", True):
@@ -3096,6 +3127,20 @@ def run_once(dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
+        # 全局日推送上限（2026-09-07 P0 审计 3.2）：计数源=pushed_events 当日条数。
+        # 触顶后非高信号条目一律不推（保护 pushplus 200条/天限额与用户收件箱）；
+        # 高信号（has_signal_keyword 命中，宏观/监管级核心事件）豁免防漏推。
+        if daily_push_limit > 0 and not has_signal_keyword(
+                f"{n.get('title', '')} {n.get('content', '')}"):
+            today_pushed = sum(1 for pe in pushed_events
+                               if str(pe.get("t", ""))[:10] == now[:10])
+            if today_pushed >= daily_push_limit:
+                logger.info(f"已达日推送上限({daily_push_limit})，不推: {n.get('title', '')[:50]}")
+                seen[n["_fp"]] = {"t": now, "pushed": False,
+                                  "title": str(n.get("title", ""))[:52] + "[日限额不推]"}
+                skipped += 1
+                continue
+
         # P6-2：跨事件矛盾附注（近48h同主体反向已推事件）——叙事链"矛盾"环节
         opposite_note = _opposite_events_note(n["_sig"], str(j.get("direction") or ""),
                                               pushed_events)
@@ -3109,6 +3154,7 @@ def run_once(dry_run: bool = False) -> dict:
                 pass
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+            _mark_candidate_pushed(state, _ck)
             # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
@@ -3124,13 +3170,28 @@ def run_once(dry_run: bool = False) -> dict:
             if result.get("code") == 200 or result.get("errcode") == 0:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+                _mark_candidate_pushed(state, _ck)
                 pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
                                       "title": str(n.get("title", ""))[:60],
                                       "source": str(n.get("source", "") or "")[:30]})
                 pushed += 1
             else:
-                # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
-                logger.error(f"推送失败（下轮重试）: {n.get('title', '')[:50]} | {result}")
+                # 推送失败：挂起 pending 下轮重试（2026-09-07 P0 审计修复——
+                # 此前什么都不写，条目滚出源窗口后静默漏推且无重试上限）。
+                # retry 达 MAX_PENDING_RETRY 仍失败 → 写 seen 放弃（防持续假失败
+                # 无限重试）；否则带 payload 挂起，复用 _reinject_pending_items
+                # 通道下轮主动重注入。
+                retry = int(n.get("_pend_retry", 0)) + 1
+                if retry >= MAX_PENDING_RETRY:
+                    seen[n["_fp"]] = {"t": now, "pushed": False,
+                                      "title": str(n.get("title", ""))[:52] + "[推送失败放弃]"}
+                    logger.error(f"连续{retry}轮推送失败，放弃: {n.get('title', '')[:50]}")
+                else:
+                    pending[n["_fp"]] = {"t": now, "retry": retry,
+                                         "title": str(n.get("title", ""))[:60],
+                                         "payload": _pend_payload(n)}
+                    logger.error(f"推送失败（第{retry}次挂起，下轮重试）: "
+                                 f"{n.get('title', '')[:50]} | {result}")
                 skipped += 1
 
     # 其余未进入候选的条目也记录指纹（跳过溢出挂起的 pending 条目——它们下轮重试）
