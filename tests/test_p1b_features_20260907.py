@@ -213,3 +213,64 @@ class TestPushSourceHealthAlerts:
         assert "财联社电报" in sent[0][1]
 
 
+# ============================================================
+# 任务2：公告接入（type 白名单）
+# ============================================================
+
+class TestAnnounceWhitelist:
+    def test_pledge_release_matched(self):
+        ann = {"type": "股份解押", "title": "关于控股股东部分股份解除质押的公告"}
+        assert rtp._announce_whitelist_category(ann) == "解除质押"
+
+    def test_pledge_release_takes_priority_over_pledge(self):
+        ann = {"type": "", "title": "关于部分股份解除质押的公告"}
+        assert rtp._announce_whitelist_category(ann) == "解除质押"
+
+    def test_buyback_and_performance_matched(self):
+        assert rtp._announce_whitelist_category({"type": "回购", "title": "回购报告书"}) == "回购"
+        assert rtp._announce_whitelist_category({"type": "业绩预告", "title": ""}) == "业绩预告"
+        assert rtp._announce_whitelist_category({"type": "", "title": "2026年年度业绩快报"}) == "业绩快报"
+        assert rtp._announce_whitelist_category({"type": "处罚", "title": ""}) == "立案处罚"
+
+    def test_non_whitelisted_returns_empty(self):
+        assert rtp._announce_whitelist_category(
+            {"type": "其他", "title": "关于召开2026年第一次临时股东大会的通知"}) == ""
+        assert rtp._announce_whitelist_category(
+            {"type": "融资融券", "title": "融资融券明细"}) == ""
+        assert rtp._announce_whitelist_category("bad") == ""
+
+    def test_rule_order_pledge_release_first(self):
+        assert rtp.ANNOUNCE_TYPE_RULES[0][0] == "解除质押"
+
+
+WHITELIST_ANNOUNCE = {"code": "600000", "name": "浦发银行", "type": "回购",
+                      "title": "关于以集中竞价交易方式回购公司股份的公告",
+                      "content": "关于以集中竞价交易方式回购公司股份的公告",
+                      "published_at": "2026-09-07"}
+NOISE_ANNOUNCE = {"code": "600001", "name": "某某公司", "type": "其他",
+                  "title": "关于召开2026年第一次临时股东大会的通知",
+                  "content": "关于召开2026年第一次临时股东大会的通知",
+                  "published_at": "2026-09-07"}
+
+
+class TestAnnounceIngestRunOnce:
+    def test_whitelisted_enters_pipeline_noise_blocked(self, monkeypatch, tmp_path):
+        state_path = _setup_run_round(monkeypatch, tmp_path,
+                                      announcements=[WHITELIST_ANNOUNCE, NOISE_ANNOUNCE])
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 1, "白名单外公告不得进候选"
+        assert saved["pushed_events"][0]["source"] == rtp.ANNOUNCE_SOURCE
+        noise_fp = rtp._news_fingerprint(rtp._announce_to_news_item(
+            {**NOISE_ANNOUNCE}, "回购"))
+        assert noise_fp not in saved["seen"], "白名单外公告一律不进管线（不落指纹）"
+
+    def test_ingest_drops_non_whitelisted(self, monkeypatch, tmp_path):
+        state = rtp._empty_state()
+        items = rtp._ingest_announcements([WHITELIST_ANNOUNCE, NOISE_ANNOUNCE],
+                                          set(), state)
+        assert len(items) == 1
+        assert items[0]["source"] == rtp.ANNOUNCE_SOURCE
+        assert items[0]["_announce_category"] == "回购"
+
+

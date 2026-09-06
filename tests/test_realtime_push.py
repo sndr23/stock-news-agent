@@ -37,6 +37,18 @@ def _load_rtp():
 rtp = _load_rtp()
 
 
+@pytest.fixture(autouse=True)
+def _stub_announce_and_source_health(monkeypatch):
+    """run_once 新增外部依赖默认隔离（2026-09-07 P1）：
+    - get_announcements 返回空（公告接入不触网）
+    - 源健康状态读空/写丢弃（不读写仓库 logs/source_health.json）
+    需要真实行为的用例在用例内自行 monkeypatch 覆盖即可。"""
+    empty_tool = type("T", (), {"func": staticmethod(lambda *a, **k: [])})()
+    monkeypatch.setattr(rtp, "get_announcements", empty_tool, raising=False)
+    monkeypatch.setattr(rtp, "load_source_health", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(rtp, "save_source_health", lambda *a, **k: None, raising=False)
+
+
 def test_is_trading_day_rejects_makeup_saturday():
     """实时资讯入口与 A 股统一：法定补班周六仍不算交易日。"""
     assert not rtp._is_trading_day(date(2026, 10, 10))

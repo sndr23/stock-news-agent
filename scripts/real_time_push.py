@@ -109,7 +109,7 @@ def _env_int(name: str, default: int) -> int:
 # 复用项目现有能力（不重复造轮子）
 # ============================================================
 from src.tools.data_fetchers import (get_stock_news, get_market_signals,
-                                     dedup_news_3layer)  # 多源聚合抓取 + 三层近似去重
+                                     get_announcements, dedup_news_3layer)  # 多源聚合抓取 + 三层近似去重
 from src.tools.data_fetchers import load_source_health, save_source_health  # 源健康状态（P1 源健康告警）
 from src.tools.calculators import (
     calculate_prefilter_importance,   # 预筛评分
@@ -1423,6 +1423,9 @@ def _empty_state() -> dict:
         # 记录于 LLM 判定后的每一候选（无论最终推/不推）；pushed_events 仍为"实际已推送"权威。
         # [{**事件签名, "dir": str, "t": str, "pushed": bool}]
         "candidate_events": [],
+        # watchlist 公告直通限频日志（2026-09-07 P1 新增）：
+        # [{"key": "code|类别", "t": str}]，同股同类别 24h 限推 1 条（防刷屏）。
+        "watch_announce": [],
     }
 
 
@@ -1532,6 +1535,7 @@ def load_state() -> dict:
             state = _gist_load(gist_token, gist_id)
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
+            state.setdefault("watch_announce", [])
             logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pushed_events', []))} 个已推事件"
                         f", {len(state.get('pending', {}))} 个挂起重试")
@@ -1550,6 +1554,7 @@ def load_state() -> dict:
                 state = _empty_state()
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
+            state.setdefault("watch_announce", [])
             logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pending', {}))} 个挂起重试")
             return state
@@ -1674,6 +1679,14 @@ def _merge_state(local: dict, remote: dict) -> dict:
         if old is None or (e.get("pushed") and not old.get("pushed")):
             merged_cands[_k] = e
     local["candidate_events"] = list(merged_cands.values())
+
+    # 合并 watchlist 公告直通限频日志（2026-09-07 P1）：按 (key, t) 去重并集
+    merged_wa = {(e.get("key"), e.get("t")): e
+                 for e in (remote.get("watch_announce") or []) if isinstance(e, dict)}
+    for e in (local.get("watch_announce") or []):
+        if isinstance(e, dict):
+            merged_wa.setdefault((e.get("key"), e.get("t")), e)
+    local["watch_announce"] = list(merged_wa.values())
     return local
 
 
@@ -1750,6 +1763,10 @@ def save_state(state: dict) -> None:
         logger.warning(f"candidate_events 超过上限（{before_n} 条 → 300 条），"
                        "已推条目优先淘汰，未推候选优先保留")
     state["candidate_events"] = ce
+
+    # watchlist 公告直通限频日志滚动清理（2026-09-07 P1：24h 窗口 + 上限防爆胀）
+    state["watch_announce"] = _watch_announce_prune(
+        state.get("watch_announce") or [], datetime.now(BJT))
 
     if gist_token and gist_id and not _merge_failed:
         _gist_save(gist_token, gist_id, state)
@@ -2877,6 +2894,103 @@ def _send_alert_item(push_config: dict, title: str, content: str) -> dict:
 
 
 # ============================================================
+# 交易所公告接入（2026-09-07 P1）：type 白名单 + watchlist 直通
+# ============================================================
+# 盘后全市场公告可达上千条，直接接入会击穿候选池与 Gist 状态 1MB 硬限——
+# 只有下列事件类公告才允许进入推送候选管线，白名单外一律不进。
+# 规则有序，首个命中生效（"解除质押"必须排在"质押"之前）；
+# 匹配文本 = 公告 type + 标题（akshare 的 type 字段口径不稳，标题兜底）。
+ANNOUNCE_TYPE_RULES = [
+    ("解除质押", ("解除质押", "解押")),
+    ("质押", ("质押",)),
+    ("回购", ("回购",)),
+    ("增持", ("增持",)),
+    ("减持", ("减持",)),
+    ("业绩预告", ("业绩预告",)),
+    ("业绩快报", ("业绩快报",)),
+    ("重大合同", ("重大合同", "中标")),
+    ("分红送转", ("分红", "派息", "送转", "利润分配")),
+    ("立案处罚", ("立案", "处罚", "监管函", "问询函", "关注函")),
+]
+ANNOUNCE_SOURCE = "交易所公告"
+# watchlist 公告直通防刷屏：同股同类别 24h 内最多推 1 条
+WATCH_ANNOUNCE_WINDOW_HOURS = 24
+WATCH_ANNOUNCE_MAX_LOG = 100
+
+
+def _announce_whitelist_category(ann: dict) -> str:
+    """公告白名单匹配：返回命中的类别名，白名单外返回空串"""
+    if not isinstance(ann, dict):
+        return ""
+    text = f"{ann.get('type', '') or ''} {ann.get('title', '') or ''}"
+    for cat, keywords in ANNOUNCE_TYPE_RULES:
+        if any(kw in text for kw in keywords):
+            return cat
+    return ""
+
+
+def _announce_to_news_item(ann: dict, category: str) -> dict:
+    """白名单公告 → 推送管线新闻条目（后续走既有指纹/去重/预筛链路）"""
+    title = str(ann.get("title", "") or "").strip()
+    name = str(ann.get("name", "") or "").strip()
+    code = str(ann.get("code", "") or "").strip()
+    return {
+        "title": title,
+        "content": title,
+        "source": ANNOUNCE_SOURCE,
+        "published_at": str(ann.get("published_at", "") or ""),
+        "code": code,
+        "name": name,
+        "affected_stocks": [name] if name else [],
+        "category": "news",
+        "sentiment": "neutral",
+        "_announce_category": category,
+    }
+
+
+def _watch_announce_prune(log: list, now: datetime) -> list:
+    """watchlist 公告直通限频日志：滚动清理窗口前记录并限长（防爆胀）"""
+    cutoff = (now - timedelta(hours=WATCH_ANNOUNCE_WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    kept = [e for e in (log or []) if isinstance(e, dict) and str(e.get("t", "")) >= cutoff]
+    return kept[-WATCH_ANNOUNCE_MAX_LOG:]
+
+
+def _ingest_announcements(announces: list, watchlist: set, state: dict,
+                          now: datetime | None = None) -> list:
+    """公告接入主循环入口（2026-09-07 P1）。
+
+    - 白名单外公告一律不进候选（不进指纹、不落 seen）；
+    - watchlist 股票的白名单公告：标记直通（_watch_announce），下游跳过预筛
+      竞争以高优先级进候选并推送；同股同类别 24h 限 1 条（限频日志
+      state['watch_announce']，推送成功时登记）；
+    - 其余白名单公告走既有去重/预筛链路正常竞争。
+    """
+    if not announces:
+        return []
+    now = now or datetime.now(BJT)
+    log = state.setdefault("watch_announce", [])
+    log[:] = _watch_announce_prune(log, now)
+    items = []
+    for ann in announces:
+        if not isinstance(ann, dict):
+            continue
+        cat = _announce_whitelist_category(ann)
+        if not cat:
+            continue  # 白名单外一律不进候选
+        item = _announce_to_news_item(ann, cat)
+        if watchlist and _hit_watchlist(item, watchlist):
+            key = f"{item.get('code') or item.get('name')}|{cat}"
+            if any(e.get("key") == key for e in log):
+                logger.info(f"watchlist 公告直通限频（同股同类别 {WATCH_ANNOUNCE_WINDOW_HOURS}h 内已推），"
+                            f"跳过: {item.get('title', '')[:50]}")
+                continue
+            item["_watch_announce"] = True
+            item["_watch_announce_key"] = key
+        items.append(item)
+    return items
+
+
+# ============================================================
 # 主流程：单次执行
 # ============================================================
 def run_once(dry_run: bool = False) -> dict:
@@ -2906,6 +3020,14 @@ def run_once(dry_run: bool = False) -> dict:
     seen = state.setdefault("seen", {})
     pending = state.setdefault("pending", {})
 
+    # 自选龙头名单（watchlist.json）提前加载：公告接入（P1）在抓取阶段即需
+    # watchlist 判定直通；与 LLM 的 is_leader_stock 判定互为补充
+    leader_watchlist = _load_leader_watchlist()
+    if not leader_watchlist and not _watchlist_warned[0]:
+        _watchlist_warned[0] = True
+        logger.warning("自选龙头名单 watchlist.json 为空，龙头放行退化为 LLM is_leader_stock 单通道"
+                       "（如需盘面异动龙头放行/科技龙头兜底双通道，请填入关注名单）")
+
     # 1. 多源聚合抓取：6 大新闻源 + 龙虎榜/业绩预告信号
     # 注意: get_stock_news/get_market_signals 是 LangChain @tool 包装的
     # StructuredTool 实例，需用 .func 取原始函数调用
@@ -2922,6 +3044,19 @@ def run_once(dry_run: bool = False) -> dict:
         logger.error(f"市场信号抓取失败: {e}", exc_info=True)
         signals = []
 
+    # 交易所公告接入（2026-09-07 P1）：type 白名单过滤后进管线；
+    # watchlist 股票的白名单公告标记直通（跳过预筛竞争，同股同类别 24h 限 1 条）。
+    try:
+        raw_announces = get_announcements.func()
+    except Exception as e:
+        logger.error(f"公告抓取失败: {e}", exc_info=True)
+        raw_announces = []
+    announce_items = _ingest_announcements(raw_announces, leader_watchlist, state)
+    if announce_items:
+        n_direct = sum(1 for a in announce_items if a.get("_watch_announce"))
+        logger.info(f"公告接入: 白名单命中 {len(announce_items)}/{len(raw_announces or [])} 条"
+                    f"（其中 watchlist 直通 {n_direct} 条）")
+
     # 源健康告警（2026-09-07 P1）：区分"没新闻"与"源挂了"——单源连续多轮空
     # 推送告警（同源 24h 限频），全源同时空视为市场静默不告警。
     # 检查异常只记日志，不影响主推送流程。
@@ -2936,7 +3071,9 @@ def run_once(dry_run: bool = False) -> dict:
     news_list = dedup_news_3layer(list(news_list))
     if len(news_list) < before_dedup:
         logger.info(f"三层近似去重: {before_dedup} -> {len(news_list)} 条")
-    news_list = news_list + list(signals)
+    # 公告与 signals 一样是交易所结构化数据，不参与标题 SimHash 近似去重
+    # （模板化标题会误并），指纹层去重已覆盖。
+    news_list = news_list + list(signals) + announce_items
     logger.info(f"多源聚合: 拉取 {len(news_list)} 条")
     if not news_list:
         logger.info("无资讯返回，跳过本轮")
@@ -3050,13 +3187,6 @@ def run_once(dry_run: bool = False) -> dict:
     if not judges:
         # 防御：_llm_judge 异常返回空 → 全部挂起下轮重试（不推、不落指纹）
         judges = [_hang_judge(n) for n in candidates]
-
-    # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
-    leader_watchlist = _load_leader_watchlist()
-    if not leader_watchlist and not _watchlist_warned[0]:
-        _watchlist_warned[0] = True
-        logger.warning("自选龙头名单 watchlist.json 为空，龙头放行退化为 LLM is_leader_stock 单通道"
-                       "（如需盘面异动龙头放行/科技龙头兜底双通道，请填入关注名单）")
 
     # 5. 同事件合并（跨源同事件只推最优一条）→ 跨轮已推事件拦截 → 阈值过滤 → 推送
     pushed = 0
