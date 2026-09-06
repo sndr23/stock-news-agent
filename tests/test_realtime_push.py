@@ -2672,3 +2672,63 @@ class TestMacroCapitalInjectDedup0907:
         assert "注资" in sig_d["events"]
         assert not rtp._is_same_event(sig_c, sig_d)
 
+
+class TestPushFailureRetry0907:
+    """审计缺口2：推送失败分支什么都不写——条目滚出源窗口后静默漏推，
+    持续假失败时无重试上限。修复：失败挂起 pending（带 payload）重试，
+    连续 MAX_PENDING_RETRY 轮失败写 seen 放弃。"""
+
+    NEWS = [{"title": "中际旭创 800G 光模块获海外大单",
+             "content": "公司公告获得海外大客户订单",
+             "source": "财联社", "published_at": "2026-09-07 10:00:00",
+             "affected_stocks": ["中际旭创"]}]
+
+    def test_push_failure_goes_to_pending_with_payload(self, monkeypatch, tmp_path):
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS,
+                                      alert_result={"code": 500, "msg": "server error"})
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        fp = rtp._news_fingerprint(self.NEWS[0])
+        assert fp not in saved["seen"], "失败条目不得写 seen（否则永久漏推）"
+        rec = saved["pending"].get(fp)
+        assert rec, "推送失败必须挂起 pending 下轮重试"
+        assert rec["retry"] == 1
+        assert rec.get("payload", {}).get("title"), "pending 必须带 payload 供主动重注入"
+
+    def test_push_failure_abandons_after_max_retries(self, monkeypatch, tmp_path):
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS,
+                                      alert_result={"code": 500, "msg": "server error"})
+        for _ in range(rtp.MAX_PENDING_RETRY):
+            rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        fp = rtp._news_fingerprint(self.NEWS[0])
+        rec = saved["seen"].get(fp)
+        assert rec, "连续失败达上限必须写 seen（防无限重试）"
+        assert "推送失败放弃" in rec["title"]
+        assert rec["pushed"] is False
+        assert fp not in saved["pending"]
+
+    def test_failure_reinject_then_success_clears_pending(self, monkeypatch, tmp_path):
+        """失败挂起 → 重注入 → 下轮成功：pending 清空、seen pushed=True。"""
+        item = {"title": "央行宣布降准0.5个百分点",
+                "content": "央行决定下调金融机构存款准备金率",
+                "source": "财联社", "published_at": "2026-09-07 10:00:00"}
+        fp = rtp._news_fingerprint(item)
+        state_path = tmp_path / "real_time_state.json"
+        state_path.write_text(json.dumps({
+            "seen": {},
+            "pending": {fp: {"t": "2026-09-07 10:00:00", "retry": 1,
+                             "title": item["title"],
+                             "payload": rtp._pend_payload(item)}},
+            "pushed_events": [], "candidate_events": [],
+        }, ensure_ascii=False), encoding="utf-8")
+        # 本轮源窗口已滚出该条目：news_list 只有无关条目，触发主动重注入
+        filler = {"title": "某公司召开例行股东大会", "content": "审议年度议案",
+                  "source": "财联社", "published_at": "2026-09-07 11:00:00"}
+        state_path2 = _setup_run_round(monkeypatch, tmp_path, [filler])
+        assert state_path2 == state_path
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert saved["seen"].get(fp, {}).get("pushed") is True, "重注入后成功必须置 pushed=True"
+        assert fp not in saved["pending"], "已定论条目必须从 pending 移除"
+
