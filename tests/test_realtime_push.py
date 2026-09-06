@@ -2732,3 +2732,44 @@ class TestPushFailureRetry0907:
         assert saved["seen"].get(fp, {}).get("pushed") is True, "重注入后成功必须置 pushed=True"
         assert fp not in saved["pending"], "已定论条目必须从 pending 移除"
 
+
+class TestCandidatePushedBackfill0907:
+    """审计缺口3：candidate_events pushed 字段从无置 True 路径 + 裁剪纯 FIFO
+    把未推强档候选挤出。修复：推送成功按 (日期,事件签名) 回查置 True；
+    裁剪改为未推优先保留（已推先淘汰）。"""
+
+    def test_candidate_marked_pushed_after_success(self, monkeypatch, tmp_path):
+        news = [{"title": "中际旭创 800G 光模块获海外大单",
+                 "content": "公司公告获得海外大客户订单",
+                 "source": "财联社", "published_at": "2026-09-07 10:00:00",
+                 "affected_stocks": ["中际旭创"]}]
+        state_path = _setup_run_round(monkeypatch, tmp_path, news)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        cands = saved["candidate_events"]
+        assert cands, "判定候选必须落 candidate_events"
+        assert all(e.get("pushed") is True for e in cands), \
+            "推送成功后对应 candidate 的 pushed 必须回填 True"
+
+    def test_trimming_keeps_unpushed_drops_pushed_first(self, monkeypatch, tmp_path, caplog):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cands = [{"entities": [], "events": [f"e{i}"], "numbers": [],
+                  "title_norm": f"未推{i}", "t": now, "pushed": False}
+                 for i in range(300)]
+        cands += [{"entities": [], "events": [f"p{i}"], "numbers": [],
+                   "title_norm": f"已推{i}", "t": now, "pushed": True}
+                  for i in range(10)]
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        with caplog.at_level("WARNING", logger=rtp.logger.name):
+            rtp.save_state({"seen": {}, "pending": {}, "pushed_events": [],
+                            "candidate_events": cands})
+        saved = _load_saved_state(tmp_path / "real_time_state.json")
+        ce = saved["candidate_events"]
+        assert len(ce) == 300
+        assert all(not e.get("pushed") for e in ce), "溢出裁剪必须已推条目先淘汰"
+        assert any("candidate_events" in r.message for r in caplog.records), \
+            "裁剪发生时必须 warning 留痕"
+
