@@ -1542,6 +1542,16 @@ def _day_key(e: dict) -> str:
     return str(e.get("t") or "")[:10]
 
 
+def _mark_candidate_pushed(state: dict, ck: tuple) -> None:
+    """推送成功后回填 candidate_events 的 pushed 标记（2026-09-07 P0 审计 1.4B）。
+
+    此前 pushed 字段写死 False 从无置 True 路径。按 (日期, 事件签名) 键回查
+    （勿持列表下标——_merge_state 重新去重后引用/顺序会变），命中即置 True。
+    """
+    for ce in state.get("candidate_events") or []:
+        if (_day_key(ce), _event_sig_key(ce)) == ck:
+            ce["pushed"] = True
+
 
 def _merge_state(local: dict, remote: dict) -> dict:
     """合并两份状态（Gist 读-改-写防并发覆盖）：取并集，pushed=True 优先
@@ -1653,7 +1663,12 @@ def save_state(state: dict) -> None:
     # 滚动清理过期当日预筛候选（P7-1，48h 窗口）+ 上限 300 条防爆胀
     ce = [e for e in (state.get("candidate_events") or []) if e.get("t", "") >= cutoff]
     if len(ce) > 300:
-        ce = sorted(ce, key=lambda e: e.get("t", ""))[-300:]
+        before_n = len(ce)
+        # 2026-09-07 P0 审计 2.3：纯按时间 FIFO 会把高流量日未推的强档候选挤出。
+        # 改为未推条目优先保留（pushed=True 先淘汰），同组内按时间保留最新。
+        ce = sorted(ce, key=lambda e: (0 if e.get("pushed") else 1, e.get("t", "")))[-300:]
+        logger.warning(f"candidate_events 超过上限（{before_n} 条 → 300 条），"
+                       "已推条目优先淘汰，未推候选优先保留")
     state["candidate_events"] = ce
 
     if gist_token and gist_id and not _merge_failed:
@@ -3139,6 +3154,7 @@ def run_once(dry_run: bool = False) -> dict:
                 pass
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+            _mark_candidate_pushed(state, _ck)
             # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
@@ -3154,6 +3170,7 @@ def run_once(dry_run: bool = False) -> dict:
             if result.get("code") == 200 or result.get("errcode") == 0:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
+                _mark_candidate_pushed(state, _ck)
                 pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
                                       "title": str(n.get("title", ""))[:60],
                                       "source": str(n.get("source", "") or "")[:30]})
