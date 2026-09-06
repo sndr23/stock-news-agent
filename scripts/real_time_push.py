@@ -331,6 +331,12 @@ def _normalize_title(title: str) -> str:
     return t[:40]
 
 
+# 推送层私有事件组叠加（2026-09-07 P0 审计）：宏观资本运作动作词。
+# 仅本模块 _event_signature_light 扫描时与共享表合并使用，不回写
+# calculators._EVENT_KEYWORD_GROUPS（该表被 UI/推送多条管线共享，改动影响面大）。
+_EXTRA_EVENT_GROUPS = [("注资", ["注资", "增资", "特别国债"])]
+
+
 def _event_signature_light(news: dict) -> tuple:
     """轻量事件签名 (stocks, events, numbers)
 
@@ -347,7 +353,11 @@ def _event_signature_light(news: dict) -> tuple:
         stocks.add(name)
     text = f"{news.get('title', '')} {news.get('content', '')}"
     events = set()
-    for group_name, keywords in _EVENT_KEYWORD_GROUPS:
+    # 2026-09-07 P0 审计：叠加推送层私有事件组 _EXTRA_EVENT_GROUPS——
+    # "注资/增资/特别国债"类宏观动作词不在共享表（calculators.py 保持不动），
+    # 导致"财政部注资8家中央金融企业"题材多源报道事件组全空、指纹分裂走
+    # 纯标题路径，轮内合并与跨轮 48h 拦截全部兜不住（17:02-21:02 五连推实证）。
+    for group_name, keywords in list(_EVENT_KEYWORD_GROUPS) + _EXTRA_EVENT_GROUPS:
         if any(kw in text for kw in keywords):
             events.add(group_name)
     numbers = _extract_core_numbers(text)
@@ -696,6 +706,8 @@ _EVENT_PHRASE_ANCHORS = [
     "合资", "收购", "并购", "建厂", "成立", "融资", "回购", "入股",
     "签约", "中标", "停牌", "重组", "破产", "退市", "处罚", "立案",
     "增持", "减持",
+    # 2026-09-07 P0 审计：宏观资本运作动作词（财政部注资题材五连推实证）
+    "注资", "增资",
 ]
 
 # 宏观数据发布后的市场反应合并词（2026-08-12 实证：21:31"美国CPI符合预期美股高开"
@@ -1528,6 +1540,7 @@ def _event_sig_key(e: dict) -> str:
 def _day_key(e: dict) -> str:
     """事件所在日期（YYYY-MM-DD，取 t 字段前缀）"""
     return str(e.get("t") or "")[:10]
+
 
 
 def _merge_state(local: dict, remote: dict) -> dict:
