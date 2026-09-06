@@ -3112,6 +3112,10 @@ def run_once(dry_run: bool = False) -> dict:
     for n in new_items:
         pref_score, hit = _prefilter(n)
         n["_pref_score"] = pref_score
+        # watchlist 公告直通（2026-09-07 P1）：跳过预筛竞争，等同高信号
+        # （候选恒进入 + 溢出排序恒优先）
+        if n.get("_watch_announce"):
+            hit = True
         n["_hit_signal"] = hit
         if pref_score >= PREFILTER_SCORE_MIN or hit:
             candidates.append(n)
@@ -3246,6 +3250,11 @@ def run_once(dry_run: bool = False) -> dict:
     daily_push_limit = _env_int("RT_MAX_PUSH_PER_DAY", 0)
     _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
+        # watchlist 公告直通（2026-09-07 P1）：白名单公告已跳过预筛竞争，
+        # 此处继续跳过强档方向/噪声/阈值/风险降级/题材饱和/日限额等闸门直接
+        # 推送（LLM 判定仍必须完成——judged=False 照常挂起；48h 同事件拦截
+        # 保留防重复推送）。
+        watch_direct = bool(n.get("_watch_announce"))
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
             # 未判定条目不推、不落指纹 → 下轮重新送 LLM 判定（避免规则误判方向）。
@@ -3264,7 +3273,8 @@ def run_once(dry_run: bool = False) -> dict:
         # 2026-08-04 用户口径：仅强利好/强利空（bullish/bearish）推送；
         # 弱档/中性/混合（mildly_bullish/mildly_bearish/neutral/mixed）一律不推，
         # 覆盖 market/sector/stock、外围科技必推、科技防漏推等全部路径。
-        if j.get("direction") not in ("bullish", "bearish"):
+        # 例外：watchlist 公告直通不适用（解除质押等公告方向常被判中性/弱档）。
+        if not watch_direct and j.get("direction") not in ("bullish", "bearish"):
             logger.info(f"非强档方向({j.get('direction')})，不推: {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
@@ -3272,7 +3282,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 2026-08-11 修复（审核实证 13/61 滥推）：栏目汇总/指数播报/盘面异动类
         # 即使 LLM 判强档也硬过滤（"晚间新闻精选""隔夜要闻""KOSPI涨超2%""概念异动拉升"），
         # 属"非重大消息"，按用户口径（仅重大事件推送）不应推。记 seen 标注原因。
-        noise_reason = _is_noise_push(n, j, leader_watchlist)
+        noise_reason = None if watch_direct else _is_noise_push(n, j, leader_watchlist)
         if noise_reason:
             logger.info(f"噪声过滤({noise_reason})，不推: {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
@@ -3296,7 +3306,10 @@ def run_once(dry_run: bool = False) -> dict:
         # 命中 _TECH_OVERRIDE_VIEW_WORDS（定性判断措辞）的科技消息不放行，
         # 让 LLM 的 push=false 生效；仅未命中观点词（可能被 LLM 漏判的硬事件）兜底放行。
         tech_override = _tech_override_enabled(n, j, leader_watchlist)
-        if j.get("push") and _passes_threshold(
+        if watch_direct:
+            # watchlist 公告直通：跳过阈值竞争直接推送
+            pass_round = True
+        elif j.get("push") and _passes_threshold(
                 mode, j.get("score", 0), j.get("direction", "neutral"),
                 j.get("scope", "stock"), leader_stock=is_leader):
             pass_round = True
@@ -3317,7 +3330,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 风险收缩期降级（2026-08-14 第二阶段联动）：risk_off 时，科技利好若无硬事件
         # 佐证（金额/订单/公告/获批等）则降级不推——与量化资金风险期降杠杆一致；
         # 利空/风险资讯不受影响（风险期更应提示）。seen 标注原因便于复核。
-        if risk_state == "risk_off" and _risk_off_downgrade(n, j):
+        if risk_state == "risk_off" and not watch_direct and _risk_off_downgrade(n, j):
             logger.info(f"风险收缩期降级(科技利好无硬事件佐证): {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[风险收缩期降级]"}
@@ -3335,7 +3348,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 同题材饱和拦截（2026-08-12 防偏科）：同一板块/实体 24h 内已推达上限
         # （默认 5 条）后不再推——存储行情日 17 推实证；market 级（宏观数据/大盘）
         # 豁免，CPI 等宏观数据永不受限。
-        if _topic_saturated(n["_sig"], pushed_events):
+        if not watch_direct and _topic_saturated(n["_sig"], pushed_events):
             logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
@@ -3345,7 +3358,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 全局日推送上限（2026-09-07 P0 审计 3.2）：计数源=pushed_events 当日条数。
         # 触顶后非高信号条目一律不推（保护 pushplus 200条/天限额与用户收件箱）；
         # 高信号（has_signal_keyword 命中，宏观/监管级核心事件）豁免防漏推。
-        if daily_push_limit > 0 and not has_signal_keyword(
+        if daily_push_limit > 0 and not watch_direct and not has_signal_keyword(
                 f"{n.get('title', '')} {n.get('content', '')}"):
             today_pushed = sum(1 for pe in pushed_events
                                if str(pe.get("t", ""))[:10] == now[:10])
@@ -3370,6 +3383,10 @@ def run_once(dry_run: bool = False) -> dict:
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
             _mark_candidate_pushed(state, _ck)
+            if watch_direct:
+                # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
+                state.setdefault("watch_announce", []).append(
+                    {"key": n.get("_watch_announce_key", ""), "t": now})
             # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
@@ -3386,6 +3403,10 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
                 _mark_candidate_pushed(state, _ck)
+                if watch_direct:
+                    # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
+                    state.setdefault("watch_announce", []).append(
+                        {"key": n.get("_watch_announce_key", ""), "t": now})
                 pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
                                       "title": str(n.get("title", ""))[:60],
                                       "source": str(n.get("source", "") or "")[:30]})

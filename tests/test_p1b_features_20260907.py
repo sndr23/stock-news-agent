@@ -274,3 +274,77 @@ class TestAnnounceIngestRunOnce:
         assert items[0]["_announce_category"] == "回购"
 
 
+# ============================================================
+# 任务3：watchlist 个股公告直通（用解质押公告做用例）
+# ============================================================
+
+PLEDGE_RELEASE = {"code": "300308", "name": "中际旭创", "type": "股份解押",
+                  "title": "关于控股股东部分股份解除质押的公告",
+                  "content": "关于控股股东部分股份解除质押的公告",
+                  "published_at": "2026-09-07"}
+PLEDGE_RELEASE_2 = {"code": "300308", "name": "中际旭创", "type": "股份解押",
+                    "title": "关于控股股东5000万股解除质押的公告",
+                    "content": "关于控股股东5000万股解除质押的公告",
+                    "published_at": "2026-09-07"}
+WATCHLIST = {"中际旭创", "新易盛"}
+
+
+class TestWatchlistAnnounceDirectPass:
+    def test_direct_push_bypasses_gates(self, monkeypatch, tmp_path):
+        """watchlist 白名单公告：LLM 判中性/不推仍直通推送（跳过预筛竞争与推送闸门）"""
+        state_path = _setup_run_round(monkeypatch, tmp_path,
+                                      announcements=[PLEDGE_RELEASE],
+                                      judge={"push": False, "direction": "neutral",
+                                             "scope": "stock"},
+                                      watchlist=WATCHLIST)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 1, "直通公告必须推送"
+        assert "解除质押" in saved["pushed_events"][0].get("title", "")
+        fp = rtp._news_fingerprint(rtp._announce_to_news_item(PLEDGE_RELEASE, "解除质押"))
+        assert saved["seen"].get(fp, {}).get("pushed") is True
+        assert saved["watch_announce"] == [{"key": "300308|解除质押", "t": saved["watch_announce"][0]["t"]}]
+
+    def test_same_stock_same_type_limited_once_per_24h(self, monkeypatch, tmp_path):
+        """防刷屏：同股同类别 24h 内限 1 条（第二条不同措辞的解质押公告不推）"""
+        state_path = _setup_run_round(monkeypatch, tmp_path,
+                                      announcements=[PLEDGE_RELEASE],
+                                      judge={"push": False, "direction": "neutral",
+                                             "scope": "stock"},
+                                      watchlist=WATCHLIST)
+        rtp.run_once(dry_run=False)
+        assert len(_load_saved_state(state_path)["pushed_events"]) == 1
+
+        # 第二轮：另一条解质押公告（不同措辞→不同指纹），同股同类别 → 限频跳过
+        _setup_run_round(monkeypatch, tmp_path,
+                         announcements=[PLEDGE_RELEASE_2],
+                         judge={"push": False, "direction": "neutral", "scope": "stock"},
+                         watchlist=WATCHLIST)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 1, "同股同类别 24h 内不得重复推送"
+        fp2 = rtp._news_fingerprint(rtp._announce_to_news_item(PLEDGE_RELEASE_2, "解除质押"))
+        assert fp2 not in saved["seen"], "限频条目在入口即被丢弃，不进管线"
+
+    def test_non_watchlist_announcement_still_gated(self, monkeypatch, tmp_path):
+        """非 watchlist 公告不走直通：中性判定 → 强档方向门槛拦截"""
+        ann = {**PLEDGE_RELEASE, "code": "000001", "name": "平安银行"}
+        state_path = _setup_run_round(monkeypatch, tmp_path,
+                                      announcements=[ann],
+                                      judge={"push": False, "direction": "neutral",
+                                             "scope": "stock"},
+                                      watchlist=WATCHLIST)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert saved["pushed_events"] == [], "非 watchlist 公告仍受推送闸门约束"
+
+    def test_direct_flag_requires_watchlist_hit(self, monkeypatch, tmp_path):
+        state = rtp._empty_state()
+        items = rtp._ingest_announcements([PLEDGE_RELEASE], WATCHLIST, state)
+        assert items[0].get("_watch_announce") is True
+        assert items[0]["_watch_announce_key"] == "300308|解除质押"
+        # 空名单 → 无直通标记
+        items2 = rtp._ingest_announcements([PLEDGE_RELEASE], set(), rtp._empty_state())
+        assert items2 and not items2[0].get("_watch_announce")
+
+
