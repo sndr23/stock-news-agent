@@ -108,7 +108,9 @@ def _env_int(name: str, default: int) -> int:
 # ============================================================
 # 复用项目现有能力（不重复造轮子）
 # ============================================================
-from src.tools.data_fetchers import get_stock_news, get_market_signals, dedup_news_3layer  # 多源聚合抓取 + 三层近似去重
+from src.tools.data_fetchers import (get_stock_news, get_market_signals,
+                                     dedup_news_3layer)  # 多源聚合抓取 + 三层近似去重
+from src.tools.data_fetchers import load_source_health, save_source_health  # 源健康状态（P1 源健康告警）
 from src.tools.calculators import (
     calculate_prefilter_importance,   # 预筛评分
     _EVENT_KEYWORD_GROUPS,            # 事件关键词组
@@ -232,8 +234,86 @@ _zero_push_streak = [0]
 # watchlist 空名单告警去重（2026-08-13 P1-2：--loop 模式只告警一次，避免每轮刷屏）
 _watchlist_warned = [False]
 
+# 源健康告警（2026-09-07 P1）：单源连续 N 轮拉取为空 → 推送一条告警
+# （同源 24h 限频 1 次）；全部源同时为空 = 市场静默（如非交易时段），不告警。
+# 数据由 data_fetchers.record_source_health 落本地状态（logs/source_health.json）。
+SOURCE_HEALTH_ALERT_STREAK = 6
+SOURCE_HEALTH_ALERT_INTERVAL_HOURS = 24
+
 # Gist 内状态文件名
 GIST_STATE_FILENAME = "real_time_state.json"
+
+def _parse_bjt(value: str):
+    """状态时间字符串（北京时间）转 aware datetime，失败返回 None"""
+    try:
+        return datetime.strptime(str(value or ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=BJT)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluate_source_health_alerts(health: dict, now: datetime | None = None) -> list:
+    """从源健康状态生成待推送告警，返回 [(源名, 告警文案)]。
+
+    规则：
+    - 单源连续空轮数 >= SOURCE_HEALTH_ALERT_STREAK 才告警（文案含源名与连续空轮数）；
+    - 同源 SOURCE_HEALTH_ALERT_INTERVAL_HOURS 小时内已告警过则跳过（24h 限频）；
+    - 本轮全部源拉取均为空 = 市场静默（非交易时段正常现象），不告警。
+    """
+    now = now or datetime.now(BJT)
+    entries = {k: v for k, v in (health or {}).items() if isinstance(v, dict)}
+    if not entries:
+        return []
+    counts = {k: int(v.get("count", 0) or 0) for k, v in entries.items()}
+    if all(c == 0 for c in counts.values()):
+        return []  # 市场静默：全源同时空，非单源故障
+    alerts = []
+    for label, e in entries.items():
+        streak = int(e.get("streak", 0) or 0)
+        if streak < SOURCE_HEALTH_ALERT_STREAK:
+            continue
+        last = _parse_bjt(e.get("last_alert", ""))
+        if last and (now - last) < timedelta(hours=SOURCE_HEALTH_ALERT_INTERVAL_HOURS):
+            continue
+        alerts.append((label,
+                       f"⚠️ 源健康告警：数据源「{label}」已连续 {streak} 轮拉取为空"
+                       f"（最近记录 {e.get('t', '')}），可能故障，请人工检查。"))
+    return alerts
+
+
+def push_source_health_alerts(push_config: dict, dry_run: bool = False,
+                              health: dict | None = None,
+                              now: datetime | None = None) -> int:
+    """检查源健康并推送告警（同源 24h 限频），返回实际推送条数。
+
+    health/now 参数供测试注入；默认读 data_fetchers 落地的本地源健康状态。
+    告警推送成功才回写 last_alert（推送失败下轮重试）；检查异常只告警日志，
+    不影响主推送流程。
+    """
+    try:
+        health = load_source_health() if health is None else health
+        alerts = evaluate_source_health_alerts(health, now=now)
+        if not alerts:
+            return 0
+        now = now or datetime.now(BJT)
+        sent = 0
+        for label, msg in alerts:
+            if dry_run:
+                logger.warning(f"[dry-run] 将推送源健康告警: {msg}")
+                continue
+            result = _send_alert_item(push_config, "源健康告警", msg)
+            if result.get("code") == 200 or result.get("errcode") == 0:
+                if isinstance(health.get(label), dict):
+                    health[label]["last_alert"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                sent += 1
+                logger.warning(f"源健康告警已推送: {msg}")
+            else:
+                logger.error(f"源健康告警推送失败（下轮重试）: {msg} | {result}")
+        if sent:
+            save_source_health(health)
+        return sent
+    except Exception as e:
+        logger.warning(f"源健康告警检查异常(不影响主流程): {e}")
+        return 0
 
 # ============================================================
 # 阈值模式
@@ -2841,6 +2921,11 @@ def run_once(dry_run: bool = False) -> dict:
     except Exception as e:
         logger.error(f"市场信号抓取失败: {e}", exc_info=True)
         signals = []
+
+    # 源健康告警（2026-09-07 P1）：区分"没新闻"与"源挂了"——单源连续多轮空
+    # 推送告警（同源 24h 限频），全源同时空视为市场静默不告警。
+    # 检查异常只记日志，不影响主推送流程。
+    push_source_health_alerts(push_config, dry_run=dry_run)
 
     # 跨源近似去重（URL/精确标题之外补一层 SimHash）：同一事件不同措辞的多源
     # 报道先在入口收敛，避免各自进指纹/候选、重复消耗 LLM 判定 token。
