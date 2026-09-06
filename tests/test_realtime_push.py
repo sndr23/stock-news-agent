@@ -2598,3 +2598,239 @@ class TestPrefilterWatchlistDirectPass:
         monkeypatch.setattr(rtp, "_PREF_WATCHLIST_NAMES_CACHE", ["生益科技"])
         assert rtp._hit_headline_entity("生益科技:半年度利润分配实施公告")
         assert not rtp._hit_headline_entity("无主体词的普通标题")
+
+
+# ============================================================
+# PUSH-OPT-P0 批次（2026-09-07 审计修复）
+# ============================================================
+
+def _setup_run_round(monkeypatch, tmp_path, news_list, judge=None, alert_result=None):
+    """run_once 单轮测试公共桩：本地状态文件 + 固定 LLM 判定 + 可配置推送结果"""
+    news = type("T", (), {"func": staticmethod(lambda: list(news_list))})()
+    sig = type("T", (), {"func": staticmethod(lambda: [])})()
+    monkeypatch.setattr(rtp, "get_stock_news", news)
+    monkeypatch.setattr(rtp, "get_market_signals", sig)
+    monkeypatch.setenv("GIST_TOKEN", "")
+    monkeypatch.setenv("GIST_ID", "")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+    monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+    monkeypatch.setattr(rtp, "_send_alert_item",
+                        lambda cfg, t, c: alert_result if alert_result is not None else {"code": 200})
+    base_judge = {"push": True, "score": 8, "direction": "bullish", "scope": "market",
+                  "sectors": [], "entities": [], "is_leader_stock": False,
+                  "reason": "重大事件"}
+    if judge:
+        base_judge.update(judge)
+    monkeypatch.setattr(rtp, "_llm_judge",
+                        lambda items, **kw: [dict(base_judge) for _ in items])
+    return tmp_path / "real_time_state.json"
+
+
+def _load_saved_state(state_path):
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+class TestMacroCapitalInjectDedup0907:
+    """审计缺口1：同事件多源重复——"注资/增资/特别国债"宏观动作词事件组缺失。
+
+    实证：财政部注资8家中央金融企业题材 17:02-21:02 五连推——
+    该类词不在 _EVENT_PHRASE_ANCHORS 也不在共享 _EVENT_KEYWORD_GROUPS，
+    指纹分裂走纯标题路径，轮内合并与跨轮 48h 拦截全部兜不住。
+    修复：锚表追加 + 推送层私有 _EXTRA_EVENT_GROUPS 叠加（不动共享表）。
+    """
+
+    def test_extra_event_groups_module_table(self):
+        assert ("注资", ["注资", "增资", "特别国债"]) in rtp._EXTRA_EVENT_GROUPS
+        # 共享表（calculators.py）不得被改动
+        import src.tools.calculators as calc
+        assert ("注资", ["注资", "增资", "特别国债"]) not in calc._EVENT_KEYWORD_GROUPS
+
+    def test_phrase_anchors_extended(self):
+        assert "注资" in rtp._EVENT_PHRASE_ANCHORS
+        assert "增资" in rtp._EVENT_PHRASE_ANCHORS
+
+    def test_two_sources_same_event_via_shared_group(self):
+        """两源不同措辞标题判同事件，且走 _same_event_shared_group 路径。"""
+        a = {"title": "财政部宣布注资8家中央金融企业", "content": "", "category": "news"}
+        b = {"title": "四部门部署向中央金融企业增资", "content": "", "category": "news"}
+        sig_a = rtp._push_event_sig(a, {"entities": ["财政部"], "scope": "market"})
+        sig_b = rtp._push_event_sig(b, {"entities": [], "scope": "market"})
+        assert "注资" in sig_a["events"], "标题含注资应抽到注资事件组"
+        assert "注资" in sig_b["events"], "标题含增资应归入同组"
+        ctx = rtp._same_event_ctx(sig_a, sig_b)
+        assert ctx.shared_ev == {"注资"}, "两源必须共享注资事件组（修复前为空集）"
+        assert rtp._is_same_event(sig_a, sig_b)
+
+    def test_rrj_cut_vs_zhu_zi_not_merged(self):
+        """反向锁死：央行降准与央行注资不得因实体重叠被误并。"""
+        c = {"title": "央行宣布降准0.5个百分点", "content": "", "category": "news"}
+        d = {"title": "央行注资两家股份制银行", "content": "", "category": "news"}
+        sig_c = rtp._push_event_sig(c, {"entities": ["央行"], "scope": "market"})
+        sig_d = rtp._push_event_sig(d, {"entities": ["央行"], "scope": "market"})
+        assert "注资" not in sig_c["events"]
+        assert "注资" in sig_d["events"]
+        assert not rtp._is_same_event(sig_c, sig_d)
+
+
+class TestPushFailureRetry0907:
+    """审计缺口2：推送失败分支什么都不写——条目滚出源窗口后静默漏推，
+    持续假失败时无重试上限。修复：失败挂起 pending（带 payload）重试，
+    连续 MAX_PENDING_RETRY 轮失败写 seen 放弃。"""
+
+    NEWS = [{"title": "中际旭创 800G 光模块获海外大单",
+             "content": "公司公告获得海外大客户订单",
+             "source": "财联社", "published_at": "2026-09-07 10:00:00",
+             "affected_stocks": ["中际旭创"]}]
+
+    def test_push_failure_goes_to_pending_with_payload(self, monkeypatch, tmp_path):
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS,
+                                      alert_result={"code": 500, "msg": "server error"})
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        fp = rtp._news_fingerprint(self.NEWS[0])
+        assert fp not in saved["seen"], "失败条目不得写 seen（否则永久漏推）"
+        rec = saved["pending"].get(fp)
+        assert rec, "推送失败必须挂起 pending 下轮重试"
+        assert rec["retry"] == 1
+        assert rec.get("payload", {}).get("title"), "pending 必须带 payload 供主动重注入"
+
+    def test_push_failure_abandons_after_max_retries(self, monkeypatch, tmp_path):
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS,
+                                      alert_result={"code": 500, "msg": "server error"})
+        for _ in range(rtp.MAX_PENDING_RETRY):
+            rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        fp = rtp._news_fingerprint(self.NEWS[0])
+        rec = saved["seen"].get(fp)
+        assert rec, "连续失败达上限必须写 seen（防无限重试）"
+        assert "推送失败放弃" in rec["title"]
+        assert rec["pushed"] is False
+        assert fp not in saved["pending"]
+
+    def test_failure_reinject_then_success_clears_pending(self, monkeypatch, tmp_path):
+        """失败挂起 → 重注入 → 下轮成功：pending 清空、seen pushed=True。"""
+        item = {"title": "央行宣布降准0.5个百分点",
+                "content": "央行决定下调金融机构存款准备金率",
+                "source": "财联社", "published_at": "2026-09-07 10:00:00"}
+        fp = rtp._news_fingerprint(item)
+        state_path = tmp_path / "real_time_state.json"
+        state_path.write_text(json.dumps({
+            "seen": {},
+            "pending": {fp: {"t": "2026-09-07 10:00:00", "retry": 1,
+                             "title": item["title"],
+                             "payload": rtp._pend_payload(item)}},
+            "pushed_events": [], "candidate_events": [],
+        }, ensure_ascii=False), encoding="utf-8")
+        # 本轮源窗口已滚出该条目：news_list 只有无关条目，触发主动重注入
+        filler = {"title": "某公司召开例行股东大会", "content": "审议年度议案",
+                  "source": "财联社", "published_at": "2026-09-07 11:00:00"}
+        state_path2 = _setup_run_round(monkeypatch, tmp_path, [filler])
+        assert state_path2 == state_path
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert saved["seen"].get(fp, {}).get("pushed") is True, "重注入后成功必须置 pushed=True"
+        assert fp not in saved["pending"], "已定论条目必须从 pending 移除"
+
+
+class TestCandidatePushedBackfill0907:
+    """审计缺口3：candidate_events pushed 字段从无置 True 路径 + 裁剪纯 FIFO
+    把未推强档候选挤出。修复：推送成功按 (日期,事件签名) 回查置 True；
+    裁剪改为未推优先保留（已推先淘汰）。"""
+
+    def test_candidate_marked_pushed_after_success(self, monkeypatch, tmp_path):
+        news = [{"title": "中际旭创 800G 光模块获海外大单",
+                 "content": "公司公告获得海外大客户订单",
+                 "source": "财联社", "published_at": "2026-09-07 10:00:00",
+                 "affected_stocks": ["中际旭创"]}]
+        state_path = _setup_run_round(monkeypatch, tmp_path, news)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        cands = saved["candidate_events"]
+        assert cands, "判定候选必须落 candidate_events"
+        assert all(e.get("pushed") is True for e in cands), \
+            "推送成功后对应 candidate 的 pushed 必须回填 True"
+
+    def test_trimming_keeps_unpushed_drops_pushed_first(self, monkeypatch, tmp_path, caplog):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cands = [{"entities": [], "events": [f"e{i}"], "numbers": [],
+                  "title_norm": f"未推{i}", "t": now, "pushed": False}
+                 for i in range(300)]
+        cands += [{"entities": [], "events": [f"p{i}"], "numbers": [],
+                   "title_norm": f"已推{i}", "t": now, "pushed": True}
+                  for i in range(10)]
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        with caplog.at_level("WARNING", logger=rtp.logger.name):
+            rtp.save_state({"seen": {}, "pending": {}, "pushed_events": [],
+                            "candidate_events": cands})
+        saved = _load_saved_state(tmp_path / "real_time_state.json")
+        ce = saved["candidate_events"]
+        assert len(ce) == 300
+        assert all(not e.get("pushed") for e in ce), "溢出裁剪必须已推条目先淘汰"
+        assert any("candidate_events" in r.message for r in caplog.records), \
+            "裁剪发生时必须 warning 留痕"
+
+
+class TestDailyPushLimit0907:
+    """审计 3.2：全局日推送上限 RT_MAX_PUSH_PER_DAY（0=不启用）。
+    计数源=pushed_events 当日条数；触顶后非高信号条目不推落 seen。"""
+
+    NEWS_TWO = [
+        {"title": "中际旭创 800G 光模块获海外大单",
+         "content": "公司公告获得海外大客户订单",
+         "source": "财联社", "published_at": "2026-09-07 10:00:00",
+         "affected_stocks": ["中际旭创"]},
+        {"title": "紫金矿业卡莫阿铜矿三期正式投产",
+         "content": "公司公告相关事项",
+         "source": "财联社", "published_at": "2026-09-07 10:05:00",
+         "affected_stocks": ["紫金矿业"]},
+    ]
+
+    @staticmethod
+    def _bypass_zijin_prefilter(monkeypatch):
+        """紫金条目预筛分不足（0.14 < 0.55），这里放行普通条目路径（限额测试与预筛无关）。
+        注意该条目不得命中 has_signal_keyword——否则会被限额豁免而非拦下。"""
+        real_pf = rtp._prefilter
+
+        def _pf(n):
+            if "紫金矿业" in str(n.get("title", "")):
+                return 5.0, False
+            return real_pf(n)
+
+        monkeypatch.setattr(rtp, "_prefilter", _pf)
+
+    def test_daily_limit_blocks_normal_item(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RT_MAX_PUSH_PER_DAY", "1")
+        self._bypass_zijin_prefilter(monkeypatch)
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 1, "触顶后普通条目不得推送"
+        fp2 = rtp._news_fingerprint(self.NEWS_TWO[1])
+        rec = saved["seen"].get(fp2, {})
+        assert "日限额不推" in rec.get("title", ""), "触顶条目必须落 seen 并标注原因"
+
+    def test_daily_limit_high_signal_item_exempt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RT_MAX_PUSH_PER_DAY", "1")
+        self._bypass_zijin_prefilter(monkeypatch)
+        high = {"title": "央行宣布降准0.5个百分点",
+                "content": "央行决定下调金融机构存款准备金率",
+                "source": "财联社", "published_at": "2026-09-07 10:10:00"}
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO + [high])
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 2, "触顶后高信号条目仍应推送"
+        blocked = {fp for fp, rec in saved["seen"].items()
+                   if "日限额不推" in rec.get("title", "")}
+        assert rtp._news_fingerprint(high) not in blocked
+
+    def test_daily_limit_default_zero_no_effect(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RT_MAX_PUSH_PER_DAY", raising=False)
+        self._bypass_zijin_prefilter(monkeypatch)
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 2, "默认 0=不启用，不得拦截"
