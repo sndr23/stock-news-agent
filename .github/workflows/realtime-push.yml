@@ -49,6 +49,8 @@ jobs:
       RT_ALWAYS_ON: "1"
       # 单轮进入 LLM 判定的候选条数上限
       RT_MAX_CANDIDATES: "40"
+      # 全局日推送上限（审计 3.2）：0=不启用；触顶后仅高信号条目仍可推送
+      RT_MAX_PUSH_PER_DAY: ${{ secrets.RT_MAX_PUSH_PER_DAY }}
 
     steps:
       - name: 检出代码
