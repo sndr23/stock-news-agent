@@ -2865,3 +2865,88 @@ class TestNormalizeTitleDecimal:
     def test_truncate_still_40(self):
         out = rtp._normalize_title("涨" * 50 + "2.9")
         assert len(out) == 40
+
+
+# ============================================================
+# 2026-09-07 标题党治理：实质版优先 + 截断标题拦截
+# ============================================================
+
+class TestHeadlineQuality0907:
+    """候选择优加入"实质版优先"：实体名+具体数字+增量信息加权，
+    纯情绪化标题降权；以省略号结尾的截断标题不进入推送。"""
+
+    def test_substantive_title_plus_one(self):
+        n = {"title": "中际旭创拟40-80亿元回购股份",
+             "affected_stocks": ["中际旭创"]}
+        assert rtp._headline_quality(n) == 1
+
+    def test_substantive_colon_entity_plus_one(self):
+        # 公告式标题：冒号前主体即实体
+        n = {"title": "中际旭创:拟40亿元回购公司股份"}
+        assert rtp._headline_quality(n) == 1
+
+    def test_substantive_no_entity_zero(self):
+        # 有数字有增量信息但无具体实体名 → 中性，不加权
+        n = {"title": "存储芯片价格较上月上涨15%"}
+        assert rtp._headline_quality(n) == 0
+
+    def test_emotional_without_digit_minus_one(self):
+        assert rtp._headline_quality({"title": "半导体板块疯了！"}) == -1
+        assert rtp._headline_quality({"title": "存储芯片价格杀疯了"}) == -1
+
+    def test_emotional_with_digit_not_demoted(self):
+        # "油价暴涨6%" 含数字——事实性表述，不降权
+        assert rtp._headline_quality({"title": "油价暴涨6%"}) == 0
+
+    def test_neutral_title_zero(self):
+        assert rtp._headline_quality({"title": "央行开展逆回购操作"}) == 0
+
+    def test_sort_key_substantive_beats_higher_score(self):
+        substantive = {"title": "中际旭创拟40亿元回购股份",
+                       "affected_stocks": ["中际旭创"],
+                       "_hit_signal": False, "_pref_score": 5.0}
+        emotional = {"title": "半导体板块疯了！",
+                     "_hit_signal": False, "_pref_score": 9.0}
+        assert rtp._candidate_sort_key(substantive) > rtp._candidate_sort_key(emotional)
+
+    def test_sort_key_emotional_sinks(self):
+        neutral = {"title": "某公司发布公告", "_hit_signal": False, "_pref_score": 5.0}
+        emotional = {"title": "板块崩了", "_hit_signal": False, "_pref_score": 9.0}
+        assert rtp._candidate_sort_key(neutral) > rtp._candidate_sort_key(emotional)
+
+    def test_sort_key_keeps_signal_macro_priority(self):
+        """高信号/宏观层级仍优先于实质版（不逆转既有分层）"""
+        macro = {"title": "普通标题", "content": "央行 降准",
+                 "_hit_signal": False, "_pref_score": 1.0}
+        substantive = {"title": "中际旭创拟40亿元回购股份",
+                       "affected_stocks": ["中际旭创"],
+                       "_hit_signal": False, "_pref_score": 9.0}
+        assert rtp._candidate_sort_key(macro) > rtp._candidate_sort_key(substantive)
+
+    def test_truncated_title_detection(self):
+        assert rtp._is_truncated_title("某公司发布公告…") is True
+        assert rtp._is_truncated_title("某公司发布公告...") is True
+        assert rtp._is_truncated_title("某公司发布公告。。。") is True
+        assert rtp._is_truncated_title("某公司发布公告") is False
+        assert rtp._is_truncated_title("…") is True
+        assert rtp._is_truncated_title("") is False
+
+    def test_truncated_title_excluded_from_push(self, monkeypatch, tmp_path):
+        """截断标题不进入推送：写 seen [截断]，完整标题版本正常推送"""
+        monkeypatch.setenv("PUSHPLUS_TOKEN", "test-token")
+        truncated = {"title": "中际旭创 800G 光模块获海外大单…",
+                     "content": "公司公告获得海外大客户订单",
+                     "source": "财联社", "published_at": "2026-09-07 10:00:00"}
+        # 完整可推条目须与截断版标题不同（仅差省略号的同标题会被三层去重收敛）
+        full = {"title": "央行宣布降准0.5个百分点 释放万亿流动性",
+                "content": "国常会部署，支持实体",
+                "source": "财联社", "published_at": "2026-09-07 10:05:00"}
+        state_path = _setup_run_round(monkeypatch, tmp_path, [truncated, full])
+        stats = rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        fp_trunc = rtp._news_fingerprint(truncated)
+        assert fp_trunc in saved["seen"], "截断标题必须写 seen 防重复进入"
+        assert saved["seen"][fp_trunc]["title"].endswith("[截断]")
+        assert saved["seen"][fp_trunc].get("pushed") is False
+        assert saved["pushed_events"], "完整标题版本必须正常推送"
+        assert stats["pushed"] == 1

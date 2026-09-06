@@ -979,6 +979,86 @@ def _is_macro_policy(news: dict) -> bool:
     return any(k in text for k in _MACRO_POLICY_KEYWORDS)
 
 
+# ============================================================
+# 标题党治理（2026-09-07 P1）：实质版优先
+# ============================================================
+# 增量信息词：标题表达事实变化（数值变动/事件落地）而非情绪渲染
+_HEADLINE_INCREMENTAL_MARKERS = (
+    "较", "增至", "涨至", "跌至", "降至", "回落至", "增长", "增逾", "增",
+    "落地", "获批", "核准", "中标", "签署", "达成", "上调", "下调",
+    "增持", "减持", "回购", "解除质押", "质押", "扩产", "投产", "交付",
+    "创新高", "创下", "突破", "立案", "调查", "回购",
+)
+# 纯情绪化词：渲染性措辞（仅在无数字、无增量信息时才判情绪化）
+_HEADLINE_EMOTIONAL_MARKERS = (
+    "疯涨", "疯抢", "炸裂", "惊呆", "震惊", "崩了", "疯了", "太猛",
+    "杀疯了", "史诗级", "王炸", "炸锅", "嗨了", "慌了", "火了", "爆了",
+    "彻底慌", "要变天", "大事不好", "紧急提醒", "速看", "刚刚传来",
+)
+
+
+def _headline_quality(news: dict) -> int:
+    """标题"实质版"质量分（候选择优溢出排序用）
+
+    +1 实质版：标题含具体实体名 + 具体数字 + 增量信息（较/增至/落地等）
+    -1 纯情绪化：情绪词/感叹号渲染且无数字、无增量信息
+     0 中性
+    """
+    title = str(news.get("title", "") or "").strip()
+    if not title:
+        return 0
+    has_digit = bool(re.search(r"\d", title))
+    has_incr = any(m in title for m in _HEADLINE_INCREMENTAL_MARKERS)
+    has_entity = _title_has_entity(news, title)
+    if has_entity and has_digit and has_incr:
+        return 1
+    if not has_digit and not has_incr and (
+            any(m in title for m in _HEADLINE_EMOTIONAL_MARKERS)
+            or "！" in title or title.count("!") >= 1):
+        return -1
+    return 0
+
+
+_TRUNCATED_ENDINGS = ("…", "。。。", "...", "。。")
+
+
+def _is_truncated_title(title: str) -> bool:
+    """标题是否为"…"截断标题（以省略号结尾）——信息不完整，不进入推送"""
+    t = str(title or "").strip()
+    return t.endswith(_TRUNCATED_ENDINGS)
+
+
+def _title_has_entity(news: dict, title: str) -> bool:
+    """标题是否含具体实体名：显式字段（name/affected_stocks/entities）
+    出现在标题中，或公告式标题冒号前主体（"中际旭创:关于回购…"）"""
+    entities = [str(e).strip() for e in _as_list(news.get("affected_stocks"))]
+    entities += [str(e).strip() for e in _as_list(news.get("entities"))]
+    name = str(news.get("name", "") or "").strip()
+    if name:
+        entities.append(name)
+    if any(e and e in title for e in entities):
+        return True
+    if ("：" in title or ":" in title):
+        head = re.split("[：:]", title, 1)[0].strip()
+        if 2 <= len(head) <= 12:
+            return True
+    return False
+
+
+def _candidate_sort_key(x: dict) -> tuple:
+    """候选择优排序键（溢出截断时用）：高信号 > 宏观 > 实质版 > 预筛分
+
+    2026-09-07 标题党治理：同层内实质版（实体+数字+增量信息）优先，
+    纯情绪化标题沉底——多源同事件各措辞竞逐最后槽位时，实质版胜出。
+    """
+    return (
+        1 if x.get("_hit_signal") else 0,
+        1 if _is_macro_policy(x) else 0,
+        _headline_quality(x),
+        x["_pref_score"],
+    )
+
+
 def _topic_saturated(sig: dict, pushed_events: list) -> bool:
     """同题材推送是否已达饱和：market 级仅宏观数据豁免（其余走主题槽位，上限3）；
     板块/实体 24h 内已推 ≥ 上限（5）
@@ -2892,8 +2972,17 @@ def run_once(dry_run: bool = False) -> dict:
         return {"fetched": len(news_list), "new": 0, "prefiltered": 0, "pushed": 0, "skipped": 0}
 
     # 3. 规则预筛（重要度评分 或 高信号词命中）
+    # 标题党治理（2026-09-07 P1）：以省略号结尾的截断标题信息不完整，
+    # 不进入推送候选（写 seen 防每轮重复进入；后续其他源给出完整标题
+    # 时指纹不同，仍正常处理）。
+    now_pref = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
     candidates = []
     for n in new_items:
+        if _is_truncated_title(str(n.get("title", "") or "")):
+            seen[n["_fp"]] = {"t": now_pref, "pushed": False,
+                              "title": str(n.get("title", ""))[:60] + "[截断]"}
+            logger.info(f"截断标题不进入推送: {str(n.get('title', ''))[:40]}")
+            continue
         pref_score, hit = _prefilter(n)
         n["_pref_score"] = pref_score
         n["_hit_signal"] = hit
@@ -2916,13 +3005,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 科技条目（韩国/存储/英伟达等宽泛词也命中）仍可能把宏观数据挤出——
         # 今日 36 推中存储 17 条、宏观 0 条实证。宏观优先确保 CPI/降准等
         # 确定性宏观事件在溢出时不被打压。
-        candidates.sort(
-            key=lambda x: (
-                1 if x.get("_hit_signal") else 0,
-                1 if _is_macro_policy(x) else 0,
-                x["_pref_score"],
-            ),
-            reverse=True)
+        candidates.sort(key=_candidate_sort_key, reverse=True)
         overflow = candidates[max_candidates:]
         candidates = candidates[:max_candidates]
         now_for_pend = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
@@ -2945,10 +3028,11 @@ def run_once(dry_run: bool = False) -> dict:
         overflow_fps = set()
     logger.info(f"规则预筛: 通过 {len(candidates)}/{len(new_items)} 条")
     if not candidates:
-        # 全部不达标：记录指纹，不推送（跳过 pending 溢出条目——它们下轮重试）
+        # 全部不达标：记录指纹，不推送（跳过 pending 溢出条目——它们下轮重试；
+        # 已有 seen 记录的条目不覆盖，保留 [截断] 等标注原因）
         now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
         for n in new_items:
-            if n["_fp"] in pending:
+            if n["_fp"] in pending or n["_fp"] in seen:
                 continue
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
         if not dry_run:
