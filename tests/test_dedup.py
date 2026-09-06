@@ -45,6 +45,16 @@ class TestInNewsWindow:
         today = datetime.now(BJT).strftime("%Y-%m-%d")
         assert _in_news_window(today) is True
 
+    def test_today_later_clock_time_passes(self):
+        """当天日期+晚于当前时刻的时间戳不算未来（上界按日期粒度）。
+
+        回归：凌晨运行时"今天 19:16:56"曾被时间戳级上界误判为未来，
+        导致 yicai/东财行业/持仓公告三个解析器在测试与生产中丢条目。
+        """
+        today = datetime.now(BJT).strftime("%Y-%m-%d")
+        assert _in_news_window(f"{today} 23:59:59") is True
+        assert _in_news_window(f"{today}T23:59:59") is True
+
     def test_future_rejected(self):
         future = (datetime.now(BJT) + timedelta(days=2)).strftime("%Y-%m-%d")
         assert _in_news_window(future) is False
