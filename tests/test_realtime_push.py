@@ -2773,3 +2773,64 @@ class TestCandidatePushedBackfill0907:
         assert any("candidate_events" in r.message for r in caplog.records), \
             "裁剪发生时必须 warning 留痕"
 
+
+class TestDailyPushLimit0907:
+    """审计 3.2：全局日推送上限 RT_MAX_PUSH_PER_DAY（0=不启用）。
+    计数源=pushed_events 当日条数；触顶后非高信号条目不推落 seen。"""
+
+    NEWS_TWO = [
+        {"title": "中际旭创 800G 光模块获海外大单",
+         "content": "公司公告获得海外大客户订单",
+         "source": "财联社", "published_at": "2026-09-07 10:00:00",
+         "affected_stocks": ["中际旭创"]},
+        {"title": "紫金矿业卡莫阿铜矿三期正式投产",
+         "content": "公司公告相关事项",
+         "source": "财联社", "published_at": "2026-09-07 10:05:00",
+         "affected_stocks": ["紫金矿业"]},
+    ]
+
+    @staticmethod
+    def _bypass_zijin_prefilter(monkeypatch):
+        """紫金条目预筛分不足（0.14 < 0.55），这里放行普通条目路径（限额测试与预筛无关）。
+        注意该条目不得命中 has_signal_keyword——否则会被限额豁免而非拦下。"""
+        real_pf = rtp._prefilter
+
+        def _pf(n):
+            if "紫金矿业" in str(n.get("title", "")):
+                return 5.0, False
+            return real_pf(n)
+
+        monkeypatch.setattr(rtp, "_prefilter", _pf)
+
+    def test_daily_limit_blocks_normal_item(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RT_MAX_PUSH_PER_DAY", "1")
+        self._bypass_zijin_prefilter(monkeypatch)
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 1, "触顶后普通条目不得推送"
+        fp2 = rtp._news_fingerprint(self.NEWS_TWO[1])
+        rec = saved["seen"].get(fp2, {})
+        assert "日限额不推" in rec.get("title", ""), "触顶条目必须落 seen 并标注原因"
+
+    def test_daily_limit_high_signal_item_exempt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RT_MAX_PUSH_PER_DAY", "1")
+        self._bypass_zijin_prefilter(monkeypatch)
+        high = {"title": "央行宣布降准0.5个百分点",
+                "content": "央行决定下调金融机构存款准备金率",
+                "source": "财联社", "published_at": "2026-09-07 10:10:00"}
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO + [high])
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 2, "触顶后高信号条目仍应推送"
+        blocked = {fp for fp, rec in saved["seen"].items()
+                   if "日限额不推" in rec.get("title", "")}
+        assert rtp._news_fingerprint(high) not in blocked
+
+    def test_daily_limit_default_zero_no_effect(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RT_MAX_PUSH_PER_DAY", raising=False)
+        self._bypass_zijin_prefilter(monkeypatch)
+        state_path = _setup_run_round(monkeypatch, tmp_path, self.NEWS_TWO)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert len(saved["pushed_events"]) == 2, "默认 0=不启用，不得拦截"

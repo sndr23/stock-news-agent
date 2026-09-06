@@ -3176,8 +3176,22 @@ def run_once(dry_run: bool = False) -> dict:
                                       "source": str(n.get("source", "") or "")[:30]})
                 pushed += 1
             else:
-                # 推送失败：不记录指纹，下轮重试（避免重大消息丢失）
-                logger.error(f"推送失败（下轮重试）: {n.get('title', '')[:50]} | {result}")
+                # 推送失败：挂起 pending 下轮重试（2026-09-07 P0 审计修复——
+                # 此前什么都不写，条目滚出源窗口后静默漏推且无重试上限）。
+                # retry 达 MAX_PENDING_RETRY 仍失败 → 写 seen 放弃（防持续假失败
+                # 无限重试）；否则带 payload 挂起，复用 _reinject_pending_items
+                # 通道下轮主动重注入。
+                retry = int(n.get("_pend_retry", 0)) + 1
+                if retry >= MAX_PENDING_RETRY:
+                    seen[n["_fp"]] = {"t": now, "pushed": False,
+                                      "title": str(n.get("title", ""))[:52] + "[推送失败放弃]"}
+                    logger.error(f"连续{retry}轮推送失败，放弃: {n.get('title', '')[:50]}")
+                else:
+                    pending[n["_fp"]] = {"t": now, "retry": retry,
+                                         "title": str(n.get("title", ""))[:60],
+                                         "payload": _pend_payload(n)}
+                    logger.error(f"推送失败（第{retry}次挂起，下轮重试）: "
+                                 f"{n.get('title', '')[:50]} | {result}")
                 skipped += 1
 
     # 其余未进入候选的条目也记录指纹（跳过溢出挂起的 pending 条目——它们下轮重试）
