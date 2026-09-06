@@ -108,7 +108,9 @@ def _env_int(name: str, default: int) -> int:
 # ============================================================
 # 复用项目现有能力（不重复造轮子）
 # ============================================================
-from src.tools.data_fetchers import get_stock_news, get_market_signals, dedup_news_3layer  # 多源聚合抓取 + 三层近似去重
+from src.tools.data_fetchers import (get_stock_news, get_market_signals,
+                                     get_announcements, dedup_news_3layer)  # 多源聚合抓取 + 三层近似去重
+from src.tools.data_fetchers import load_source_health, save_source_health  # 源健康状态（P1 源健康告警）
 from src.tools.calculators import (
     calculate_prefilter_importance,   # 预筛评分
     _EVENT_KEYWORD_GROUPS,            # 事件关键词组
@@ -232,8 +234,104 @@ _zero_push_streak = [0]
 # watchlist 空名单告警去重（2026-08-13 P1-2：--loop 模式只告警一次，避免每轮刷屏）
 _watchlist_warned = [False]
 
+# 源健康告警（2026-09-07 P1）：单源连续 N 轮拉取为空 → 推送一条告警
+# （同源 24h 限频 1 次）；全部源同时为空 = 市场静默（如非交易时段），不告警。
+# 数据由 data_fetchers.record_source_health 落本地状态（logs/source_health.json）。
+SOURCE_HEALTH_ALERT_STREAK = 6
+SOURCE_HEALTH_ALERT_INTERVAL_HOURS = 24
+
 # Gist 内状态文件名
 GIST_STATE_FILENAME = "real_time_state.json"
+
+# ============================================================
+# Gist 状态体积守卫（2026-09-07 P1）
+# ============================================================
+# Gist 单文件 1MB 是硬限，超限 = 状态写失败 = 推送中断（云端状态已实测 917KB）。
+# 上传前检查序列化体积：>950KB 先压缩 seen（保留最近 1800 条）再传；
+# 压缩后仍超限则报错（含压缩前后体积），fail-stop 交由人工处理。
+GIST_STATE_LIMIT_BYTES = 950_000
+GIST_STATE_SEEN_KEEP = 1800
+
+
+def _compress_seen_for_gist(seen: dict, keep: int = GIST_STATE_SEEN_KEEP) -> dict:
+    """体积守卫压缩：按时间保留最近 keep 条指纹记录（体积优先于去重覆盖面）。"""
+    if len(seen) <= keep:
+        return seen
+    items = sorted(seen.items(), key=lambda kv: str(kv[1].get("t", "")))
+    return dict(items[len(items) - keep:])
+
+
+def _parse_bjt(value: str):
+    """状态时间字符串（北京时间）转 aware datetime，失败返回 None"""
+    try:
+        return datetime.strptime(str(value or ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=BJT)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluate_source_health_alerts(health: dict, now: datetime | None = None) -> list:
+    """从源健康状态生成待推送告警，返回 [(源名, 告警文案)]。
+
+    规则：
+    - 单源连续空轮数 >= SOURCE_HEALTH_ALERT_STREAK 才告警（文案含源名与连续空轮数）；
+    - 同源 SOURCE_HEALTH_ALERT_INTERVAL_HOURS 小时内已告警过则跳过（24h 限频）；
+    - 本轮全部源拉取均为空 = 市场静默（非交易时段正常现象），不告警。
+    """
+    now = now or datetime.now(BJT)
+    entries = {k: v for k, v in (health or {}).items() if isinstance(v, dict)}
+    if not entries:
+        return []
+    counts = {k: int(v.get("count", 0) or 0) for k, v in entries.items()}
+    if all(c == 0 for c in counts.values()):
+        return []  # 市场静默：全源同时空，非单源故障
+    alerts = []
+    for label, e in entries.items():
+        streak = int(e.get("streak", 0) or 0)
+        if streak < SOURCE_HEALTH_ALERT_STREAK:
+            continue
+        last = _parse_bjt(e.get("last_alert", ""))
+        if last and (now - last) < timedelta(hours=SOURCE_HEALTH_ALERT_INTERVAL_HOURS):
+            continue
+        alerts.append((label,
+                       f"⚠️ 源健康告警：数据源「{label}」已连续 {streak} 轮拉取为空"
+                       f"（最近记录 {e.get('t', '')}），可能故障，请人工检查。"))
+    return alerts
+
+
+def push_source_health_alerts(push_config: dict, dry_run: bool = False,
+                              health: dict | None = None,
+                              now: datetime | None = None) -> int:
+    """检查源健康并推送告警（同源 24h 限频），返回实际推送条数。
+
+    health/now 参数供测试注入；默认读 data_fetchers 落地的本地源健康状态。
+    告警推送成功才回写 last_alert（推送失败下轮重试）；检查异常只告警日志，
+    不影响主推送流程。
+    """
+    try:
+        health = load_source_health() if health is None else health
+        alerts = evaluate_source_health_alerts(health, now=now)
+        if not alerts:
+            return 0
+        now = now or datetime.now(BJT)
+        sent = 0
+        for label, msg in alerts:
+            if dry_run:
+                logger.warning(f"[dry-run] 将推送源健康告警: {msg}")
+                continue
+            result = _send_alert_item(push_config, "源健康告警", msg)
+            if result.get("code") == 200 or result.get("errcode") == 0:
+                if isinstance(health.get(label), dict):
+                    health[label]["last_alert"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                sent += 1
+                logger.warning(f"源健康告警已推送: {msg}")
+            else:
+                logger.error(f"源健康告警推送失败（下轮重试）: {msg} | {result}")
+        if sent:
+            save_source_health(health)
+        return sent
+    except Exception as e:
+        logger.warning(f"源健康告警检查异常(不影响主流程): {e}")
+        return 0
 
 # ============================================================
 # 阈值模式
@@ -1429,6 +1527,9 @@ def _empty_state() -> dict:
         # 记录于 LLM 判定后的每一候选（无论最终推/不推）；pushed_events 仍为"实际已推送"权威。
         # [{**事件签名, "dir": str, "t": str, "pushed": bool}]
         "candidate_events": [],
+        # watchlist 公告直通限频日志（2026-09-07 P1 新增）：
+        # [{"key": "code|类别", "t": str}]，同股同类别 24h 限推 1 条（防刷屏）。
+        "watch_announce": [],
     }
 
 
@@ -1521,10 +1622,29 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
     917KB，超出 Gist GET content 截断线（~900KB，实测 917KB 文件 content
     截到 70.8 万字符），每轮 load 被迫走 raw_url 回退慢路径；继续增长逼近
     1MB 硬限将致 PATCH 写入直接失败。紧凑序列化立省 ~174KB（19%）。
+    2026-09-07 P1 体积守卫：上传前检查序列化体积，>950KB 先压缩 seen
+    （保留最近 1800 条）再传；压缩后仍超限报错（含压缩前后体积），
+    宁可本轮失败也不静默写入失败导致推送中断。
     """
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    size_before = len(payload.encode("utf-8"))
+    if size_before > GIST_STATE_LIMIT_BYTES:
+        seen_n_before = len(state.get("seen") or {})
+        state["seen"] = _compress_seen_for_gist(state.get("seen") or {})
+        payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        size_after = len(payload.encode("utf-8"))
+        logger.warning(f"Gist 状态序列化超限（{size_before}B > {GIST_STATE_LIMIT_BYTES}B），"
+                       f"已压缩 seen: {seen_n_before} 条 → {len(state['seen'])} 条，"
+                       f"压缩后 {size_after}B")
+        if size_after > GIST_STATE_LIMIT_BYTES:
+            logger.error(f"Gist 状态压缩后仍超限: 压缩前 {size_before}B, "
+                         f"压缩后 {size_after}B, 上限 {GIST_STATE_LIMIT_BYTES}B")
+            raise RuntimeError(f"Gist 状态体积超限: 压缩前 {size_before}B, "
+                               f"压缩后 {size_after}B（上限 {GIST_STATE_LIMIT_BYTES}B），"
+                               "需人工清理状态文件")
     patch_gist_file(
         GIST_STATE_FILENAME,
-        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+        payload,
         token, gist_id,
     )
 
@@ -1538,6 +1658,7 @@ def load_state() -> dict:
             state = _gist_load(gist_token, gist_id)
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
+            state.setdefault("watch_announce", [])
             logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pushed_events', []))} 个已推事件"
                         f", {len(state.get('pending', {}))} 个挂起重试")
@@ -1556,6 +1677,7 @@ def load_state() -> dict:
                 state = _empty_state()
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
+            state.setdefault("watch_announce", [])
             logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pending', {}))} 个挂起重试")
             return state
@@ -1680,6 +1802,14 @@ def _merge_state(local: dict, remote: dict) -> dict:
         if old is None or (e.get("pushed") and not old.get("pushed")):
             merged_cands[_k] = e
     local["candidate_events"] = list(merged_cands.values())
+
+    # 合并 watchlist 公告直通限频日志（2026-09-07 P1）：按 (key, t) 去重并集
+    merged_wa = {(e.get("key"), e.get("t")): e
+                 for e in (remote.get("watch_announce") or []) if isinstance(e, dict)}
+    for e in (local.get("watch_announce") or []):
+        if isinstance(e, dict):
+            merged_wa.setdefault((e.get("key"), e.get("t")), e)
+    local["watch_announce"] = list(merged_wa.values())
     return local
 
 
@@ -1756,6 +1886,10 @@ def save_state(state: dict) -> None:
         logger.warning(f"candidate_events 超过上限（{before_n} 条 → 300 条），"
                        "已推条目优先淘汰，未推候选优先保留")
     state["candidate_events"] = ce
+
+    # watchlist 公告直通限频日志滚动清理（2026-09-07 P1：24h 窗口 + 上限防爆胀）
+    state["watch_announce"] = _watch_announce_prune(
+        state.get("watch_announce") or [], datetime.now(BJT))
 
     if gist_token and gist_id and not _merge_failed:
         _gist_save(gist_token, gist_id, state)
@@ -2883,6 +3017,103 @@ def _send_alert_item(push_config: dict, title: str, content: str) -> dict:
 
 
 # ============================================================
+# 交易所公告接入（2026-09-07 P1）：type 白名单 + watchlist 直通
+# ============================================================
+# 盘后全市场公告可达上千条，直接接入会击穿候选池与 Gist 状态 1MB 硬限——
+# 只有下列事件类公告才允许进入推送候选管线，白名单外一律不进。
+# 规则有序，首个命中生效（"解除质押"必须排在"质押"之前）；
+# 匹配文本 = 公告 type + 标题（akshare 的 type 字段口径不稳，标题兜底）。
+ANNOUNCE_TYPE_RULES = [
+    ("解除质押", ("解除质押", "解押")),
+    ("质押", ("质押",)),
+    ("回购", ("回购",)),
+    ("增持", ("增持",)),
+    ("减持", ("减持",)),
+    ("业绩预告", ("业绩预告",)),
+    ("业绩快报", ("业绩快报",)),
+    ("重大合同", ("重大合同", "中标")),
+    ("分红送转", ("分红", "派息", "送转", "利润分配")),
+    ("立案处罚", ("立案", "处罚", "监管函", "问询函", "关注函")),
+]
+ANNOUNCE_SOURCE = "交易所公告"
+# watchlist 公告直通防刷屏：同股同类别 24h 内最多推 1 条
+WATCH_ANNOUNCE_WINDOW_HOURS = 24
+WATCH_ANNOUNCE_MAX_LOG = 100
+
+
+def _announce_whitelist_category(ann: dict) -> str:
+    """公告白名单匹配：返回命中的类别名，白名单外返回空串"""
+    if not isinstance(ann, dict):
+        return ""
+    text = f"{ann.get('type', '') or ''} {ann.get('title', '') or ''}"
+    for cat, keywords in ANNOUNCE_TYPE_RULES:
+        if any(kw in text for kw in keywords):
+            return cat
+    return ""
+
+
+def _announce_to_news_item(ann: dict, category: str) -> dict:
+    """白名单公告 → 推送管线新闻条目（后续走既有指纹/去重/预筛链路）"""
+    title = str(ann.get("title", "") or "").strip()
+    name = str(ann.get("name", "") or "").strip()
+    code = str(ann.get("code", "") or "").strip()
+    return {
+        "title": title,
+        "content": title,
+        "source": ANNOUNCE_SOURCE,
+        "published_at": str(ann.get("published_at", "") or ""),
+        "code": code,
+        "name": name,
+        "affected_stocks": [name] if name else [],
+        "category": "news",
+        "sentiment": "neutral",
+        "_announce_category": category,
+    }
+
+
+def _watch_announce_prune(log: list, now: datetime) -> list:
+    """watchlist 公告直通限频日志：滚动清理窗口前记录并限长（防爆胀）"""
+    cutoff = (now - timedelta(hours=WATCH_ANNOUNCE_WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    kept = [e for e in (log or []) if isinstance(e, dict) and str(e.get("t", "")) >= cutoff]
+    return kept[-WATCH_ANNOUNCE_MAX_LOG:]
+
+
+def _ingest_announcements(announces: list, watchlist: set, state: dict,
+                          now: datetime | None = None) -> list:
+    """公告接入主循环入口（2026-09-07 P1）。
+
+    - 白名单外公告一律不进候选（不进指纹、不落 seen）；
+    - watchlist 股票的白名单公告：标记直通（_watch_announce），下游跳过预筛
+      竞争以高优先级进候选并推送；同股同类别 24h 限 1 条（限频日志
+      state['watch_announce']，推送成功时登记）；
+    - 其余白名单公告走既有去重/预筛链路正常竞争。
+    """
+    if not announces:
+        return []
+    now = now or datetime.now(BJT)
+    log = state.setdefault("watch_announce", [])
+    log[:] = _watch_announce_prune(log, now)
+    items = []
+    for ann in announces:
+        if not isinstance(ann, dict):
+            continue
+        cat = _announce_whitelist_category(ann)
+        if not cat:
+            continue  # 白名单外一律不进候选
+        item = _announce_to_news_item(ann, cat)
+        if watchlist and _hit_watchlist(item, watchlist):
+            key = f"{item.get('code') or item.get('name')}|{cat}"
+            if any(e.get("key") == key for e in log):
+                logger.info(f"watchlist 公告直通限频（同股同类别 {WATCH_ANNOUNCE_WINDOW_HOURS}h 内已推），"
+                            f"跳过: {item.get('title', '')[:50]}")
+                continue
+            item["_watch_announce"] = True
+            item["_watch_announce_key"] = key
+        items.append(item)
+    return items
+
+
+# ============================================================
 # 主流程：单次执行
 # ============================================================
 def run_once(dry_run: bool = False) -> dict:
@@ -2912,6 +3143,14 @@ def run_once(dry_run: bool = False) -> dict:
     seen = state.setdefault("seen", {})
     pending = state.setdefault("pending", {})
 
+    # 自选龙头名单（watchlist.json）提前加载：公告接入（P1）在抓取阶段即需
+    # watchlist 判定直通；与 LLM 的 is_leader_stock 判定互为补充
+    leader_watchlist = _load_leader_watchlist()
+    if not leader_watchlist and not _watchlist_warned[0]:
+        _watchlist_warned[0] = True
+        logger.warning("自选龙头名单 watchlist.json 为空，龙头放行退化为 LLM is_leader_stock 单通道"
+                       "（如需盘面异动龙头放行/科技龙头兜底双通道，请填入关注名单）")
+
     # 1. 多源聚合抓取：6 大新闻源 + 龙虎榜/业绩预告信号
     # 注意: get_stock_news/get_market_signals 是 LangChain @tool 包装的
     # StructuredTool 实例，需用 .func 取原始函数调用
@@ -2928,6 +3167,24 @@ def run_once(dry_run: bool = False) -> dict:
         logger.error(f"市场信号抓取失败: {e}", exc_info=True)
         signals = []
 
+    # 交易所公告接入（2026-09-07 P1）：type 白名单过滤后进管线；
+    # watchlist 股票的白名单公告标记直通（跳过预筛竞争，同股同类别 24h 限 1 条）。
+    try:
+        raw_announces = get_announcements.func()
+    except Exception as e:
+        logger.error(f"公告抓取失败: {e}", exc_info=True)
+        raw_announces = []
+    announce_items = _ingest_announcements(raw_announces, leader_watchlist, state)
+    if announce_items:
+        n_direct = sum(1 for a in announce_items if a.get("_watch_announce"))
+        logger.info(f"公告接入: 白名单命中 {len(announce_items)}/{len(raw_announces or [])} 条"
+                    f"（其中 watchlist 直通 {n_direct} 条）")
+
+    # 源健康告警（2026-09-07 P1）：区分"没新闻"与"源挂了"——单源连续多轮空
+    # 推送告警（同源 24h 限频），全源同时空视为市场静默不告警。
+    # 检查异常只记日志，不影响主推送流程。
+    push_source_health_alerts(push_config, dry_run=dry_run)
+
     # 跨源近似去重（URL/精确标题之外补一层 SimHash）：同一事件不同措辞的多源
     # 报道先在入口收敛，避免各自进指纹/候选、重复消耗 LLM 判定 token。
     # 注: 只作用于多源新闻(dedup_news_3layer 对标题 SimHash)，signals 是交易所
@@ -2937,7 +3194,9 @@ def run_once(dry_run: bool = False) -> dict:
     news_list = dedup_news_3layer(list(news_list))
     if len(news_list) < before_dedup:
         logger.info(f"三层近似去重: {before_dedup} -> {len(news_list)} 条")
-    news_list = news_list + list(signals)
+    # 公告与 signals 一样是交易所结构化数据，不参与标题 SimHash 近似去重
+    # （模板化标题会误并），指纹层去重已覆盖。
+    news_list = news_list + list(signals) + announce_items
     logger.info(f"多源聚合: 拉取 {len(news_list)} 条")
     if not news_list:
         logger.info("无资讯返回，跳过本轮")
@@ -2985,6 +3244,10 @@ def run_once(dry_run: bool = False) -> dict:
             continue
         pref_score, hit = _prefilter(n)
         n["_pref_score"] = pref_score
+        # watchlist 公告直通（2026-09-07 P1）：跳过预筛竞争，等同高信号
+        # （候选恒进入 + 溢出排序恒优先）
+        if n.get("_watch_announce"):
+            hit = True
         n["_hit_signal"] = hit
         if pref_score >= PREFILTER_SCORE_MIN or hit:
             candidates.append(n)
@@ -3056,13 +3319,6 @@ def run_once(dry_run: bool = False) -> dict:
         # 防御：_llm_judge 异常返回空 → 全部挂起下轮重试（不推、不落指纹）
         judges = [_hang_judge(n) for n in candidates]
 
-    # 自选龙头名单（watchlist.json），与 LLM 的 is_leader_stock 判定互为补充
-    leader_watchlist = _load_leader_watchlist()
-    if not leader_watchlist and not _watchlist_warned[0]:
-        _watchlist_warned[0] = True
-        logger.warning("自选龙头名单 watchlist.json 为空，龙头放行退化为 LLM is_leader_stock 单通道"
-                       "（如需盘面异动龙头放行/科技龙头兜底双通道，请填入关注名单）")
-
     # 5. 同事件合并（跨源同事件只推最优一条）→ 跨轮已推事件拦截 → 阈值过滤 → 推送
     pushed = 0
     skipped = 0
@@ -3121,6 +3377,11 @@ def run_once(dry_run: bool = False) -> dict:
     daily_push_limit = _env_int("RT_MAX_PUSH_PER_DAY", 0)
     _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
+        # watchlist 公告直通（2026-09-07 P1）：白名单公告已跳过预筛竞争，
+        # 此处继续跳过强档方向/噪声/阈值/风险降级/题材饱和/日限额等闸门直接
+        # 推送（LLM 判定仍必须完成——judged=False 照常挂起；48h 同事件拦截
+        # 保留防重复推送）。
+        watch_direct = bool(n.get("_watch_announce"))
         if not j.get("judged", True):
             # 2026-08-03 用户口径：全部资讯必须经 LLM 判定。
             # 未判定条目不推、不落指纹 → 下轮重新送 LLM 判定（避免规则误判方向）。
@@ -3139,7 +3400,8 @@ def run_once(dry_run: bool = False) -> dict:
         # 2026-08-04 用户口径：仅强利好/强利空（bullish/bearish）推送；
         # 弱档/中性/混合（mildly_bullish/mildly_bearish/neutral/mixed）一律不推，
         # 覆盖 market/sector/stock、外围科技必推、科技防漏推等全部路径。
-        if j.get("direction") not in ("bullish", "bearish"):
+        # 例外：watchlist 公告直通不适用（解除质押等公告方向常被判中性/弱档）。
+        if not watch_direct and j.get("direction") not in ("bullish", "bearish"):
             logger.info(f"非强档方向({j.get('direction')})，不推: {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
@@ -3147,7 +3409,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 2026-08-11 修复（审核实证 13/61 滥推）：栏目汇总/指数播报/盘面异动类
         # 即使 LLM 判强档也硬过滤（"晚间新闻精选""隔夜要闻""KOSPI涨超2%""概念异动拉升"），
         # 属"非重大消息"，按用户口径（仅重大事件推送）不应推。记 seen 标注原因。
-        noise_reason = _is_noise_push(n, j, leader_watchlist)
+        noise_reason = None if watch_direct else _is_noise_push(n, j, leader_watchlist)
         if noise_reason:
             logger.info(f"噪声过滤({noise_reason})，不推: {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
@@ -3171,7 +3433,10 @@ def run_once(dry_run: bool = False) -> dict:
         # 命中 _TECH_OVERRIDE_VIEW_WORDS（定性判断措辞）的科技消息不放行，
         # 让 LLM 的 push=false 生效；仅未命中观点词（可能被 LLM 漏判的硬事件）兜底放行。
         tech_override = _tech_override_enabled(n, j, leader_watchlist)
-        if j.get("push") and _passes_threshold(
+        if watch_direct:
+            # watchlist 公告直通：跳过阈值竞争直接推送
+            pass_round = True
+        elif j.get("push") and _passes_threshold(
                 mode, j.get("score", 0), j.get("direction", "neutral"),
                 j.get("scope", "stock"), leader_stock=is_leader):
             pass_round = True
@@ -3192,7 +3457,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 风险收缩期降级（2026-08-14 第二阶段联动）：risk_off 时，科技利好若无硬事件
         # 佐证（金额/订单/公告/获批等）则降级不推——与量化资金风险期降杠杆一致；
         # 利空/风险资讯不受影响（风险期更应提示）。seen 标注原因便于复核。
-        if risk_state == "risk_off" and _risk_off_downgrade(n, j):
+        if risk_state == "risk_off" and not watch_direct and _risk_off_downgrade(n, j):
             logger.info(f"风险收缩期降级(科技利好无硬事件佐证): {n.get('title', '')[:40]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[风险收缩期降级]"}
@@ -3210,7 +3475,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 同题材饱和拦截（2026-08-12 防偏科）：同一板块/实体 24h 内已推达上限
         # （默认 5 条）后不再推——存储行情日 17 推实证；market 级（宏观数据/大盘）
         # 豁免，CPI 等宏观数据永不受限。
-        if _topic_saturated(n["_sig"], pushed_events):
+        if not watch_direct and _topic_saturated(n["_sig"], pushed_events):
             logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
@@ -3220,7 +3485,7 @@ def run_once(dry_run: bool = False) -> dict:
         # 全局日推送上限（2026-09-07 P0 审计 3.2）：计数源=pushed_events 当日条数。
         # 触顶后非高信号条目一律不推（保护 pushplus 200条/天限额与用户收件箱）；
         # 高信号（has_signal_keyword 命中，宏观/监管级核心事件）豁免防漏推。
-        if daily_push_limit > 0 and not has_signal_keyword(
+        if daily_push_limit > 0 and not watch_direct and not has_signal_keyword(
                 f"{n.get('title', '')} {n.get('content', '')}"):
             today_pushed = sum(1 for pe in pushed_events
                                if str(pe.get("t", ""))[:10] == now[:10])
@@ -3245,6 +3510,10 @@ def run_once(dry_run: bool = False) -> dict:
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
             _mark_candidate_pushed(state, _ck)
+            if watch_direct:
+                # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
+                state.setdefault("watch_announce", []).append(
+                    {"key": n.get("_watch_announce_key", ""), "t": now})
             # dir 字段（P0-3 2026-08-19）：盘后复盘按方向统计利多/利空占比。
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
@@ -3261,6 +3530,10 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
                 _mark_candidate_pushed(state, _ck)
+                if watch_direct:
+                    # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
+                    state.setdefault("watch_announce", []).append(
+                        {"key": n.get("_watch_announce_key", ""), "t": now})
                 pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
                                       "title": str(n.get("title", ""))[:60],
                                       "source": str(n.get("source", "") or "")[:30]})
