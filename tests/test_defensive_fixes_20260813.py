@@ -372,6 +372,8 @@ class _FuncHolder:
 def _e2e_patch(monkeypatch, news_list):
     monkeypatch.setattr(rtp, "get_stock_news", _FuncHolder(lambda: [dict(n) for n in news_list]))
     monkeypatch.setattr(rtp, "get_market_signals", _FuncHolder(lambda: []))
+    # 2026-09-07 P1：公告接入不触网（run_once 新增依赖）
+    monkeypatch.setattr(rtp, "get_announcements", _FuncHolder(lambda: []))
     monkeypatch.setattr(rtp, "load_state", lambda: rtp._empty_state())
     monkeypatch.setattr(rtp, "save_state", lambda state: None)
 
