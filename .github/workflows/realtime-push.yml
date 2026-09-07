@@ -34,6 +34,16 @@ jobs:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OPENROUTER_MODEL_NAME: ${{ secrets.OPENROUTER_MODEL_NAME }}
       OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+      # LLM 降级链备选模型（2026-09-07）：key 未配置的级别自动跳过
+      LLM_FALLBACK1_API_KEY: ${{ secrets.LLM_FALLBACK1_API_KEY }}
+      LLM_FALLBACK1_BASE_URL: ${{ secrets.LLM_FALLBACK1_BASE_URL }}
+      LLM_FALLBACK1_MODEL: ${{ secrets.LLM_FALLBACK1_MODEL }}
+      LLM_FALLBACK2_API_KEY: ${{ secrets.LLM_FALLBACK2_API_KEY }}
+      LLM_FALLBACK2_BASE_URL: ${{ secrets.LLM_FALLBACK2_BASE_URL }}
+      LLM_FALLBACK2_MODEL: ${{ secrets.LLM_FALLBACK2_MODEL }}
+      LLM_FALLBACK3_API_KEY: ${{ secrets.LLM_FALLBACK3_API_KEY }}
+      LLM_FALLBACK3_BASE_URL: ${{ secrets.LLM_FALLBACK3_BASE_URL }}
+      LLM_FALLBACK3_MODEL: ${{ secrets.LLM_FALLBACK3_MODEL }}
       # 推送后端（推荐 PushPlus，无需企业微信）:
       # PUSHPLUS_TOKEN: pushplus.plus 扫码获取（免费200条/天，严格模式够用）
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
