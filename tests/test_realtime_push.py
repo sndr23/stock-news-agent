@@ -1048,7 +1048,7 @@ class TestTruncatedTitleHandling:
 
     def test_watchlist_truncated_title_reaches_candidate_without_seen(self, monkeypatch, tmp_path):
         self._setup(monkeypatch, tmp_path)
-        title = "金十【高盛首次覆盖中际旭创】…"
+        title = "金十【高盛首次覆盖中际旭创…】"
         news = type("T", (), {"func": staticmethod(lambda: [{
             "title": title,
             "content": "重点关注光模块产业链",
@@ -3062,7 +3062,19 @@ class TestHeadlineQuality0907:
         assert rtp._is_truncated_title("某公司发布公告。。。") is True
         assert rtp._is_truncated_title("某公司发布公告") is False
         assert rtp._is_truncated_title("…") is True
+        assert rtp._is_truncated_title(
+            "【一架波音767货运飞机在迈阿密滑出跑道 航班或大规模延误】金十数据9月7日讯，"
+        ) is False
+        assert rtp._is_truncated_title(
+            "【软银中国宋安澜：遗憾没能抢到入场机会】..."
+        ) is True
+        assert rtp._is_truncated_title("【完整新闻主体】金十数据9月7日讯，...") is False
         assert rtp._is_truncated_title("") is False
+
+    def test_hard_scale_quantity_recognizes_english_plural_units(self):
+        assert rtp._HARD_SCALE_QUANTITY_RE.search(
+            "DeepSeek plans to buy 160,000 Huawei chips"
+        ) is not None
 
     def test_truncated_title_remains_candidate_for_llm(self, monkeypatch, tmp_path):
         """截断标题仍进入 LLM 候选；不再在预筛阶段写 seen 或直接放弃。"""
