@@ -82,7 +82,9 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
         url = f"{base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {provider['api_key']}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            # Nous inference 等 Cloudflare 前置端点会拦 python-requests 默认 UA (error 1010)
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         }
         # 只有 OpenRouter 官方端点需要保留代理并附带官方请求头。
         is_official = "openrouter.ai" in base_url.lower()
