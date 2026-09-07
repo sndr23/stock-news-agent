@@ -123,6 +123,7 @@ from src.strategy.state_io import atomic_write_json, get_gist_config, patch_gist
 from src.strategy.data_freshness import _is_workday
 # LLM 调用与 JSON 修复（2026-08-06 起从共享模块导入，不再依赖废弃的批处理管线 nodes.py）
 from src.llm_client import _call_llm_api, _repair_json
+from scripts.intraday_sweep import run_sweep as _run_intraday_sweep  # SNA-06 盘中异动反查
 from src.tools.keyword_tables import (                      # 共享关键词表（单一事实来源）
     HIGH_SIGNAL_KEYWORDS,
     OVERSEAS_TECH_KEYWORDS,
@@ -2311,7 +2312,7 @@ def _llm_judge(items: list, deadline: float = 0, env_context: str = "",
         for offset, n in enumerate(batch):
             n["_judge_idx"] = start + offset
         try:
-            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch, env_context, pushed_events), timeout=60, max_retries=1, deadline=deadline)
+            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch, env_context, pushed_events), timeout=100, max_retries=1, deadline=deadline)
             entries = _parse_llm_array(raw)
             # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
             by_idx = {}
@@ -2390,6 +2391,21 @@ def _load_leader_watchlist() -> set:
         return {n for n in names if n}
     except Exception:
         return set()
+
+
+def _load_watchlist_stocks() -> list:
+    """SNA-06（2026-09-07）：加载 watchlist stocks 原始 [{code, name}]，供异动反查。"""
+    try:
+        wl = json.loads((PROJECT_ROOT / "watchlist.json").read_text(encoding="utf-8"))
+        stocks = wl.get("stocks", []) or []
+        out = []
+        for s in stocks:
+            if isinstance(s, dict) and str(s.get("code", "") or "").strip():
+                out.append({"code": str(s["code"]).strip(),
+                            "name": str(s.get("name", "") or "").strip()})
+        return out
+    except Exception:
+        return []
 
 
 def _hit_watchlist(news: dict, watchlist: set) -> bool:
@@ -3198,6 +3214,25 @@ def run_once(dry_run: bool = False) -> dict:
     # （模板化标题会误并），指纹层去重已覆盖。
     news_list = news_list + list(signals) + announce_items
     logger.info(f"多源聚合: 拉取 {len(news_list)} 条")
+
+    # SNA-06 盘中异动反查（2026-09-07）：watchlist 分钟级急涨急跌监控。
+    # 放在多源聚合之后、主推送之前——复用本轮已抓取的 news_list 做消息反查；
+    # 只推"反查无关联消息"的异动（疑似小作文），有消息的由正常管线覆盖。
+    # 检查异常只记日志，绝不影响主推送流程。
+    try:
+        import requests as _sweep_requests
+        _sweep_watch = _load_watchlist_stocks()
+        _sweep_state = state.setdefault("sweep_events", [])
+        _sweep_stats = _run_intraday_sweep(
+            _sweep_requests.get, _sweep_watch, news_list, _sweep_state,
+            send_push=(None if dry_run else
+                      (lambda title, content: _send_alert_item(push_config, title, content))),
+            dry_run=dry_run)
+        if _sweep_stats.get("detected"):
+            logger.info(f"[sweep] 异动反查: {_sweep_stats}")
+    except Exception as e:
+        logger.warning(f"[sweep] 盘中异动反查异常(不影响主推送): {e}")
+
     if not news_list:
         logger.info("无资讯返回，跳过本轮")
         return {"fetched": 0, "new": 0, "prefiltered": 0, "pushed": 0, "skipped": 0}
