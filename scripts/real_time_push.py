@@ -2311,7 +2311,7 @@ def _llm_judge(items: list, deadline: float = 0, env_context: str = "",
         for offset, n in enumerate(batch):
             n["_judge_idx"] = start + offset
         try:
-            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch, env_context, pushed_events), timeout=100, max_retries=1, deadline=deadline)
+            raw = _call_llm_api(_LLM_SYSTEM_PROMPT, _build_llm_user_prompt(batch, env_context, pushed_events), timeout=45, max_retries=1, deadline=deadline)
             entries = _parse_llm_array(raw)
             # 按 idx 精确对齐（标题兜底）：LLM 可能增减条目/乱序/改写标题
             by_idx = {}
