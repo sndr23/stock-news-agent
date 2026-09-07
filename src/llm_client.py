@@ -12,12 +12,46 @@ nodes.py 保留 re-import 兼容（测试 patch 路径 src.agent.nodes._call_llm
 """
 import json
 import logging
+import os
 import re
 import time
 
 logger = logging.getLogger(__name__)
 
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
+
+
+def _build_llm_model_chain() -> list:
+    """按配置构建 LLM 模型链，未配置 key 的备选级别静默跳过。"""
+    chain = [{
+        "model": OPENROUTER_MODEL_NAME,
+        "base_url": OPENROUTER_BASE_URL,
+        "api_key": OPENROUTER_API_KEY,
+    }]
+    fallbacks = [
+        ("LLM_FALLBACK1_BASE_URL", "https://api.b.ai/v1",
+         "LLM_FALLBACK1_API_KEY", "LLM_FALLBACK1_MODEL", "glm-5.3-flash"),
+        ("LLM_FALLBACK2_BASE_URL", "https://apihub.agnes-ai.cn/v1",
+         "LLM_FALLBACK2_API_KEY", "LLM_FALLBACK2_MODEL", "agnes-2.5-flash"),
+        ("LLM_FALLBACK3_BASE_URL", "https://api.longcat.chat/openai/v1",
+         "LLM_FALLBACK3_API_KEY", "LLM_FALLBACK3_MODEL", "LongCat-2.0"),
+    ]
+    for base_env, default_base, key_env, model_env, default_model in fallbacks:
+        api_key = os.getenv(key_env, "").strip()
+        if not api_key:
+            continue
+        chain.append({
+            "model": os.getenv(model_env) or default_model,
+            "base_url": os.getenv(base_env) or default_base,
+            "api_key": api_key,
+        })
+    return chain
+
+
+def _raise_if_deadline_reached(deadline: float, attempts: int) -> None:
+    """检查总超时熔断，确保模型切换也不突破 deadline。"""
+    if deadline and time.monotonic() >= deadline:
+        raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempts} 次）")
 
 
 def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_retries: int = 2, deadline: float = 0) -> str:
@@ -39,57 +73,68 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
     """
     import requests
 
-    url = f"{OPENROUTER_BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    # OpenRouter 官方要求 HTTP-Referer 和 X-Title 请求头，否则返回 402
-    if IS_OPENROUTER_OFFICIAL:
-        headers["HTTP-Referer"] = "https://github.com/stock-news-agent"
-        headers["X-Title"] = "StockNewsAgent"
-    payload = {
-        "model": OPENROUTER_MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.1,  # 结构化输出场景降低温度
-        "max_tokens": 16384
-    }
-
+    model_chain = _build_llm_model_chain()
     last_error = None
-    for attempt in range(max_retries + 1):
-        # 总超时熔断：逼近 deadline 立即放弃重试并返回上层降级
-        if deadline and time.monotonic() >= deadline:
-            raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt} 次）")
-        session = requests.Session()
-        # 官方端点(OpenRouter)需科学上网保留代理；Agnes 等中转端点禁用代理避免 ConnectionRefused
-        session.trust_env = IS_OPENROUTER_OFFICIAL
-        try:
-            resp = session.post(url, json=payload, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            if content:  # 非空内容才返回
-                return content
-            else:
-                last_error = f"第{attempt+1}次返回空内容"
-                logger.warning(last_error)
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"第{attempt+1}次调用失败: {e}")
-        finally:
-            session.close()
+    attempts = 0
+    for provider_index, provider in enumerate(model_chain):
+        model = provider["model"]
+        base_url = str(provider["base_url"]).rstrip("/")
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Content-Type": "application/json"
+        }
+        # 只有 OpenRouter 官方端点需要保留代理并附带官方请求头。
+        is_official = "openrouter.ai" in base_url.lower()
+        if is_official:
+            headers["HTTP-Referer"] = "https://github.com/stock-news-agent"
+            headers["X-Title"] = "StockNewsAgent"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.1,  # 结构化输出场景降低温度
+            "max_tokens": 16384
+        }
 
-        if attempt < max_retries:
-            # 重试前再次确认未超 deadline（避免退避等待期间已超时仍继续重试）
-            if deadline and time.monotonic() >= deadline:
-                raise Exception(f"LLM 调用逼近总超时熔断，放弃重试（已尝试 {attempt + 1} 次）")
-            # 指数退避: 2s, 4s
-            wait_time = 2 ** (attempt + 1)
-            logger.info(f"等待 {wait_time}s 后重试（Agnes 端点）...")
-            time.sleep(wait_time)
+        _raise_if_deadline_reached(deadline, attempts)
+        for attempt in range(max_retries + 1):
+            # 总超时熔断：逼近 deadline 立即放弃重试并返回上层挂起。
+            _raise_if_deadline_reached(deadline, attempts)
+            session = requests.Session()
+            # 国内直连/中转端点禁用代理，避免系统代理未运行导致连接失败。
+            session.trust_env = is_official
+            try:
+                resp = session.post(url, json=payload, headers=headers, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                if content:  # 非空内容才返回
+                    logger.info(f"LLM 调用成功，使用模型 {model}")
+                    return content
+                last_error = f"第{attempt + 1}次返回空内容"
+                logger.warning(f"模型{model}{last_error}")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"模型{model}第{attempt + 1}次调用失败: {e}")
+            finally:
+                session.close()
+            attempts += 1
+
+            if attempt < max_retries:
+                # 重试前再次确认未超 deadline（避免退避等待期间已超时仍继续重试）。
+                _raise_if_deadline_reached(deadline, attempts)
+                # 指数退避: 2s, 4s。
+                wait_time = 2 ** (attempt + 1)
+                logger.info(f"等待 {wait_time}s 后重试（模型 {model}）...")
+                time.sleep(wait_time)
+
+        if provider_index + 1 < len(model_chain):
+            next_model = model_chain[provider_index + 1]["model"]
+            _raise_if_deadline_reached(deadline, attempts)
+            logger.warning(f"模型{model}失败，降级到模型{next_model}")
 
     raise Exception(f"LLM API 调用失败，已重试 {max_retries} 次: {last_error}")
 
