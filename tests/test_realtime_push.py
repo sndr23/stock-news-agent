@@ -413,6 +413,9 @@ class TestParseLlmArray:
 
 
 class TestLlmJudge:
+    def test_batch_size_is_four(self):
+        assert rtp.LLM_BATCH_SIZE == 4
+
     def test_idx_alignment_despite_reorder_and_rewrite(self, monkeypatch):
         """LLM 乱序+改写标题时仍能按 idx 对齐（标题匹配时代会误判不推→漏推）"""
         items = [
@@ -497,6 +500,63 @@ class TestLlmJudge:
         assert judges[1]["judged"] is False
         assert judges[2]["push"] is False
         assert judges[2]["judged"] is False
+
+    def test_missing_idx_retries_only_that_item(self, monkeypatch):
+        """批次漏回显 idx 时，缺失项单条重试，不让整批一起挂起。"""
+        items = [
+            {"title": "央行宣布降准", "content": "", "_pref_score": 0.8,
+             "_hit_signal": True},
+            {"title": "工信部部署400G光网", "content": "", "_pref_score": 0.7,
+             "_hit_signal": True},
+        ]
+        calls = []
+
+        def fake_llm(system_prompt, user_prompt, timeout=90, max_retries=1,
+                     deadline=0):
+            calls.append(timeout)
+            if timeout == 45:
+                return json.dumps([{
+                    "idx": 0, "title": "央行宣布降准", "push": True,
+                    "score": 9, "direction": "bullish", "scope": "market",
+                }], ensure_ascii=False)
+            assert timeout == 20
+            return json.dumps([{
+                "idx": 1, "title": "工信部部署400G光网", "push": True,
+                "score": 8, "direction": "bullish", "scope": "sector",
+            }], ensure_ascii=False)
+
+        monkeypatch.setattr(rtp, "_call_llm_api", fake_llm)
+        judges = rtp._llm_judge(items)
+
+        assert calls == [45, 20]
+        assert [j["judged"] for j in judges] == [True, True]
+        assert [j["push"] for j in judges] == [True, True]
+
+    def test_missing_idx_single_retry_failure_hangs_only_that_item(self, monkeypatch):
+        """单条重试失败时，仅缺失 idx 挂起，已回显项保持判定结果。"""
+        items = [
+            {"title": "央行宣布降准", "content": "", "_pref_score": 0.8,
+             "_hit_signal": True},
+            {"title": "工信部部署400G光网", "content": "", "_pref_score": 0.7,
+             "_hit_signal": True},
+        ]
+
+        def fake_llm(system_prompt, user_prompt, timeout=90, max_retries=1,
+                     deadline=0):
+            if timeout == 45:
+                return json.dumps([{
+                    "idx": 0, "title": "央行宣布降准", "push": True,
+                    "score": 9, "direction": "bullish", "scope": "market",
+                }], ensure_ascii=False)
+            raise RuntimeError("single retry down")
+
+        monkeypatch.setattr(rtp, "_call_llm_api", fake_llm)
+        judges = rtp._llm_judge(items)
+
+        assert judges[0]["judged"] is True
+        assert judges[0]["push"] is True
+        assert judges[1]["judged"] is False
+        assert judges[1]["push"] is False
 
     def test_garbage_output_all_hang(self, monkeypatch):
         """LLM 返回完全无法解析的内容时，全部条目挂起（judged=False），不规则直推"""
@@ -970,6 +1030,61 @@ class TestPrefilterNameStrip:
 # ============================================================
 # 候选溢出挂起重试（2026-08-06 P1-2 修复：不再永久 seen 漏推）
 
+
+
+# ============================================================
+# 截断标题候选处理（2026-09-08 P0）
+# ============================================================
+
+class TestTruncatedTitleHandling:
+    def _setup(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GIST_TOKEN", "")
+        monkeypatch.setenv("GIST_ID", "")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(rtp, "_state_path", lambda: tmp_path / "real_time_state.json")
+        monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: {"中际旭创"})
+        monkeypatch.setattr(rtp, "_send_alert_item", lambda cfg, t, c: {"code": 200})
+        monkeypatch.setattr(rtp, "dedup_news_3layer", lambda lst: list(lst))
+
+    def test_watchlist_truncated_title_reaches_candidate_without_seen(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path)
+        title = "金十【高盛首次覆盖中际旭创】…"
+        news = type("T", (), {"func": staticmethod(lambda: [{
+            "title": title,
+            "content": "重点关注光模块产业链",
+            "source": "金十数据",
+            "published_at": "2026-09-08 10:00:00",
+            "affected_stocks": ["中际旭创"],
+        }])})()
+        signals = type("T", (), {"func": staticmethod(lambda: [])})()
+        monkeypatch.setattr(rtp, "get_stock_news", news)
+        monkeypatch.setattr(rtp, "get_market_signals", signals)
+        judged_items = []
+
+        def hang(items, **kwargs):
+            judged_items.extend(items)
+            return [rtp._hang_judge(n) for n in items]
+
+        monkeypatch.setattr(rtp, "_llm_judge", hang)
+        stats = rtp.run_once(dry_run=False)
+
+        assert stats["prefiltered"] == 1
+        assert len(judged_items) == 1
+        assert judged_items[0]["_truncated"] is True
+        saved = json.loads((tmp_path / "real_time_state.json").read_text(encoding="utf-8"))
+        assert not saved["seen"], "未判定的截断标题不得先写入 seen"
+
+    def test_truncated_candidate_is_first_overflow_in_same_layer(self):
+        normal = {"title": "正常实质新闻", "_hit_signal": True,
+                  "_pref_score": 0.70, "_truncated": False}
+        truncated = {"title": "中际旭创增至500亿元订单…",
+                     "affected_stocks": ["中际旭创"], "_hit_signal": True,
+                     "_pref_score": 0.70, "_truncated": True}
+
+        ranked = sorted([truncated, normal], key=rtp._candidate_sort_key, reverse=True)
+
+        assert ranked[:1] == [normal]
+        assert ranked[1:] == [truncated]
 
 
 # ============================================================
@@ -1526,6 +1641,12 @@ class TestNoiseFilter:
         ]
         for t in cases:
             assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "盘面异动", t
+
+    def test_intraday_move_with_substantive_action_is_kept(self):
+        for title in (
+                "摩尔线程最新回应：不存在财务造假",
+                "摩尔线程异动拉升 最新回应：不存在财务造假"):
+            assert rtp._is_noise_push({"title": title}, self._judge(), set()) == ""
 
     def test_leader_intraday_kept(self):
         """龙头个股盘面保留：LLM 龙头标记或命中自选名单 → 不过滤"""
@@ -2880,12 +3001,12 @@ class TestNormalizeTitleDecimal:
 
 
 # ============================================================
-# 2026-09-07 标题党治理：实质版优先 + 截断标题拦截
+# 2026-09-07 标题党治理：实质版优先 + 截断标题降权
 # ============================================================
 
 class TestHeadlineQuality0907:
     """候选择优加入"实质版优先"：实体名+具体数字+增量信息加权，
-    纯情绪化标题降权；以省略号结尾的截断标题不进入推送。"""
+    纯情绪化标题降权；以省略号结尾的截断标题进入候选但溢出时沉底。"""
 
     def test_substantive_title_plus_one(self):
         n = {"title": "中际旭创拟40-80亿元回购股份",
@@ -2943,8 +3064,8 @@ class TestHeadlineQuality0907:
         assert rtp._is_truncated_title("…") is True
         assert rtp._is_truncated_title("") is False
 
-    def test_truncated_title_excluded_from_push(self, monkeypatch, tmp_path):
-        """截断标题不进入推送：写 seen [截断]，完整标题版本正常推送"""
+    def test_truncated_title_remains_candidate_for_llm(self, monkeypatch, tmp_path):
+        """截断标题仍进入 LLM 候选；不再在预筛阶段写 seen 或直接放弃。"""
         monkeypatch.setenv("PUSHPLUS_TOKEN", "test-token")
         truncated = {"title": "中际旭创 800G 光模块获海外大单…",
                      "content": "公司公告获得海外大客户订单",
@@ -2957,8 +3078,8 @@ class TestHeadlineQuality0907:
         stats = rtp.run_once(dry_run=False)
         saved = _load_saved_state(state_path)
         fp_trunc = rtp._news_fingerprint(truncated)
-        assert fp_trunc in saved["seen"], "截断标题必须写 seen 防重复进入"
-        assert saved["seen"][fp_trunc]["title"].endswith("[截断]")
-        assert saved["seen"][fp_trunc].get("pushed") is False
-        assert saved["pushed_events"], "完整标题版本必须正常推送"
-        assert stats["pushed"] == 1
+        assert fp_trunc in saved["seen"], "LLM 判定完成后才记录截断标题的最终状态"
+        assert not saved["seen"][fp_trunc]["title"].endswith("[截断]")
+        assert saved["seen"][fp_trunc].get("pushed") is True
+        assert len(saved["pushed_events"]) == 2, "截断标题与完整候选都应有机会进入推送"
+        assert stats["pushed"] == 2

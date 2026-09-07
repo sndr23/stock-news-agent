@@ -148,7 +148,7 @@ PREFILTER_SCORE_MIN = 0.55
 MAX_CANDIDATES_PER_ROUND = 40
 
 # 批量 LLM 判定每批条数（控制单次请求 token 与延迟）
-LLM_BATCH_SIZE = 8
+LLM_BATCH_SIZE = 4
 
 # 状态窗口：指纹保留时长（小时），滚动清理
 STATE_WINDOW_HOURS = 48
@@ -759,7 +759,8 @@ _NOISE_INTRADAY_MARKERS = [
 # 盘面词仅是背景。例外仅跳过噪声判定，最终仍走强档门槛 + LLM 把关。）
 _MAJOR_CORPORATE_EVENT_MARKERS = [
     "立案", "留置", "退市", "欺诈", "被罚", "刑拘", "逮捕", "冻结",
-    "破产", "暴雷", "爆雷", "双双被", "被查",
+    "破产", "暴雷", "爆雷", "双双被", "被查", "回应", "公告", "澄清",
+    "减持", "回购", "增持", "处罚", "问询", "批复", "核准",
 ]
 # 研报/观点/主题类措辞（2026-08-13 P0 修复：tech_override 排除守卫用——
 # 命中此类措辞的科技消息属"无具体事件的定性判断"，即使 LLM 判 push=false
@@ -1144,14 +1145,16 @@ def _title_has_entity(news: dict, title: str) -> bool:
 
 
 def _candidate_sort_key(x: dict) -> tuple:
-    """候选择优排序键（溢出截断时用）：高信号 > 宏观 > 实质版 > 预筛分
+    """候选择优排序键（溢出截断时用）：高信号 > 宏观 > 完整标题 > 实质版 > 预筛分
 
     2026-09-07 标题党治理：同层内实质版（实体+数字+增量信息）优先，
     纯情绪化标题沉底——多源同事件各措辞竞逐最后槽位时，实质版胜出。
+    截断标题只在同一优先层内沉底，避免候选溢出时挤掉高信号/宏观/实质版条目。
     """
     return (
         1 if x.get("_hit_signal") else 0,
         1 if _is_macro_policy(x) else 0,
+        1 if not x.get("_truncated") else 0,
         _headline_quality(x),
         x["_pref_score"],
     )
@@ -2266,6 +2269,25 @@ def _hang_judge(news: dict) -> dict:
     }
 
 
+def _format_llm_judge_result(news: dict, entry: dict) -> dict:
+    """将单条 LLM 回显归一化为推送管线使用的判定结构。"""
+    title = str(news.get("title", "") or "").strip()
+    return {
+        "title": title,
+        "push": _as_bool(entry.get("push", False), False),
+        "judged": True,
+        "score": entry.get("score", 0),
+        "direction": _normalize_direction(entry.get("direction", "neutral"), news),
+        "scope": str(entry.get("scope", "stock") or "stock").lower(),
+        "sectors": _as_list(entry.get("sectors")),
+        "entities": [str(x).strip() for x in _as_list(entry.get("entities"))
+                     if isinstance(x, (str, int, float)) and str(x).strip()],
+        "is_leader_stock": _as_bool(entry.get("is_leader_stock", False), False),
+        "env_note": str(entry.get("env_note", "") or "").strip()[:80],
+        "reason": str(entry.get("reason", "") or "").strip(),
+    }
+
+
 def _llm_judge(items: list, deadline: float = 0, env_context: str = "",
                pushed_events: list = None) -> list:
     """批量 LLM 判定，返回与 items 一一对应的判定 dict 列表
@@ -2328,31 +2350,50 @@ def _llm_judge(items: list, deadline: float = 0, env_context: str = "",
                 t = str(e.get("title", "") or "").strip()
                 if t:
                     by_title[t] = e
+            missing = []
             for offset, n in enumerate(batch):
                 i = start + offset
                 t = str(n.get("title", "") or "").strip()
                 e = by_idx.get(i) or by_title.get(t)
-                if not e:
-                    # LLM 成功返回但未回显该条目（截断/遗漏/标题改写导致 idx 与标题均未对齐）。
-                    # 不静默判 push=False（避免把可推重大消息漏掉），也不规则直推——
-                    # 挂起留待下轮重新送 LLM 判定。
-                    logger.warning(f"LLM 未回显条目 idx={i}，挂起下轮重试: {t[:40]}")
+                if e:
+                    results[i] = _format_llm_judge_result(n, e)
+                else:
+                    missing.append((i, n, t))
+
+            # 批量回显不完整时，对缺失 idx 单条补试，避免一个格式异常拖挂整批。
+            for i, n, t in missing:
+                if deadline and time.monotonic() >= deadline:
                     results[i] = _hang_judge(n)
                     continue
-                results[i] = {
-                    "title": t,
-                    "push": _as_bool(e.get("push", False), False),
-                    "judged": True,
-                    "score": e.get("score", 0),
-                    "direction": _normalize_direction(e.get("direction", "neutral"), n),
-                    "scope": str(e.get("scope", "stock") or "stock").lower(),
-                    "sectors": _as_list(e.get("sectors")),
-                    "entities": [str(x).strip() for x in _as_list(e.get("entities"))
-                                 if isinstance(x, (str, int, float)) and str(x).strip()],
-                    "is_leader_stock": _as_bool(e.get("is_leader_stock", False), False),
-                    "env_note": str(e.get("env_note", "") or "").strip()[:80],
-                    "reason": str(e.get("reason", "") or "").strip(),
-                }
+                try:
+                    retry_raw = _call_llm_api(
+                        _LLM_SYSTEM_PROMPT,
+                        _build_llm_user_prompt([n], env_context, pushed_events),
+                        timeout=20, max_retries=1, deadline=deadline,
+                    )
+                    retry_entries = _parse_llm_array(retry_raw)
+                    retry_entry = None
+                    for retry_e in retry_entries:
+                        if not isinstance(retry_e, dict):
+                            continue
+                        try:
+                            retry_idx = int(retry_e.get("idx", -1))
+                        except (ValueError, TypeError):
+                            retry_idx = -1
+                        if retry_idx == i or str(retry_e.get("title", "") or "").strip() == t:
+                            retry_entry = retry_e
+                            break
+                    # 单条 prompt 没有 idx 时，唯一回显项可安全按请求项归属。
+                    if (retry_entry is None and len(retry_entries) == 1
+                            and "idx" not in retry_entries[0]):
+                        retry_entry = retry_entries[0]
+                    if retry_entry is None:
+                        raise ValueError("单条重试仍未回显目标 idx")
+                    results[i] = _format_llm_judge_result(n, retry_entry)
+                    logger.info(f"LLM 缺失 idx={i} 单条重试成功")
+                except Exception as retry_error:
+                    logger.warning(f"LLM 缺失 idx={i} 单条重试失败，挂起该条: {retry_error}")
+                    results[i] = _hang_judge(n)
             logger.info(f"LLM 判定批次 {start//LLM_BATCH_SIZE + 1}: {len(batch)} 条完成（回显{len(entries)}条）")
         except Exception as e:
             logger.warning(f"LLM 判定批次失败（{len(batch)} 条），整批挂起下轮重试: {e}")
@@ -2463,6 +2504,23 @@ _HARD_EVENT_WORDS = (
 # 展望修饰词：硬事件动词前 6 字内出现 → 视为"展望/未发生"而非已发生事件，
 # 不构成硬事件佐证（如"有望中标""拟收购""订单验证窗口"）。
 _FORWARD_MODIFIERS = ("有望", "预期", "预计", "或", "计划", "拟", "验证", "窗口", "开启", "迎")
+
+# 大额数量/规模佐证：不依赖金额归一，覆盖设备、容量、工艺和库存周期等硬数据。
+# 刻意不包含涨/跌/百分号，纯行情播报不得因此绕过风险期降级。
+_HARD_SCALE_QUANTITY_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*[万亿]?\s*"
+    r"(?:台|块|件|片|卡|核|节点|G|纳米|毫瓦|千瓦时|天)",
+    re.IGNORECASE,
+)
+
+
+def _has_non_market_percentage(text: str) -> bool:
+    """是否含非纯涨跌行情的百分比硬数据（如良率/市占率）。"""
+    for match in re.finditer(r"\d+(?:\.\d+)?\s*%", text or ""):
+        context = text[max(0, match.start() - 8):match.end()]
+        if not re.search(r"涨幅|跌幅|涨跌|涨|跌", context):
+            return True
+    return False
 
 
 def _is_tech_by_sectors(sectors) -> bool:
@@ -2750,7 +2808,8 @@ def _risk_off_downgrade(news: dict, judge: dict) -> bool:
     - 仅作用于 bullish 科技资讯（板块/个股级）；利空/中性/非科技不受影响
     - 硬事件佐证（任一即放行）：①具体金额（_extract_core_numbers）②百分比/倍数硬数据
       （如"良率98%""产能翻倍"）③完成态硬事件动词（中标/收购/扩建/投产等），
-      且动词前无展望修饰（"有望/拟/验证窗口"等）
+      且动词前无展望修饰（"有望/拟/验证窗口"等）④大额数量/规模量词
+      （台/块/件/片/G/纳米/卡/核/节点等）+数字；纯涨跌行情百分比不算硬事件
     - 纯情绪/板块利好（"景气提升""有望受益""空间广阔"等无事件佐证）→ 降级
     """
     if judge.get("direction") != "bullish":
@@ -2764,8 +2823,10 @@ def _risk_off_downgrade(news: dict, judge: dict) -> bool:
     # ① 具体金额 → 硬事件，放行
     if _extract_core_numbers(text):
         return False
-    # ② 百分比/倍数硬数据（良率98%、市占率升至X%、产能翻倍）→ 放行
-    if re.search(r"\d+(\.\d+)?%", text) or re.search(r"翻[一二两三四五六七八九十百\d]倍|倍增", text):
+    # ② 百分比/倍数硬数据（良率98%、市占率升至X%、产能翻倍）→ 放行；
+    #    纯涨跌百分比（"涨超5%"）不属于事件佐证，仍降级。
+    if (_has_non_market_percentage(text)
+            or re.search(r"翻[一二两三四五六七八九十百\d]倍|倍增", text)):
         return False
     # ③ 完成态硬事件动词（排除展望修饰）
     for w in _HARD_EVENT_WORDS:
@@ -2775,6 +2836,9 @@ def _risk_off_downgrade(news: dict, judge: dict) -> bool:
         ctx = text[max(0, idx - 6):idx]
         if any(m in ctx for m in _FORWARD_MODIFIERS):
             continue  # 展望性表述（"有望中标"），不算已发生
+        return False
+    # ④ 大额数量/规模量词（10000台、400G、160,000块、不足10天）→ 放行。
+    if _HARD_SCALE_QUANTITY_RE.search(text):
         return False
     return True
 
@@ -3248,16 +3312,14 @@ def run_once(dry_run: bool = False) -> dict:
 
     # 3. 规则预筛（重要度评分 或 高信号词命中）
     # 标题党治理（2026-09-07 P1）：以省略号结尾的截断标题信息不完整，
-    # 不进入推送候选（写 seen 防每轮重复进入；后续其他源给出完整标题
-    # 时指纹不同，仍正常处理）。
+    # 仍进入预筛和候选池，但在候选溢出排序时沉底；后续其他源给出完整标题
+    # 时，完整版自然胜出。
     now_pref = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
     candidates = []
     for n in new_items:
         if _is_truncated_title(str(n.get("title", "") or "")):
-            seen[n["_fp"]] = {"t": now_pref, "pushed": False,
-                              "title": str(n.get("title", ""))[:60] + "[截断]"}
-            logger.info(f"截断标题不进入推送: {str(n.get('title', ''))[:40]}")
-            continue
+            n["_truncated"] = True
+            logger.info(f"截断标题进入候选并降权: {str(n.get('title', ''))[:40]}")
         pref_score, hit = _prefilter(n)
         n["_pref_score"] = pref_score
         # watchlist 公告直通（2026-09-07 P1）：跳过预筛竞争，等同高信号
