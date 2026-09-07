@@ -1122,8 +1122,16 @@ _TRUNCATED_ENDINGS = ("…", "。。。", "...", "。。")
 
 
 def _is_truncated_title(title: str) -> bool:
-    """标题是否为"…"截断标题（以省略号结尾）——信息不完整，不进入推送"""
+    """判断标题主体是否被省略号截断，兼容金十的【新闻主体】正文格式。"""
     t = str(title or "").strip()
+    bracketed = re.search(r"【([^】]*)】", t)
+    if bracketed:
+        # 金十标题的新闻主体包在【】内；主体完整时，后面的正文截断不影响推送价值。
+        if bracketed.group(1).strip().endswith(_TRUNCATED_ENDINGS):
+            return True
+        suffix = t[bracketed.end():].strip()
+        # 闭合括号后只有裸省略号时，仍按标题截断标记处理；正文前缀后的省略号则忽略。
+        return suffix in _TRUNCATED_ENDINGS
     return t.endswith(_TRUNCATED_ENDINGS)
 
 
@@ -2509,7 +2517,9 @@ _FORWARD_MODIFIERS = ("有望", "预期", "预计", "或", "计划", "拟", "验
 # 刻意不包含涨/跌/百分号，纯行情播报不得因此绕过风险期降级。
 _HARD_SCALE_QUANTITY_RE = re.compile(
     r"\d[\d,]*(?:\.\d+)?\s*[万亿]?\s*"
-    r"(?:台|块|件|片|卡|核|节点|G|纳米|毫瓦|千瓦时|天)",
+    r"(?:台|块|件|片|卡|核|节点|G|纳米|毫瓦|千瓦时|天|"
+    r"(?:[A-Za-z][A-Za-z-]*\s+)?"
+    r"(?:chips?|units?|shares?|vehicles?|servers?))",
     re.IGNORECASE,
 )
 
