@@ -157,6 +157,12 @@ STATE_WINDOW_HOURS = 48
 # 已推条目仍需完整 48h（复盘列表 + 48h 同事件拦截依赖）。
 STATE_WINDOW_HOURS_UNPUSHED = 24
 
+# 回测事件档案上限（2026-09-08 P0-2 新增）：pushed_events 只留 48h，被淘汰条目
+# 转存 backtest_events 供 signal_backtest 统计后 1/3/5/10 日收益（此前 48h 外事件
+# 永久丢失，后 3/5/10 日维度永远无数据）。2000 条 × ~300B ≈ 600KB 已在
+# Gist 体积守卫（_gist_save）的 backtest_events 裁剪兜底范围内。
+BACKTEST_EVENTS_MAX = 2000
+
 # 候选溢出挂起重试上限（2026-08-06 新增）：同一指纹连续 N 轮溢出后放弃（写 seen），
 # 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
 MAX_PENDING_RETRY = 3
@@ -1541,6 +1547,10 @@ def _empty_state() -> dict:
         # watchlist 公告直通限频日志（2026-09-07 P1 新增）：
         # [{"key": "code|类别", "t": str}]，同股同类别 24h 限推 1 条（防刷屏）。
         "watch_announce": [],
+        # 回测事件档案（2026-09-08 P0-2 新增）：pushed_events 48h 清理时被淘汰的
+        # 条目原样转存于此，供 signal_backtest 统计后 1/3/5/10 日收益。
+        # 条目结构与 pushed_events 完全一致。
+        "backtest_events": [],
     }
 
 
@@ -1636,6 +1646,9 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
     2026-09-07 P1 体积守卫：上传前检查序列化体积，>950KB 先压缩 seen
     （保留最近 1800 条）再传；压缩后仍超限报错（含压缩前后体积），
     宁可本轮失败也不静默写入失败导致推送中断。
+    2026-09-08 P0-2：seen 压缩后仍超限时，先把 backtest_events 裁到最新
+    500 条再试一次（回测档案只影响统计样本量，最安全的可裁项），
+    仍超限时再压缩 seen 到最近 500 条，仍超限才报错。
     """
     payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     size_before = len(payload.encode("utf-8"))
@@ -1647,6 +1660,29 @@ def _gist_save(token: str, gist_id: str, state: dict) -> None:
         logger.warning(f"Gist 状态序列化超限（{size_before}B > {GIST_STATE_LIMIT_BYTES}B），"
                        f"已压缩 seen: {seen_n_before} 条 → {len(state['seen'])} 条，"
                        f"压缩后 {size_after}B")
+        if size_after > GIST_STATE_LIMIT_BYTES:
+            # 2026-09-08 P0-2：seen 压缩后仍超限，先把回测档案裁到最新 500 条
+            # （回测只影响统计样本量，不影响推送正确性，最安全的可裁项）再试一次。
+            bt_n_before = len(state.get("backtest_events") or [])
+            if bt_n_before > 500:
+                state["backtest_events"] = sorted(
+                    state.get("backtest_events") or [],
+                    key=lambda e: e.get("t", ""))[-500:]
+                payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+                size_after = len(payload.encode("utf-8"))
+                logger.warning(f"压缩 seen 后仍超限，已裁剪 backtest_events: "
+                               f"{bt_n_before} 条 → {len(state['backtest_events'])} 条，"
+                               f"裁剪后 {size_after}B")
+                if size_after > GIST_STATE_LIMIT_BYTES:
+                    # 档案裁剪仍不足以达标时继续压缩 seen，避免其大字段占满状态体积。
+                    seen_n_before_fallback = len(state.get("seen") or {})
+                    state["seen"] = _compress_seen_for_gist(
+                        state.get("seen") or {}, keep=500)
+                    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+                    size_after = len(payload.encode("utf-8"))
+                    logger.warning(f"裁剪 backtest_events 后仍超限，已进一步压缩 seen: "
+                                   f"{seen_n_before_fallback} 条 → {len(state['seen'])} 条，"
+                                   f"压缩后 {size_after}B")
         if size_after > GIST_STATE_LIMIT_BYTES:
             logger.error(f"Gist 状态压缩后仍超限: 压缩前 {size_before}B, "
                          f"压缩后 {size_after}B, 上限 {GIST_STATE_LIMIT_BYTES}B")
@@ -1670,6 +1706,7 @@ def load_state() -> dict:
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
             state.setdefault("watch_announce", [])
+            state.setdefault("backtest_events", [])
             logger.info(f"状态已从 Gist 加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pushed_events', []))} 个已推事件"
                         f", {len(state.get('pending', {}))} 个挂起重试")
@@ -1689,6 +1726,7 @@ def load_state() -> dict:
             state.setdefault("pushed_events", [])
             state.setdefault("pending", {})
             state.setdefault("watch_announce", [])
+            state.setdefault("backtest_events", [])
             logger.info(f"状态已从本地加载: {len(state.get('seen', {}))} 个指纹, "
                         f"{len(state.get('pending', {}))} 个挂起重试")
             return state
@@ -1802,6 +1840,15 @@ def _merge_state(local: dict, remote: dict) -> dict:
         merged_events.setdefault(_event_sig_key(e), e)
     local["pushed_events"] = list(merged_events.values())
 
+    # 合并回测事件档案（2026-09-08 P0-2）：与 pushed_events 同口径按 _event_sig_key
+    # 取并集（同 key 远端优先），防本地与云端并发写时档案互冲丢失。
+    merged_backtest = {_event_sig_key(e): e for e in (remote.get("backtest_events") or [])
+                       if isinstance(e, dict)}
+    for e in (local.get("backtest_events") or []):
+        if isinstance(e, dict):
+            merged_backtest.setdefault(_event_sig_key(e), e)
+    local["backtest_events"] = list(merged_backtest.values())
+
     # 合并当日预筛候选（P7-1）：按 (日期, 事件签名) 去重，pushed=True 优先（并发写防丢方向）。
     # 并发实例各自读-改-写时，直接覆盖会把另一方新增的候选方向丢掉 → 合并后冲突窗口收窄到单次写入。
     merged_cands = {}
@@ -1882,10 +1929,36 @@ def save_state(state: dict) -> None:
         logger.info(f"清理过期挂起重试 {len(pend_expired)} 条，剩余 {len(pending)} 条")
 
     # 滚动清理过期已推事件签名（48h 窗口）+ 上限 300 条防爆胀
-    pe = [e for e in (state.get("pushed_events") or []) if e.get("t", "") >= cutoff]
+    pe_all = state.get("pushed_events") or []
+    pe = [e for e in pe_all if e.get("t", "") >= cutoff]
     if len(pe) > 300:
         pe = sorted(pe, key=lambda e: e.get("t", ""))[-300:]
     state["pushed_events"] = pe
+
+    # 2026-09-08 P0-2：被淘汰的已推事件（出 48h 窗口或超 300 上限）先转存回测
+    # 档案再丢弃。此前直接淘汰 → 永久丢失，signal_backtest 统计后 1/3/5/10 日
+    # 收益时后 3/5/10 日维度永远无数据。档案条目与 pushed_events 原条目字段
+    # 完全一致（回测消费同一结构），按时间保留最新 BACKTEST_EVENTS_MAX 条；
+    # 体积再由 _gist_save 体积守卫兜底裁剪。并入档案前按 _event_sig_key 去重，
+    # 防 Gist 合并把远端残留的已淘汰条目复活后重复转存。
+    _pe_ids = {id(e) for e in pe}
+    _evicted = [e for e in pe_all if id(e) not in _pe_ids and isinstance(e, dict)]
+    archive = list(state.get("backtest_events") or [])
+    if _evicted:
+        _archived_keys = {_event_sig_key(e) for e in archive if isinstance(e, dict)}
+        for e in _evicted:
+            _k = _event_sig_key(e)
+            if _k not in _archived_keys:
+                _archived_keys.add(_k)
+                archive.append(e)
+        logger.info(f"已推事件淘汰 {len(_evicted)} 条转存 backtest_events（现 {len(archive)} 条）")
+    if len(archive) > BACKTEST_EVENTS_MAX:
+        before_n = len(archive)
+        # 上限裁剪后才排序落盘（无淘汰轮次不重排已有档案，避免每轮全量重写）
+        archive = sorted(archive, key=lambda e: e.get("t", ""))[-BACKTEST_EVENTS_MAX:]
+        logger.warning(f"backtest_events 超过上限（{before_n} 条 → {len(archive)} 条），"
+                       "按时间保留最新")
+    state["backtest_events"] = archive
 
     # 滚动清理过期当日预筛候选（P7-1，48h 窗口）+ 上限 300 条防爆胀
     ce = [e for e in (state.get("candidate_events") or []) if e.get("t", "") >= cutoff]

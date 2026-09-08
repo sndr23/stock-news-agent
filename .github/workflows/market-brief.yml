@@ -64,16 +64,22 @@ jobs:
         run: |
           echo "::warning::单元测试门禁失败,本轮任务仍继续执行,请尽快修复 tests/ 回归用例"
 
-      # schedule 触发时按 cron 时间区分早晚（两个 cron 语义不同）；手动触发读 input
+      # P0-1 修复(2026-09-08): 不再用执行时刻 wall-clock 判断早晚——GitHub schedule
+      # 实测延迟 4.5h+（早间 cron 实际 13:0x BJT 执行），恒落 evening 分支，盘前简报自
+      # 09-01 起静默失效。schedule 触发时改用触发它的 cron 表达式（github.event.schedule）
+      # 区分语义；手动触发保持读 input 不变。
       - name: 判断简报类型
         id: kind
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "brief=${{ inputs.brief }}" >> "$GITHUB_OUTPUT"
-          elif [ "$(date -u +%H%M)" -lt "0200" ]; then
+          elif [ "${{ github.event.schedule }}" = "45 0 * * 1-5" ]; then
             echo "brief=morning" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${{ github.event.schedule }}" = "10 7 * * 1-5" ]; then
             echo "brief=evening" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::无法识别的 schedule cron: ${{ github.event.schedule }}，未输出 brief"
+            exit 1
           fi
 
       - name: 执行简报
