@@ -116,7 +116,7 @@ class TestLlmJudgeBatchDeadline:
     def test_deadline_after_batch_breaks_remaining(self, monkeypatch):
         """批次完成后逼近 deadline，剩余条目全部挂起（P2-4 熔断粒度）"""
         items = [{"title": f"测试{i}", "content": "内容", "published_at": "",
-                  "_judge_idx": i} for i in range(20)]  # 3 批（8+8+4）
+                  "_judge_idx": i} for i in range(20)]  # 5 批（4+4+4+4+4）
         import time as _time
 
         def fake_llm(system_prompt, user_prompt, **kw):
@@ -127,7 +127,7 @@ class TestLlmJudgeBatchDeadline:
             } for i in range(len(items))], ensure_ascii=False)
 
         monkeypatch.setattr(rtp, "_call_llm_api", fake_llm)
-        # deadline 设为 1s 后——批次 1 完成后熔断，剩余 12 条挂起
+        # deadline 设为 1s 后——批次 1 完成后熔断，剩余 16 条挂起
         deadline = _time.monotonic() + 1
         # 让批次 1 完成后 deadline 已过：给批次间加一点耗时
         real_parse = rtp._parse_llm_array
@@ -144,9 +144,9 @@ class TestLlmJudgeBatchDeadline:
         judges = rtp._llm_judge(items, deadline=deadline)
         judged = [j for j in judges if j.get("judged")]
         hung = [j for j in judges if not j.get("judged")]
-        # 批次 1（8 条）已判定，剩余 12 条挂起
-        assert len(judged) == 8
-        assert len(hung) == 12
+        # 批次 1（4 条）已判定，剩余 16 条挂起
+        assert len(judged) == 4
+        assert len(hung) == 16
         assert all(j.get("reason") == "LLM未判定，挂起下轮重试" for j in hung)
 
 
