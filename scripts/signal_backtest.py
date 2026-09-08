@@ -9,6 +9,8 @@
 数据流（只读，不写任何状态）：
 - 已推事件: real_time_push 的 real_time_state.json（云端 Gist 优先，本地降级）
   pushed_events 条目: {stocks, entities, events, numbers, sectors, scope, title_norm, dir, t}
+  2026-09-08 P0-2: 事件来源 = backtest_events（48h 外淘汰档案）∪ pushed_events
+  （当前 48h 窗口），按 (t, title_norm) 去重（见 _merge_backtest_events）
 - 行情: 新浪日K（与 factor_collector 同源口径）
 - 个股代码解析: 腾讯 smartbox 搜索（名称→代码）
 
@@ -204,6 +206,22 @@ def _load_realtime_state() -> dict:
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _merge_backtest_events(state: dict) -> list:
+    """合并回测事件来源（2026-09-08 P0-2）
+
+    pushed_events 只留 48h（real_time_push 滚动清理），48h 外被淘汰的已推
+    事件转存于 backtest_events 档案。回测需统计后 1/3/5/10 日收益，必须
+    两源合并；按 (t, title_norm) 去重，backtest_events 条目优先保留。
+    状态缺 backtest_events（旧状态文件）时降级为仅 pushed_events。
+    """
+    archive = [e for e in (state.get("backtest_events") or []) if isinstance(e, dict)]
+    merged = {(e.get("t", ""), e.get("title_norm") or ""): e for e in archive}
+    for e in (state.get("pushed_events") or []):
+        if isinstance(e, dict):
+            merged.setdefault((e.get("t", ""), e.get("title_norm") or ""), e)
+    return list(merged.values())
 
 
 def _fetch_kline(symbol: str, lmt: int = 120) -> list:
@@ -486,7 +504,10 @@ def compute_winrate(days: int = 30) -> dict:
     无事件/无行情 → {"n": 0}。调用方（factor_collector）对 n<10 不展示。
     """
     state = _load_realtime_state()
-    events = state.get("pushed_events") or []
+    # 2026-09-08 P0-2：合并回测档案（backtest_events，48h 外被淘汰的已推事件）
+    # 与当前窗口 pushed_events，按 (t, title_norm) 去重（档案优先）。
+    # 此前只读 pushed_events（仅 48h），后 3/5/10 日维度永远无数据。
+    events = _merge_backtest_events(state)
     if not events:
         return {"n": 0}
     summary = backtest(events, days=days)
@@ -602,9 +623,10 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     state = _load_realtime_state()
-    events = state.get("pushed_events") or []
+    # 2026-09-08 P0-2：合并回测档案 + 当前窗口（同 compute_winrate 口径）。
+    events = _merge_backtest_events(state)
     if not events:
-        print("无已推事件可回测（real_time_state 无 pushed_events）")
+        print("无已推事件可回测（real_time_state 无 pushed_events/backtest_events）")
         return
 
     summary = backtest(events, days=args.days)

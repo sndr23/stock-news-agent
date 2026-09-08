@@ -17,10 +17,11 @@
 | STR-02 | 阴跌期降档：需与趋势因子不同源的避险信号研究 | **BACKLOG**（本轮候选均不达门槛；事件硬信号 IC 验门亦未通过） | agent | STR-01 | `scripts/_*.py`（研究） | 回撤显著下降且收益不劣化；walk-forward OOS 验证；unit 全绿 |
 | STR-03 | v5 权重合入：趋势 .35→.50、落袋 .15→.10、估值死权重清零 | **DONE**（2026-08-28 用户拍板合入；工作区已验收未单独提交，与 SNA-03/05 同模式） | agent | — | `scripts/run_chinext_timing.py:755`, `docs/**` | 新基线严格回测 +153.0%/夏普0.58/回撤-41.1%；OOS +106.1%/夏普0.59/回撤-27.0%；拐点倒U+邻域高原+分折胜率6/9；门禁 `1094 passed` 全绿 |
 | STR-05 | 盘中快照审计、严格门禁与真实回放回测 | **DONE**（2026-09-03） | agent | STR-04 | `src/strategy/intraday_snapshot.py`, `src/strategy/intraday_replay.py`, `scripts/run_chinext_timing.py`, `scripts/backtest_intraday_snapshots.py`, `tests/**`, `docs/**` | 快照元数据/质量校验；`--snapshot-only` 缺快照不推送不写状态；盘中输入无前视回放且主收益对齐收盘成交→次日；缺日默认拒绝；定向与全量 unit 全绿 |
+| SNA-06 | 盘中异动反查链路：watchlist 分钟级急涨急跌监控 → 触发后反查消息面（定位小作文/突发消息） | **REVIEW**（2026-09-07 实现完成待集成） | agent | — | `scripts/intraday_sweep.py`(新), `scripts/real_time_push.py`(接线), `tests/test_intraday_sweep.py`(新31用例), `docs/**` | ①分钟级轮询腾讯分钟K线(ifzq mkline)，watchlist 个股 1 分钟涨跌幅超 ±2%（SWEEP_MOVE_PCT env 可覆盖）触发；②触发后在轮内 news_list（含公告）反查异动前后 10 分钟（SWEEP_NEWS_LOOKUP_MIN）关联消息（标题含股票名/代码+时间窗）；③只推"无关联消息"异动（用户拍板口径：有消息的不推，30 分钟正规推送覆盖），推送三段式：股票+幅度+时间 / 无消息面声明 / 风险提示；④正常涨跌不推送；⑤与 `_is_noise_push`/LLM 判定完全解耦——独立链路直接构造推送；⑥非交易时段(9:30-15:05 外/周末)跳过；⑦同股同方向 1h 冷却 + 每轮最多 3 条防刷屏；⑧state 新增 `sweep_events`(48h 裁剪,200 条上限)；⑨real_time_push 接线在多源聚合后主推送前，异常只记日志绝不影响主管线；⑩unit 全绿 1290 passed(新增 31 用例全 mock) |
 
 ## 领取规则
 
-- 只有 `READY` 且依赖满足的任务可领取（当前无 READY；STR-02 BACKLOG，SNA-01~05/STR-01/STR-03 均已完成，进入留出样本观察）。
+- 只有 `READY` 且依赖满足的任务可领取（当前无 READY；STR-02 / SNA-06 BACKLOG，SNA-01~05/STR-01/STR-03 均已完成，进入留出样本观察）。
 - 领取时由 Coordinator 更新 Owner / branch / worktree / Base Commit 并提交协调状态。
 - 一个 Task = 一个 Owner + 一个 branch + 一个 worktree。
 - Worker 不直接在 main 开发。
