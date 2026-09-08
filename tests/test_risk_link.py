@@ -93,6 +93,25 @@ def test_hard_event_expansion():
     assert rtp._risk_off_downgrade(n, j) is False
 
 
+@pytest.mark.parametrize("title", [
+    "小米汽车锁单突破10000台",
+    "工信部部署400G光网",
+    "DeepSeek采购160,000块华为芯片",
+    "库存不足10天",
+])
+def test_hard_scale_quantity_allows_tech_bullish(title):
+    """规模/数量量词是硬事件佐证，风险收缩期不应误降级。"""
+    n = _news(title)
+    j = _judge("bullish", ["芯片"])
+    assert rtp._risk_off_downgrade(n, j) is False
+
+
+def test_market_move_percentage_is_not_hard_scale_quantity():
+    n = _news("芯片板块涨超5%")
+    j = _judge("bullish", ["芯片"])
+    assert rtp._risk_off_downgrade(n, j) is True
+
+
 def test_downgrade_emotion_research():
     # 研报/情绪类（机构称/市场空间）→ 降级
     n = _news("产业资本加速投入 机构称物理AI市场空间将迈向星辰大海")
