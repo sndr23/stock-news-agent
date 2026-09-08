@@ -2516,10 +2516,13 @@ _FORWARD_MODIFIERS = ("有望", "预期", "预计", "或", "计划", "拟", "验
 # 大额数量/规模佐证：不依赖金额归一，覆盖设备、容量、工艺和库存周期等硬数据。
 # 刻意不包含涨/跌/百分号，纯行情播报不得因此绕过风险期降级。
 _HARD_SCALE_QUANTITY_RE = re.compile(
+    r"(?:"
     r"\d[\d,]*(?:\.\d+)?\s*[万亿]?\s*"
     r"(?:台|块|件|片|卡|核|节点|G|纳米|毫瓦|千瓦时|天|"
-    r"(?:[A-Za-z][A-Za-z-]*\s+)?"
-    r"(?:chips?|units?|shares?|vehicles?|servers?))",
+    r"(?:[A-Za-z][A-Za-z-]*[\s]*)?"
+    r"(?:chips?|units?|shares?|vehicles?|servers?|GPUs?))"
+    r"|(?:十万卡|万卡|千卡|万片|万块|万台)"
+    r")",
     re.IGNORECASE,
 )
 

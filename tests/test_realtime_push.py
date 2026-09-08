@@ -3076,6 +3076,16 @@ class TestHeadlineQuality0907:
             "DeepSeek plans to buy 160,000 Huawei chips"
         ) is not None
 
+    def test_hard_scale_quantity_recognizes_chinese_number_units(self):
+        assert rtp._HARD_SCALE_QUANTITY_RE.search(
+            "工信部有序部署万卡十万卡及以上智算集群"
+        ) is not None
+
+    def test_hard_scale_quantity_recognizes_space_stripped_english_units(self):
+        assert rtp._HARD_SCALE_QUANTITY_RE.search(
+            "DeepSeekplanstobuy160000HuaweichipsasChi"
+        ) is not None
+
     def test_truncated_title_remains_candidate_for_llm(self, monkeypatch, tmp_path):
         """截断标题仍进入 LLM 候选；不再在预筛阶段写 seen 或直接放弃。"""
         monkeypatch.setenv("PUSHPLUS_TOKEN", "test-token")
