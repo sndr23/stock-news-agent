@@ -100,6 +100,8 @@ def _call_llm_api(system_prompt: str, user_prompt: str, timeout: int = 90, max_r
             "temperature": 0.1,  # 结构化输出场景降低温度
             "max_tokens": 16384
         }
+        if "agnes" in base_url.lower() and os.getenv("LLM_DISABLE_REASONING", "1") != "0":
+            payload["reasoning_effort"] = "none"
 
         _raise_if_deadline_reached(deadline, attempts)
         for attempt in range(max_retries + 1):
