@@ -207,7 +207,7 @@ class TestRecentPushedTitles:
         monkeypatch.delenv("GIST_TOKEN", raising=False)
         monkeypatch.delenv("GIST_ID", raising=False)
         monkeypatch.setattr(fc, "_REALTIME_STATE_PATH", tmp_path / "real_time_state.json")
-        now = datetime.now()
+        now = datetime.now(BJT)
         recent = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         old = (now - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
         state = {"seen": {
@@ -227,7 +227,7 @@ class TestRecentPushedTitles:
         monkeypatch.setattr(fc, "_REALTIME_STATE_PATH", tmp_path / "not_exist.json")
         assert fc._recent_pushed_titles() == []
 
-        now = datetime.now()
+        now = datetime.now(BJT)
         recent = (now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
         state = {"seen": {f"k{i}": {"t": recent, "pushed": True, "title": f"标题{i}"}
                           for i in range(7)}}
