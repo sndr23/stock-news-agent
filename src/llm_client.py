@@ -32,7 +32,7 @@ def _build_llm_model_chain() -> list:
         ("LLM_FALLBACK1_BASE_URL", "https://api.b.ai/v1",
          "LLM_FALLBACK1_API_KEY", "LLM_FALLBACK1_MODEL", "glm-5.3-flash"),
         ("LLM_FALLBACK2_BASE_URL", "https://apihub.agnes-ai.cn/v1",
-         "LLM_FALLBACK2_API_KEY", "LLM_FALLBACK2_MODEL", "agnes-2.5-flash"),
+         "LLM_FALLBACK2_API_KEY", "LLM_FALLBACK2_MODEL", "agnes-3.0-flash"),
         ("LLM_FALLBACK3_BASE_URL", "https://api.longcat.chat/openai/v1",
          "LLM_FALLBACK3_API_KEY", "LLM_FALLBACK3_MODEL", "LongCat-2.0"),
     ]
