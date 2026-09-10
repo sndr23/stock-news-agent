@@ -63,6 +63,10 @@ SYMBOL = "399006"
 SYMBOL_STOCK = "300308"  # 中际旭创（科技龙头情绪标的，双确认个股侧）
 HISTORY_LIMIT = 120  # 影子 IC 记录条数上限
 MIN_SIGNAL_HISTORY = 62  # 60 日 warmup + 至少 1 根可用于 T+1 收益的完整日线
+MISSING_INPUT_CAP = 0.6  # P0-1 fail-safe：硬风控输入缺失（盘中/外盘/估值PE）时的保守封顶
+_MISSING_INPUT_LABELS = {"intraday_missing": "盘中行情",
+                          "overseas_missing": "外盘行情",
+                          "erp_missing": "估值PE"}
 
 
 def _load_local_env() -> None:
@@ -175,12 +179,18 @@ def gather_context(df) -> dict:
             intraday_snapshot_meta or {}, expected_date=today_s)
     intraday_snapshot_ok = bool(snapshot_quality.get("ok"))
 
-    intraday = 0.0
+    # P0-1 缺失显式化（2026-09-10）：取不到当日涨跌幅时置 None，不得用 0.0 冒充
+    # "真实平盘"。硬风控看到 None 会走保守封顶，而非把缺失当安全值静默放行。
+    intraday = None
     try:
         q = get_quotes([f"0.{SYMBOL}"])
-        intraday = float(q.get(SYMBOL) or 0.0)
+        raw_intraday = q.get(SYMBOL) if q else None
+        if raw_intraday is not None:
+            intraday = float(raw_intraday)
     except Exception as e:
-        logger.warning("盘中行情失败（降级为0）: %s", type(e).__name__)
+        logger.warning("盘中行情失败: %s", type(e).__name__)
+    if intraday is None:
+        logger.warning("盘中行情缺失（未取到当日涨跌幅），硬风控输入缺失→保守封顶")
 
     snapshot = {}
     citic_net = None
@@ -218,13 +228,17 @@ def gather_context(df) -> dict:
         logger.warning("资讯事件读取失败: %s", type(e).__name__)
         news_state_error = True
 
-    # 外盘 t-1 隔夜跌幅（硬风控盘中急跌的同源确认，缺源降级为 0 不阻断）
-    overseas_drop = 0.0
+    # 外盘 t-1 隔夜跌幅（硬风控盘中急跌的同源确认）。P0-1 缺失显式化：三大序列
+    # 全无数据或读取异常时置 None（不再用 0.0 冒充"外盘平稳"），硬风控改走保守封顶。
+    overseas_drop = None
     try:
         ov = ovs.load_overseas(PROJECT_ROOT)
-        overseas_drop = ovs.overnight_drop(ov, datetime.now(BJT))
+        if ov and any(ov.get(k) for k in ("sox", "ndx", "inx")):
+            overseas_drop = ovs.overnight_drop(ov, datetime.now(BJT))
     except Exception as e:
-        logger.warning("外盘状态读取失败（降级为0）: %s", type(e).__name__)
+        logger.warning("外盘状态读取失败: %s", type(e).__name__)
+    if overseas_drop is None:
+        logger.warning("外盘行情缺失（三大外盘序列均无数据），硬风控输入缺失→保守封顶")
 
     # 中际旭创（双确认个股侧）：趋势/动量/盘中，缺源降级为 None（跳过确认）。
     # 用 ≤d-1 完整日收盘算趋势/动量（当日 partial close 会污染均线，与量价修复同口径），
@@ -301,7 +315,7 @@ def _load_erp_basis(dates) -> Optional[list]:
         pe = ipe.align_pe_by_dates(pe_map, list(dates))
         return ipe.pe_to_cheap_pctile(pe, VAL_SPAN)
     except Exception as e:
-        logger.warning("估值分位计算失败（降级为0）: %s", type(e).__name__)
+        logger.warning("估值分位计算失败（缺失显式化）: %s", type(e).__name__)
         return None
 
 
@@ -425,9 +439,11 @@ def score_all(ctx: dict) -> dict:
     mods["chan"] = chan
     mods["stock"] = stock_conf
     score = ct.clamp(core["score"] + mods["score"])
+    # P0-1 缺失显式化（2026-09-10）：intraday/overseas 缺失时为 None（gather_context
+    # 置 None），不再传 0.0 —— 若传 0.0 会被硬风控当成"真实平盘"而静默放行。
     glass = {"risk_off": str((snapshot.get("risk_state") or "")) == "risk_off",
-             "basis_min_ap": None, "intraday_pct": ctx["intraday"],
-             "overseas_drop": ctx.get("overseas_drop", 0.0)}
+             "basis_min_ap": None, "intraday_pct": ctx.get("intraday"),
+             "overseas_drop": ctx.get("overseas_drop")}
     aps = []
     for code in ("IC", "IM"):
         b = ((snapshot.get("basis") or {}) or {}).get(code) or {}
@@ -443,10 +459,23 @@ def score_all(ctx: dict) -> dict:
     except (TypeError, ValueError):
         pass
     caps = cf.defensive_state(closes, vol_pctile, glass)
+    # P0-1 fail-safe（2026-09-10）：任一硬风控输入缺失时不再 fail-open（默认"没风险"），
+    # 而是保守封顶 MISSING_INPUT_CAP，并在 triggers 写明缺失项（intraday_missing /
+    # overseas_missing / erp_missing），供报告层显式告警、影子 history 留痕。
+    _erp_series = ctx.get("erp_pctile") or []
+    _missing = []
+    if ctx.get("intraday") is None:
+        _missing.append("intraday_missing")
+    if ctx.get("overseas_drop") is None:
+        _missing.append("overseas_missing")
+    if not _erp_series or _erp_series[-1] is None:
+        _missing.append("erp_missing")
+    if _missing:
+        caps["cap"] = min(caps["cap"], MISSING_INPUT_CAP)
+        caps.setdefault("triggers", []).extend(_missing)
     # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
     # 历史宽松信息集下该约束曾表现为净负贡献（旧对照：+291.9% → +188.8%）。
     # 当前严格回测以 d 日完整收盘近似 14:45 快照，不能把旧对照当作生产基线。
-    _erp_series = ctx.get("erp_pctile") or []
     if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
         caps["cap"] = min(caps["cap"], 0.6)
         caps.setdefault("triggers", []).append(
@@ -916,7 +945,12 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
     od = ctx.get("overseas_drop") or 0.0
     if od <= -0.03:
         lines.append(f"■ 外围：SOX/纳指/标普 t-1 最差 {od:.1%}（外围大幅下杀）")
-    lines.append(f"■ 盘中：创业板指 {ctx['intraday']:+.2f}%")
+    _ip = ctx.get("intraday")
+    if isinstance(_ip, (int, float)):
+        lines.append(f"■ 盘中：创业板指 {_ip:+.2f}%")
+    else:
+        # P0-1：行情缺失时不再打印 +0.00%（会伪装成"真实平盘"掩盖断流）
+        lines.append("■ 盘中：创业板指 行情缺失（未参与盘中急跌风控）")
     dar = ctx.get("day_amount_ratio") or 0.0
     if dar:
         lines.append(f"■ 量能：今日累计量/昨量 {dar:.2f}（量价因子使用当日盘中累计量）")
@@ -951,6 +985,15 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
                          f"硬风控仅限上限未实际生效）")
     else:
         lines.append("■ 硬风控：无触发")
+    # P0-1 降级告警（2026-09-10）：风控输入缺失且已启用保守封顶时，推送里一眼可见
+    _missing_inputs = [t for t in (caps.get("triggers") or [])
+                       if str(t).endswith("_missing")]
+    if _missing_inputs:
+        _labels = "、".join(_MISSING_INPUT_LABELS.get(t, t)
+                            for t in _missing_inputs)
+        lines.append(
+            f"⚠ 降级告警：风控输入缺失（{_labels}），已启用保守封顶 "
+            f"≤{MISSING_INPUT_CAP:.0%}；缺失项 {'/'.join(_missing_inputs)}")
     if ctx.get("snapshot_stale"):
         lines.append(f"⚠ 修正层数据源停更于 {ctx.get('snapshot_ts', '')}，"
                      f"贴水/资金/情绪基于旧快照，请结合盘中走势谨慎参考")
