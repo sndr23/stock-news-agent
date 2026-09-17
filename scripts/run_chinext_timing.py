@@ -63,10 +63,9 @@ SYMBOL = "399006"
 SYMBOL_STOCK = "300308"  # 中际旭创（科技龙头情绪标的，双确认个股侧）
 HISTORY_LIMIT = 120  # 影子 IC 记录条数上限
 MIN_SIGNAL_HISTORY = 62  # 60 日 warmup + 至少 1 根可用于 T+1 收益的完整日线
-MISSING_INPUT_CAP = 0.6  # P0-1 fail-safe：硬风控输入缺失（盘中/外盘/估值PE）时的保守封顶
+MISSING_INPUT_CAP = 0.6  # P0-1 fail-safe：硬风控输入缺失（盘中/外盘）时的保守封顶
 _MISSING_INPUT_LABELS = {"intraday_missing": "盘中行情",
-                          "overseas_missing": "外盘行情",
-                          "erp_missing": "估值PE"}
+                          "overseas_missing": "外盘行情"}
 
 
 def _load_local_env() -> None:
@@ -298,25 +297,7 @@ def gather_context(df) -> dict:
             "citic_net": citic_net, "citic_day": citic_day, "events": events,
             "news_state_error": news_state_error,
             "overseas_drop": overseas_drop, "stock_ctx": stock_ctx,
-            "day_amount_ratio": day_amount_ratio,
-            "erp_pctile": _load_erp_basis(dates)}
-
-
-VAL_SPAN = 500  # 估值分位滚动窗（实盘与回测定稿同口径）
-
-
-def _load_erp_basis(dates) -> Optional[list]:
-    """加载创业板50 TTM PE 滚动分位便宜度序列（对齐 dates，span=VAL_SPAN）。
-    缺源/失败返回 None → 核心层估值维自动置 0。dates 为 'YYYY-MM-DD' 字符串列表。"""
-    try:
-        pe_map = ipe.load_cy50_pe(PROJECT_ROOT)
-        if not pe_map:
-            return None
-        pe = ipe.align_pe_by_dates(pe_map, list(dates))
-        return ipe.pe_to_cheap_pctile(pe, VAL_SPAN)
-    except Exception as e:
-        logger.warning("估值分位计算失败（缺失显式化）: %s", type(e).__name__)
-        return None
+            "day_amount_ratio": day_amount_ratio}
 
 
 def _dimension_modifier(snapshot: dict, ctx: dict) -> dict:
@@ -461,25 +442,15 @@ def score_all(ctx: dict) -> dict:
     caps = cf.defensive_state(closes, vol_pctile, glass)
     # P0-1 fail-safe（2026-09-10）：任一硬风控输入缺失时不再 fail-open（默认"没风险"），
     # 而是保守封顶 MISSING_INPUT_CAP，并在 triggers 写明缺失项（intraday_missing /
-    # overseas_missing / erp_missing），供报告层显式告警、影子 history 留痕。
-    _erp_series = ctx.get("erp_pctile") or []
+    # overseas_missing），供报告层显式告警、影子 history 留痕。
     _missing = []
     if ctx.get("intraday") is None:
         _missing.append("intraday_missing")
     if ctx.get("overseas_drop") is None:
         _missing.append("overseas_missing")
-    if not _erp_series or _erp_series[-1] is None:
-        _missing.append("erp_missing")
     if _missing:
         caps["cap"] = min(caps["cap"], MISSING_INPUT_CAP)
         caps.setdefault("triggers", []).extend(_missing)
-    # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
-    # 历史宽松信息集下该约束曾表现为净负贡献（旧对照：+291.9% → +188.8%）。
-    # 当前严格回测以 d 日完整收盘近似 14:45 快照，不能把旧对照当作生产基线。
-    if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
-        caps["cap"] = min(caps["cap"], 0.6)
-        caps.setdefault("triggers", []).append(
-            f"估值极贵(便宜度{_erp_series[-1]:.0%})封顶6成")
     # 顶背驰：结构否决，封顶 6 成（带否决但不完全清仓）
     if chan["bustop"]:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -1288,9 +1259,6 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                  val_span: int = 500, val_w: float = 0.10,
                  tiers: tuple = ct.TIERS, erp_cap: bool = False) -> str:
     m = backtest_metrics(df, fee, pe_map, val_span, val_w, tiers, erp_cap)
-    val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位，仅作极端滤波"
-                f"(便宜度<0.1=PE顶部10% 封顶6成，erp_cap)"
-                if m["has_val"] else "估值源缺失（估值滤波关闭）")
     ds, s = m["dates"], m["start"]
     dodge = m["down_dodge"]
     return "\n".join([
@@ -1304,7 +1272,7 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
         f"降档质量：{m['n_down']} 次减仓后10日市场 {dodge[1]:+.1%}（均值），"
         f"{dodge[0]:.0%} 段为下跌",
         "口径：信号日 d 使用 d 日 14:45 快照（回测用 d 日收盘近似），吃 d+1 收益（对齐场外基金T+1）；"
-        "仅核心层9个注册因子五维（其中ERP关闭），实时修正层+缠论不可回测（影子期再评估）。" + val_note + "。",
+        "仅核心层9个注册因子五维（其中ERP关闭），实时修正层+缠论不可回测（影子期再评估）。",
     ])
 
 
@@ -1476,10 +1444,10 @@ def main():
         return
 
     if args.backtest:
-        # ERP 估值极端滤波（便宜度<0.1=PE顶部10% 封顶6成）：估值极贵时降仓。
-        # 估值维不进打分（erp_cap 独立硬过滤，core 仍 erp_pctile=None）。
-        print(run_backtest(df, pe_map=ipe.load_cy50_pe(PROJECT_ROOT),
-                           erp_cap=True))
+        # ERP 估值极端滤波已整体下线（FIX-20260918-01）：12 年费 0 回测中该滤波净贡献
+        # -77pp（无滤波 +188.3% vs bug 版滤波 +135.2%），且分位实现本身有 bug。
+        # 回测口径恢复为纯核心层五维，不再加载 pe_map / 不启用 erp_cap。
+        print(run_backtest(df, fee=0.0))
         return
 
     today = datetime.now(BJT).strftime("%Y-%m-%d")
