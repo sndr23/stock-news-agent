@@ -89,7 +89,8 @@
 | **14:45** | **创业板仓位信号** | **chinext-timing** |
 | 15:10 | 盘后复盘 | market-brief |
 | 17:00 | 中信持仓日报 | citic-pos-push |
-| 周六 | 信号质量回测 | signal-backtest |
+| 手动 | 信号质量回测 | signal-backtest |
+| 周日 | 创业板择时质量周报 | chinext-timing-quality |
 
 > 已停用：~~strategy-daily（18:00 选股策略日报）~~
 

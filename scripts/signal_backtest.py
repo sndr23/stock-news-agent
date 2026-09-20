@@ -398,6 +398,16 @@ def backtest(events: list, days: int = DEFAULT_DAYS) -> dict:
         "by_sector": {},
         "details": results,
     }
+    # 数据实际覆盖区间：取合并后全部已推事件（含可评估+跳过），而非仅可评估样本
+    in_window_dates = [str(e.get("t", ""))[:10] for e in in_window if e.get("t")]
+    if in_window_dates:
+        cov_earliest = min(in_window_dates)
+        cov_latest = max(in_window_dates)
+        summary["data_coverage"] = {
+            "earliest": cov_earliest,
+            "latest": cov_latest,
+            "days": (datetime.strptime(cov_latest, "%Y-%m-%d") - datetime.strptime(cov_earliest, "%Y-%m-%d")).days + 1,
+        }
     sector_rows = defaultdict(list)
     for r in results:
         for s in r["sectors"]:
@@ -541,6 +551,18 @@ def build_report(summary: dict) -> str:
     lines = ["# 信号质量回测报告", f"生成时间: {now}", ""]
     lines.append(f"**样本范围**: 近 {s['window_days']} 天已推事件 {s['events_total']} 条，"
                  f"可评估 {s['evaluated']} 条（跳过 {sum(s['skipped'].values())} 条）")
+    # 数据实际覆盖区间：优先从 summary["data_coverage"]（取自全部已推事件），
+    # 读不到时回退现有 details 逻辑（兼容单测等未设置该键的场景）。
+    coverage = s.get("data_coverage")
+    if coverage:
+        lines.append(f"**数据实际覆盖**: {coverage['earliest']} ~ {coverage['latest']}（共 {coverage['days']} 天）")
+    else:
+        event_dates = [str(e.get("t", ""))[:10] for e in s.get("details", []) if e.get("t")]
+        if event_dates:
+            earliest = min(event_dates)
+            latest = max(event_dates)
+            coverage_days = (datetime.strptime(latest, "%Y-%m-%d") - datetime.strptime(earliest, "%Y-%m-%d")).days + 1
+            lines.append(f"**数据实际覆盖**: {earliest} ~ {latest}（共 {coverage_days} 天）")
     if s["skipped"]:
         lines.append("跳过原因: " + "、".join(f"{k} {v}" for k, v in s["skipped"].items()))
     # 0 可评估时明确标注冷启动，防止"无数据"被误读为"回测通过/不通过"。
