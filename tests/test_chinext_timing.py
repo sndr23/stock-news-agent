@@ -228,13 +228,13 @@ def test_defensive_caps_intraday_crash():
 # ---------------- 档位状态机 ----------------
 
 def test_score_to_tier_boundaries():
-    assert ct.score_to_tier(0.40) == 1.0
-    assert ct.score_to_tier(0.39) == 0.9
+    assert ct.TIERS == ((0.30, 1.0), (-0.25, 0.9), (-0.30, 0.6))
+    assert ct.score_to_tier(0.30) == 1.0
+    assert ct.score_to_tier(0.29) == 0.9
     assert ct.score_to_tier(0.05) == 0.9
     assert ct.score_to_tier(0.00) == 0.9
-    assert ct.score_to_tier(-0.15) == 0.9
-    assert ct.score_to_tier(-0.16) == 0.6
-    assert ct.score_to_tier(-0.25) == 0.6
+    assert ct.score_to_tier(-0.25) == 0.9
+    assert ct.score_to_tier(-0.26) == 0.6
     assert ct.score_to_tier(-0.30) == 0.6
     assert ct.score_to_tier(-0.31) == 0.0
 
@@ -278,16 +278,16 @@ def test_decide_cap_forces_immediate_down():
 
 def test_decide_hold_clears_pending():
     prev = {"position": 0.6, "pending": {"target": 1.0, "days": 1}}
-    d = ct.decide_position(-0.20, 1.0, prev)  # 目标=当前档0.6
+    d = ct.decide_position(-0.26, 1.0, prev)  # 目标=当前档0.6
     assert not d["changed"] and d["pending"] is None
 
 
 def test_hysteresis_band_blocks_threshold_jitter():
-    """分数在满仓线 0.40 下方 0.05 处震荡：原逻辑立即降档，滞回带内维持。"""
+    """分数在满仓线 0.30 下方 0.05 处震荡：原逻辑立即降档，滞回带内维持。"""
     prev = {"position": 1.0, "pending": None}
-    d = ct.decide_position(0.38, 1.0, prev)  # 0.38 ∈ [0.35, 0.40) → 维持满仓
+    d = ct.decide_position(0.28, 1.0, prev)  # 0.28 ∈ [0.25, 0.30) → 维持满仓
     assert not d["changed"] and d["position"] == 1.0
-    d2 = ct.decide_position(0.34, 1.0, prev)  # 明确跌破 0.35 → 降九成
+    d2 = ct.decide_position(0.24, 1.0, prev)  # 明确跌破 0.25 → 降九成
     assert d2["changed"] and d2["position"] == 0.9
 
 
@@ -295,7 +295,7 @@ def test_hysteresis_hold_is_not_reported_as_risk_cap():
     """滞回带保档不能误报为硬风控封顶。"""
     prev = {"position": 1.0, "pending": None}
 
-    decision = ct.decide_position(0.38, 1.0, prev)
+    decision = ct.decide_position(0.28, 1.0, prev)
 
     assert decision["position"] == 1.0
     assert "风控封顶" not in "".join(decision["note"])
@@ -304,21 +304,21 @@ def test_hysteresis_hold_is_not_reported_as_risk_cap():
 
 def test_hysteresis_band_downgrade_path():
     prev = {"position": 0.6, "pending": None}
-    # 0.01 ∈ [0.0, 0.05) → 维持六成（原逻辑降三成）
-    assert ct.decide_position(0.01, 1.0, prev)["position"] == 0.6
-    # -0.28 ∈ [-0.40, -0.35) 滞回带 → 维持三成
+    # -0.26 ∈ [-0.35, -0.25) → 维持六成
+    assert ct.decide_position(-0.26, 1.0, prev)["position"] == 0.6
+    # -0.28 未达九成升档确认线，当前六成仓位保持
     prev3 = {"position": 0.3, "pending": None}
     assert ct.decide_position(-0.28, 1.0, prev3)["position"] == 0.3
-    # -0.41 明确跌破 -0.40（带滞回带维持线）→ 空仓
+    # -0.41 明确跌破 -0.30 → 空仓
     assert ct.decide_position(-0.41, 1.0, prev3)["position"] == 0.0
 
 
 def test_hysteresis_not_apply_to_upgrade():
     """滞回带只护降档，不放松升档：不达高档位线不提议升档；达满仓线才提议（两日确认）。"""
     prev = {"position": 0.6, "pending": None}
-    d = ct.decide_position(-0.20, 1.0, prev)
-    assert d["position"] == 0.6 and d["pending"] is None  # 未过0.9档升档线(-0.15)
-    d2 = ct.decide_position(0.41, 1.0, prev)
+    d = ct.decide_position(-0.26, 1.0, prev)
+    assert d["position"] == 0.6 and d["pending"] is None  # 未过0.9档升档线(-0.25)
+    d2 = ct.decide_position(0.31, 1.0, prev)
     assert not d2["changed"] and d2["pending"]["target"] == 1.0  # 达满仓线，提议升档待确认
 
 
@@ -338,11 +338,11 @@ def test_composite_bounded():
 
 
 def test_modifier_cannot_flip_neutral_market():
-    """修正层合计封顶 ±0.30 < 满仓线 0.40：中性核心永不被实时数据推到满仓档。"""
+    """修正层合计封顶 ±0.30，达到新满仓线 0.30 时可进入满仓档。"""
     mods = ({"score": 0.15}, {"score": 0.10}, {"score": 0.08}, {"score": 0.15})
     s = ct.composite({"score": 0.0}, *mods)
     assert s == 0.30
-    assert ct.score_to_tier(s) == 0.9  # 最多到九成档，到不了满仓档
+    assert ct.score_to_tier(s) == 1.0  # 新满仓线为 0.30
 
 
 def test_dimension_modifier_applies_documented_component_caps():

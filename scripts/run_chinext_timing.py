@@ -473,13 +473,8 @@ def score_all(ctx: dict) -> dict:
     if _missing:
         caps["cap"] = min(caps["cap"], MISSING_INPUT_CAP)
         caps.setdefault("triggers", []).extend(_missing)
-    # ERP 估值极端滤波：便宜度分位<0.10（=PE处于500日顶部10%，估值极贵）封顶6成。
-    # 历史宽松信息集下该约束曾表现为净负贡献（旧对照：+291.9% → +188.8%）。
-    # 当前严格回测以 d 日完整收盘近似 14:45 快照，不能把旧对照当作生产基线。
-    if _erp_series and _erp_series[-1] is not None and _erp_series[-1] < 0.10:
-        caps["cap"] = min(caps["cap"], 0.6)
-        caps.setdefault("triggers", []).append(
-            f"估值极贵(便宜度{_erp_series[-1]:.0%})封顶6成")
+    # v5.2（2026-09-20 用户拍板）：ERP 极端估值封顶关闭（ERP OFF）。
+    # erp_pctile 仍用于上方缺失 fail-safe 的数据质量告警，但不再改变仓位上限。
     # 顶背驰：结构否决，封顶 6 成（带否决但不完全清仓）
     if chan["bustop"]:
         caps["cap"] = min(caps["cap"], 0.6)
@@ -1009,7 +1004,7 @@ def render_report(today: str, res: dict, ctx: dict, dec: dict, prev_pos: float,
         elif health.get("level") == "insufficient":
             lines.append(f"■ 策略健康度：{health['reasons'][0]}")
     lines.append("")
-    lines.append("档位线：≥+0.40满仓｜≥-0.15九成｜≥-0.30战略六成底仓｜更低空仓")
+    lines.append("档位线：≥+0.30满仓｜≥-0.25九成｜≥-0.30战略六成底仓｜更低空仓")
     lines.append(f"升档需连续2日确认，降档当日生效；15:00 前下单有效。仅供参考。"
                  f"（代码 {_git_commit()}）")
     return "\n".join(lines)
@@ -1288,13 +1283,12 @@ def run_backtest(df, fee: float = 0.0, pe_map: Optional[dict] = None,
                  val_span: int = 500, val_w: float = 0.10,
                  tiers: tuple = ct.TIERS, erp_cap: bool = False) -> str:
     m = backtest_metrics(df, fee, pe_map, val_span, val_w, tiers, erp_cap)
-    val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位，仅作极端滤波"
-                f"(便宜度<0.1=PE顶部10% 封顶6成，erp_cap)"
-                if m["has_val"] else "估值源缺失（估值滤波关闭）")
+    val_note = (f"估值：创业板50 TTM PE 滚动{val_span}日分位，ERP OFF（仅作审计，不启用极端滤波）"
+                if m["has_val"] else "估值源缺失（ERP滤波关闭）")
     ds, s = m["dates"], m["start"]
     dodge = m["down_dodge"]
     return "\n".join([
-        f"创业板仓位信号·v5.1核心层回测（{ds[s].date()} ~ {ds[-1].date()}，"
+        f"创业板仓位信号·v5.2核心层回测（{ds[s].date()} ~ {ds[-1].date()}，"
         f"{m['n_navs']}个交易日，成本{fee:.1%}/次）", "",
         f"策略累计 {m['total']:+.1%} / 年化 {m['cagr']:+.1%} / 夏普 {m['sharpe']:.2f} / "
         f"最大回撤 {m['mdd']:.1%} / 卡玛 {m['calmar']:.2f}",
@@ -1476,10 +1470,9 @@ def main():
         return
 
     if args.backtest:
-        # ERP 估值极端滤波（便宜度<0.1=PE顶部10% 封顶6成）：估值极贵时降仓。
-        # 估值维不进打分（erp_cap 独立硬过滤，core 仍 erp_pctile=None）。
+        # v5.2（2026-09-20 用户拍板）：ERP 极端估值封顶关闭，与生产 score_all 同口径。
         print(run_backtest(df, pe_map=ipe.load_cy50_pe(PROJECT_ROOT),
-                           erp_cap=True))
+                           erp_cap=False))
         return
 
     today = datetime.now(BJT).strftime("%Y-%m-%d")

@@ -9,8 +9,11 @@
 修正层的纯函数与仓位状态机。生产入口会对资金/情绪/资讯原始修正再做分项封顶，
 并将修正层总分封顶 ±0.30；硬风控最高优先级覆盖所有打分。
 
-档位状态机（0/60/90/100%，v5 收益优先中枢上移）：升档需连续两日同目标确认，降档当日生效
-（非对称：进场慢、出场快——场外基金申赎费高，宁可错过不可做错）。
+档位状态机（0/60/90/100%，v5.2 生产档位：score≥0.30→100%、≥-0.25→90%、
+≥-0.30→60%；2026-09-20 切换，依据二轮寻优+五重门禁+用户拍板）：升档需连续两日同目标确认，
+降档当日生效（非对称：进场慢、出场快——场外基金申赎费高，宁可错过不可做错）。
+v5.2 生产信号同步关闭 ERP 极端估值封顶（ERP OFF）；ERP 缺失时仍由生产入口的
+fail-safe 硬风控显式降级，不等同于启用 ERP 滤波。
 
 无前视约定：t 日 14:45 信号使用 ≤t 的盘中快照（价格、最高/最低、累计成交量）；
 若盘中快照获取失败，必须显式标记并回退到最近完整日线，不能静默伪装成盘中数据。
@@ -318,7 +321,7 @@ def defensive_caps(closes: list, intraday_pct: float, snapshot: dict,
     return {"cap": cap, "reasons": reasons}
 
 
-TIERS = ((0.40, 1.0), (-0.15, 0.9), (-0.30, 0.6))
+TIERS = ((0.30, 1.0), (-0.25, 0.9), (-0.30, 0.6))
 HYST_MARGIN = 0.05  # 降档滞回带：需明确跌破阈值-0.05 才降，防阈值震荡换仓
 UPGRADE_CONFIRM_DAYS = 2  # 升档需连续 N 日同目标确认（降档无此约束，风控优先）
 MIN_IC_SAMPLES = 10  # 影子 IC 最小样本门槛（对齐 |IC|≥0.05 + 样本≥10 的因子验门）
@@ -334,8 +337,8 @@ def score_to_tier(score: float, tiers: tuple = TIERS) -> float:
 def _tier_with_hysteresis(score: float, cur: float, tiers: tuple = TIERS) -> float:
     """滞回分档：维持/降档档位的进入阈值放宽 margin，升档阈值不变。
 
-    场景：分数在 0.35 线上下震荡时，原逻辑会 满仓→六成(即时)→满仓(两日确认)
-    反复换仓吃申赎费；加带后需明确跌破 0.30 才降档。
+    场景：分数在 0.25 线上下震荡时，原逻辑会 满仓→九成(即时)→满仓(两日确认)
+    反复换仓吃申赎费；加带后需明确跌破 0.25 才降档。
     """
     for th, pos in tiers:
         th_eff = th if pos > cur else th - HYST_MARGIN
@@ -380,7 +383,7 @@ def decide_position(score: float, cap: float, prev: dict,
             "direction": "hold", "note": []}
 
 
-MOD_TOTAL_CAP = 0.30  # 修正层合计封顶：中性市场最多被推到六成档，永远到不了满仓档
+MOD_TOTAL_CAP = 0.30  # 修正层合计封顶：中性市场最多触达新的满仓线
 
 
 def stock_confirm(stock_trend: dict, stock_mom: dict, index_trend: dict,
@@ -430,7 +433,7 @@ def composite(core: dict, deriv: dict, flow: dict, mood: dict, news: dict) -> fl
     """总分 = 核心层 + 修正层（合计封顶 ±0.30），整体 clamp 到 [-1, 1]。
 
     设计约束：实时修正数据不可回测，只能"倾斜"不能"定档"——
-    核心分 0（中性）时，即使四项修正全部拉满也只有 +0.30 < 满仓线 0.35。
+    核心分 0（中性）时，四项修正全部拉满可达到新的满仓线 +0.30。
     """
     mods = clamp(deriv["score"] + flow["score"] + mood["score"] + news["score"],
                  -MOD_TOTAL_CAP, MOD_TOTAL_CAP)

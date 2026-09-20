@@ -95,6 +95,19 @@ def test_score_all_normal_path_matches_defensive_state(monkeypatch):
     assert not any(str(t).endswith("_missing") for t in res["caps"]["triggers"])
 
 
+def test_score_all_erp_extreme_filter_is_off(monkeypatch):
+    """生产信号路径 ERP OFF：极贵分位不再额外封顶仓位。"""
+    _neutral_chan(monkeypatch)
+    ctx = _ctx(erp_pctile=[0.05] * len(_ctx()["closes"]))
+    res = rct.score_all(ctx)
+    baseline = cf.defensive_state(
+        ctx["closes"], None,
+        {"risk_off": False, "basis_min_ap": None,
+         "intraday_pct": 1.0, "overseas_drop": 0.0})
+    assert res["caps"]["cap"] == baseline["cap"]
+    assert not any("估值极贵" in str(t) for t in res["caps"]["triggers"])
+
+
 @pytest.mark.parametrize("over,tag", [
     ({"intraday": None}, "intraday_missing"),
     ({"overseas_drop": None}, "overseas_missing"),
