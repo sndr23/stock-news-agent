@@ -14,11 +14,11 @@
 - r3/r5/r10 为日后 3/5/10 个交易日实际收益，尾部 null 属正常（待回填）
 
 报告章节：
-1. 覆盖与样本
-2. score→次日收益 IC（Spearman）
-3. score 分层单调性（按 v5.1 档位边界）
-4. 仓位决策审计（核心章节）
-5. 踏空/躲跌归因
+1. 推送信号对账（逐日信号 vs 实际涨跌）
+2. 仓位决策审计（核心章节）
+3. 踏空/躲跌归因
+4. score→次日收益 IC（Spearman）
+5. score 分层单调性（按 v5.1 档位边界）
 6. 七层因子 IC
 7. 结论提示（事实陈述，禁止收益承诺）
 
@@ -54,6 +54,8 @@ REPORT_PATH = PROJECT_ROOT / "logs" / "chinext_timing_quality_report.md"
 BJT = timezone(timedelta(hours=8))
 HORIZONS = (1, 3, 5, 10)
 MIN_IC_DAYS = 20  # IC 评估最小样本（配对交易日数）
+FLAT_RET_THRESHOLD = 0.003  # 次日绝对收益小于 0.3% 视为基本持平
+MIN_SIGNAL_SAMPLE = 20  # 信号偏差结论的最小次日回填样本
 
 # v5.2 生产档位（与 src/strategy/chinext_timing.py 的 TIERS 一致，2026-09-20 切换）
 # TIERS = ((0.30, 1.0), (-0.25, 0.9), (-0.30, 0.6))
@@ -144,6 +146,195 @@ def score_to_tier(score: float) -> float:
         if score >= th:
             return pos
     return 0.0
+
+
+def classify_signal(position: float, next_ret: float,
+                    flat_threshold: float = FLAT_RET_THRESHOLD) -> str:
+    """按推送仓位和次日实际收益给出单日对账判定。"""
+    if next_ret is None:
+        return "待回填"
+    if abs(next_ret) < flat_threshold:
+        return "基本持平"
+    if position > 0:
+        return "符合" if next_ret > 0 else "偏差"
+    return "躲过" if next_ret < 0 else "错过"
+
+
+def _signal_note(position: float, next_ret: float, verdict: str,
+                 flat_threshold: float) -> str:
+    """生成逐日对账表的备注，不参与判定或统计。"""
+    signal = "持仓信号" if position > 0 else "空仓信号"
+    if verdict == "待回填":
+        return "次日实际未回填"
+    if verdict == "基本持平":
+        return f"{signal}，|次日实际|<{flat_threshold * 100:.2f}%"
+    direction = "上涨" if next_ret > 0 else "下跌"
+    return f"{signal}，次日{direction}"
+
+
+def compute_signal_reconciliation(
+    history: list, flat_threshold: float = FLAT_RET_THRESHOLD
+) -> list:
+    """构造逐条推送信号对账结果；不修改传入 history。"""
+    rows = []
+    for item in history:
+        position = item.get("position", 0.0)
+        next_ret = item.get("next_ret")
+        verdict = classify_signal(position, next_ret, flat_threshold)
+        rows.append({
+            "date": item.get("date", "—"),
+            "position": position,
+            "score": item.get("score"),
+            "next_ret": next_ret,
+            "r3": item.get("r3"),
+            "r5": item.get("r5"),
+            "r10": item.get("r10"),
+            "signal": "持仓信号" if position > 0 else "空仓信号",
+            "verdict": verdict,
+            "note": _signal_note(position, next_ret, verdict, flat_threshold),
+        })
+    return rows
+
+
+def compute_signal_bias_stats(
+    history: list, flat_threshold: float = FLAT_RET_THRESHOLD
+) -> dict:
+    """统计空仓/持仓信号与次日实际走势的偏差。"""
+    rows = compute_signal_reconciliation(history, flat_threshold)
+    empty = {
+        "total": 0,
+        "n": 0,
+        "pending": 0,
+        "avoided": 0,
+        "missed": 0,
+        "flat": 0,
+        "avoided_total": 0.0,
+        "missed_total": 0.0,
+    }
+    holding = {
+        "total": 0,
+        "n": 0,
+        "pending": 0,
+        "conforming": 0,
+        "deviation": 0,
+        "flat": 0,
+        "conforming_total": 0.0,
+        "deviation_total": 0.0,
+    }
+
+    for row in rows:
+        stats = holding if row["position"] > 0 else empty
+        stats["total"] += 1
+        next_ret = row["next_ret"]
+        if next_ret is None:
+            stats["pending"] += 1
+            continue
+        stats["n"] += 1
+        if row["verdict"] == "基本持平":
+            stats["flat"] += 1
+        elif row["verdict"] == "躲过":
+            stats["avoided"] += 1
+            stats["avoided_total"] += -next_ret
+        elif row["verdict"] == "错过":
+            stats["missed"] += 1
+            stats["missed_total"] += next_ret
+        elif row["verdict"] == "符合":
+            stats["conforming"] += 1
+            stats["conforming_total"] += next_ret
+        elif row["verdict"] == "偏差":
+            stats["deviation"] += 1
+            stats["deviation_total"] += -next_ret
+
+    for stats in (empty, holding):
+        for key in ("avoided_total", "missed_total", "conforming_total", "deviation_total"):
+            if key in stats:
+                stats[key] = round(stats[key], 6)
+
+    filled_n = sum(1 for row in rows if row["next_ret"] is not None)
+    pending_n = len(rows) - filled_n
+    missed_total = empty["missed_total"]
+    deviation_total = holding["deviation_total"]
+    if missed_total > deviation_total:
+        bias = "信号偏空"
+    elif deviation_total > missed_total:
+        bias = "信号偏多"
+    else:
+        bias = "无显著偏差"
+    conclusion = bias
+    if filled_n < MIN_SIGNAL_SAMPLE:
+        conclusion = f"{bias}；样本不足，暂不下结论"
+
+    return {
+        "n": filled_n,
+        "pending": pending_n,
+        "total": len(rows),
+        "empty": empty,
+        "holding": holding,
+        "bias": bias,
+        "conclusion": conclusion,
+        "flat_threshold": flat_threshold,
+    }
+
+
+def _fmt_return(value: float, missing: str = "—") -> str:
+    return f"{value * 100:+.2f}%" if value is not None else missing
+
+
+def render_signal_reconciliation_table(
+    history: list, flat_threshold: float = FLAT_RET_THRESHOLD
+) -> str:
+    """渲染逐日对账表，按日期倒序排列。"""
+    rows = compute_signal_reconciliation(history, flat_threshold)
+    rows.sort(key=lambda row: row["date"], reverse=True)
+    lines = [
+        "| 日期 | 推送仓位 | score | 次日实际 | 3日 | 5日 | 10日 | 判定 | 备注 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        position = f"{row['position'] * 100:.0f}%"
+        score = f"{row['score']:+.3f}" if row["score"] is not None else "—"
+        lines.append(
+            f"| {row['date']} | {position} | {score} | "
+            f"{_fmt_return(row['next_ret'], '待回填')} | "
+            f"{_fmt_return(row['r3'])} | {_fmt_return(row['r5'])} | "
+            f"{_fmt_return(row['r10'])} | {row['verdict']} | {row['note']} |"
+        )
+    return "\n".join(lines)
+
+
+def compute_current_cycle(history: list) -> dict:
+    """返回最近一次仓位变动及其后的市场累计涨跌。"""
+    ordered = sorted(history, key=lambda item: item.get("date", ""))
+    if not ordered:
+        return {
+            "change_date": None,
+            "previous_position": None,
+            "position": None,
+            "cumulative_ret": None,
+            "filled_n": 0,
+        }
+
+    change_index = 0
+    for i in range(1, len(ordered)):
+        if ordered[i].get("position", 0.0) != ordered[i - 1].get("position", 0.0):
+            change_index = i
+
+    change = ordered[change_index]
+    cumulative = 1.0
+    filled_n = 0
+    for item in ordered[change_index:]:
+        next_ret = item.get("next_ret")
+        if next_ret is not None:
+            cumulative *= 1 + next_ret
+            filled_n += 1
+    return {
+        "change_date": change.get("date"),
+        "previous_position": (ordered[change_index - 1].get("position", 0.0)
+                               if change_index > 0 else 0.0),
+        "position": change.get("position", 0.0),
+        "cumulative_ret": round(cumulative - 1, 8) if filled_n else None,
+        "filled_n": filled_n,
+    }
 
 
 def compute_ic(history: list) -> dict:
@@ -291,7 +482,7 @@ def compute_factor_ics(history: list) -> dict:
 def build_report(history: list, days: int = None) -> str:
     now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M")
     n_total = len(history)
-    dates = [h["date"] for h in history]
+    dates = [h["date"] for h in history if h.get("date")]
     earliest = min(dates) if dates else "—"
     latest = max(dates) if dates else "—"
 
@@ -306,9 +497,108 @@ def build_report(history: list, days: int = None) -> str:
              f"**各 horizon 已回填**: " + " / ".join(f"{k} {v}条" for k, v in filled.items()),
              ""]
 
-    # 1. IC
+    # 1. 推送信号对账
+    signal_stats = compute_signal_bias_stats(history)
+    current_cycle = compute_current_cycle(history)
+    empty_stats = signal_stats["empty"]
+    holding_stats = signal_stats["holding"]
+    lines.append("## 1. 推送信号对账")
+    lines.append("")
+    lines.append("### 1.1 逐日对账")
+    lines.append("")
+    lines.append(render_signal_reconciliation_table(history))
+    lines.append("")
+
+    lines.append("### 1.2 判定规则")
+    lines.append("")
+    lines.append("- 仓位 > 0 为“持仓信号”，仓位 = 0 为“空仓信号”。")
+    lines.append("- 空仓 + 次日下跌 = 躲过（一致）；空仓 + 次日上涨 = 错过（偏差）。")
+    lines.append("- 持仓 + 次日上涨 = 符合（一致）；持仓 + 次日下跌 = 偏差。")
+    lines.append(f"- |次日实际| < {FLAT_RET_THRESHOLD * 100:.2f}% 为“基本持平”，不计入偏差统计。")
+    lines.append("- 次日实际未回填 = 待回填。")
+    lines.append("")
+
+    lines.append("### 1.3 偏差统计")
+    lines.append("")
+    lines.append(
+        f"- 对账样本：次日已回填 {signal_stats['n']} 条，"
+        f"待回填 {signal_stats['pending']} 条。"
+    )
+    lines.append(
+        f"- 空仓信号日：已回填 {empty_stats['n']} 条中，"
+        f"躲过 {empty_stats['avoided']} / 错过 {empty_stats['missed']} / "
+        f"持平 {empty_stats['flat']}。"
+    )
+    lines.append(
+        f"  - 错过合计（涨幅）：{_fmt_return(empty_stats['missed_total'])}；"
+        f"躲过合计（跌幅）：{_fmt_return(empty_stats['avoided_total'])}"
+    )
+    lines.append(
+        f"- 持仓信号日：已回填 {holding_stats['n']} 条中，"
+        f"符合 {holding_stats['conforming']} / 偏差 {holding_stats['deviation']} / "
+        f"持平 {holding_stats['flat']}。"
+    )
+    lines.append(
+        f"  - 符合合计（涨幅）：{_fmt_return(holding_stats['conforming_total'])}；"
+        f"偏差合计（跌幅）：{_fmt_return(holding_stats['deviation_total'])}"
+    )
+    lines.append("- 偏空/偏多按错过涨幅合计与持仓偏差跌幅合计较大者判断。")
+    lines.append(f"- 倾向结论：{signal_stats['conclusion']}")
+    lines.append("")
+
+    lines.append("### 1.4 当前周期")
+    lines.append("")
+    if current_cycle["change_date"] is None:
+        lines.append("- 无仓位变动记录。")
+    else:
+        lines.append(
+            f"- 最近一次仓位变动：{current_cycle['change_date']}，"
+            f"{current_cycle['previous_position'] * 100:.0f}%→"
+            f"{current_cycle['position'] * 100:.0f}%。"
+        )
+        if current_cycle["cumulative_ret"] is None:
+            lines.append("- 此后市场累计涨跌：待回填。")
+        else:
+            lines.append(
+                f"- 此后市场累计涨跌：{_fmt_return(current_cycle['cumulative_ret'])} "
+                f"（按该日信号后的次日收益，已回填 {current_cycle['filled_n']} 条）。"
+            )
+    lines.append("")
+
+    # 2. 仓位决策审计
+    audits = compute_decision_audit(history)
+    lines.append("## 2. 仓位决策审计")
+    lines.append("")
+    if not audits:
+        lines.append("- 无仓位变动记录")
+    else:
+        lines.append(f"共 {len(audits)} 笔决策（含首日）")
+        lines.append("")
+        lines.append("| 日期 | 旧仓位→新仓位 | r3 | r5 | r10 | 判定 |")
+        lines.append("|---|---|---|---|---|---|")
+        for audit in audits:
+            lines.append(
+                f"| {audit['date']} | {audit['prev_pos'] * 100:.0f}%→"
+                f"{audit['new_pos'] * 100:.0f}% | {_fmt_return(audit['r3'])} | "
+                f"{_fmt_return(audit['r5'])} | {_fmt_return(audit['r10'])} | "
+                f"{audit['verdict']} |"
+            )
+    lines.append("")
+
+    # 3. 踏空/躲跌归因
+    miss = compute_miss_avoid(history)
+    lines.append("## 3. 踏空/躲跌归因")
+    lines.append("")
+    lines.append(f"- 空仓避险累计贡献: {miss['total_contrib']*100:+.4f}%")
+    if miss['nav_final'] is not None:
+        lines.append(f"- 策略净值 (nav): {miss['nav_final']:.4f} | 买入持有 (bh_nav): {miss['bh_final']:.4f}")
+        lines.append(f"- 差值: {miss['diff_pp']:+.2f} pp")
+        lines.append(f"- 策略最大回撤: {miss['nav_mdd']:.2f}% | 买入持有最大回撤: {miss['bh_mdd']:.2f}%")
+    lines.append("")
+
+    # 4. IC
     ic_result = compute_ic(history)
-    lines.append("## 1. score→次日收益 IC")
+    lines.append("## 4. score→次日收益 IC")
     lines.append("")
     if ic_result["n"] < MIN_IC_DAYS:
         lines.append(f"> ⚠️ 样本不足（n={ic_result['n']} < {MIN_IC_DAYS}），仅供参考")
@@ -318,11 +608,11 @@ def build_report(history: list, days: int = None) -> str:
         lines.append("- IC: 无法计算（配对样本 <3）")
     lines.append("")
 
-    # 2. 分层单调性
+    # 5. 分层单调性
     strat = compute_stratification(history)
-    lines.append("## 2. score 分层单调性")
+    lines.append("## 5. score 分层单调性")
     lines.append("")
-    lines.append(f"档位口径（v5.2 TIERS）：score≥0.30→100% / ≥-0.25→90% / ≥-0.30→60% / 其他→0%")
+    lines.append("档位口径（v5.2 TIERS）：score≥0.30→100% / ≥-0.25→90% / ≥-0.30→60% / 其他→0%")
     lines.append("")
     if strat["n"] == 0:
         lines.append("- 无有效分层样本")
@@ -334,38 +624,9 @@ def build_report(history: list, days: int = None) -> str:
         lines.append(f"- 单调方向: {strat['direction']}")
     lines.append("")
 
-    # 3. 仓位决策审计
-    audits = compute_decision_audit(history)
-    lines.append("## 3. 仓位决策审计")
-    lines.append("")
-    if not audits:
-        lines.append("- 无仓位变动记录")
-    else:
-        lines.append(f"共 {len(audits)} 笔决策（含首日）")
-        lines.append("")
-        lines.append("| 日期 | 旧仓位→新仓位 | r3 | r5 | r10 | 判定 |")
-        lines.append("|---|---|---|---|---|---|")
-        for a in audits:
-            def fmt(v):
-                return f"{v*100:+.2f}%" if v is not None else "—"
-            lines.append(f"| {a['date']} | {a['prev_pos']*100:.0f}%→{a['new_pos']*100:.0f}% | "
-                         f"{fmt(a['r3'])} | {fmt(a['r5'])} | {fmt(a['r10'])} | {a['verdict']} |")
-    lines.append("")
-
-    # 4. 踏空/躲跌归因
-    miss = compute_miss_avoid(history)
-    lines.append("## 4. 踏空/躲跌归因")
-    lines.append("")
-    lines.append(f"- 空仓避险累计贡献: {miss['total_contrib']*100:+.4f}%")
-    if miss['nav_final'] is not None:
-        lines.append(f"- 策略净值 (nav): {miss['nav_final']:.4f} | 买入持有 (bh_nav): {miss['bh_final']:.4f}")
-        lines.append(f"- 差值: {miss['diff_pp']:+.2f} pp")
-        lines.append(f"- 策略最大回撤: {miss['nav_mdd']:.2f}% | 买入持有最大回撤: {miss['bh_mdd']:.2f}%")
-    lines.append("")
-
-    # 5. 七层因子 IC
+    # 6. 七层因子 IC
     factor_ics = compute_factor_ics(history)
-    lines.append("## 5. 七层因子 IC（Spearman，对 next_ret）")
+    lines.append("## 6. 七层因子 IC（Spearman，对 next_ret）")
     lines.append("")
     lines.append("因子: core/basis/flow/mood/news/chan/stock（chan/海外样本少可跳过，注明）")
     lines.append("")
@@ -384,13 +645,13 @@ def build_report(history: list, days: int = None) -> str:
         lines.append(f"| {factor_labels.get(f, f)} ({f}) | {info['n']} | {ic_str} | {note} |")
     lines.append("")
 
-    # 6. 结论提示
-    lines.append("## 6. 结论提示")
+    # 7. 结论提示
+    lines.append("## 7. 结论提示")
     lines.append("")
     n_changes = len([a for a in audits if a['date'] != earliest])
     lines.append(f"- 样本 {n_total} 天，仓位变动 {n_changes} 次（不含首日），暂无统计显著性。")
-    lines.append("- 本报告仅做事实陈述，不构成任何收益承诺或投资建议。")
     lines.append("- 样本量 <20 时 IC/分层结论仅供参考，需持续积累后复核。")
+    lines.append("- 本报告仅做事实陈述，不构成任何收益承诺或投资建议。")
     lines.append("")
 
     return "\n".join(lines)
@@ -443,19 +704,20 @@ def main():
     print(f"\n[报告已保存] {REPORT_PATH}")
 
     if args.push:
-        # 推送摘要
-        ic_result = compute_ic(history)
-        miss = compute_miss_avoid(history)
-        audits = compute_decision_audit(history)
-        n_changes = len([a for a in audits if a["date"] != min(h["date"] for h in history)])
-        ic_str = f"{ic_result['ic']:+.3f}" if ic_result["ic"] is not None else "NA"
-        diff_str = f"{miss['diff_pp']:+.2f}pp" if miss["diff_pp"] is not None else "NA"
+        # 推送摘要以逐条信号对账为主
+        signal_stats = compute_signal_bias_stats(history)
+        empty_stats = signal_stats["empty"]
+        holding_stats = signal_stats["holding"]
         dates = [h["date"] for h in history]
-        summary = (f"创业板择时质量周报\n"
-                   f"覆盖: {min(dates)}~{max(dates)} 共{len(history)}天\n"
-                   f"IC(1d): {ic_str} (n={ic_result['n']})\n"
-                   f"仓位变动: {n_changes}次\n"
-                   f"nav vs bh: {diff_str}")
+        summary_lines = [
+            "创业板择时质量周报",
+            f"覆盖: {min(dates)}~{max(dates)} 共{len(history)}天",
+            f"次日已回填: {signal_stats['n']}/{signal_stats['total']}条",
+            f"空仓信号: 躲过{empty_stats['avoided']} / 错过{empty_stats['missed']} / 持平{empty_stats['flat']}",
+            f"持仓信号: 符合{holding_stats['conforming']} / 偏差{holding_stats['deviation']} / 持平{holding_stats['flat']}",
+            f"倾向: {signal_stats['conclusion']}",
+        ]
+        summary = "\n".join(summary_lines)
         r = do_push("创业板择时质量周报", summary)
         print(f"[推送] code={r.get('code', r.get('errcode'))}")
 

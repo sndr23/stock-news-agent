@@ -152,6 +152,9 @@ from scripts.chinext_timing_backtest import (  # noqa: E402
     _spearman, _rank, _max_drawdown, score_to_tier,
     compute_ic, compute_stratification, compute_decision_audit,
     compute_miss_avoid, compute_factor_ics, build_report,
+    FLAT_RET_THRESHOLD, classify_signal,
+    compute_signal_reconciliation, compute_signal_bias_stats,
+    render_signal_reconciliation_table, compute_current_cycle,
 )
 
 
@@ -430,3 +433,91 @@ def test_report_shows_ret_as_percentage():
     report = build_report(history)
     assert "+1.21%" in report, "r3=0.0121 应显示为 +1.21%"
     assert "+0.01%" not in report, "不应出现 +0.01%（量纲 bug）"
+
+
+# ============================================================
+# 推送信号对账测试
+# ============================================================
+
+
+def test_classify_signal_four_quadrants():
+    """持仓/空仓信号分别覆盖上涨和下跌四象限。"""
+    assert classify_signal(0.0, -0.01) == "躲过"
+    assert classify_signal(0.0, 0.01) == "错过"
+    assert classify_signal(0.6, 0.01) == "符合"
+    assert classify_signal(1.0, -0.01) == "偏差"
+
+
+def test_classify_signal_flat_and_pending():
+    """持平阈值以内不计偏差，缺失次日收益保持待回填。"""
+    assert FLAT_RET_THRESHOLD == pytest.approx(0.003)
+    assert classify_signal(0.0, 0.0029) == "基本持平"
+    assert classify_signal(1.0, -0.003) == "偏差"
+    assert classify_signal(1.0, None) == "待回填"
+
+
+def _make_reconciliation_history():
+    return [
+        {"date": "2026-09-01", "score": -0.40, "position": 0.0,
+         "next_ret": -0.0200, "r3": -0.01, "r5": -0.02, "r10": -0.03},
+        {"date": "2026-09-02", "score": -0.35, "position": 0.0,
+         "next_ret": 0.0150, "r3": 0.02, "r5": 0.03, "r10": 0.04},
+        {"date": "2026-09-03", "score": -0.30, "position": 0.0,
+         "next_ret": 0.0020, "r3": 0.01, "r5": 0.01, "r10": 0.01},
+        {"date": "2026-09-04", "score": 0.10, "position": 0.6,
+         "next_ret": 0.0100, "r3": 0.02, "r5": 0.03, "r10": 0.04},
+        {"date": "2026-09-05", "score": 0.20, "position": 0.6,
+         "next_ret": -0.0120, "r3": -0.02, "r5": -0.03, "r10": -0.04},
+        {"date": "2026-09-06", "score": 0.30, "position": 0.6,
+         "next_ret": None, "r3": None, "r5": None, "r10": None},
+    ]
+
+
+def test_compute_signal_bias_stats_counts_and_totals():
+    stats = compute_signal_bias_stats(_make_reconciliation_history())
+
+    assert stats["n"] == 5
+    assert stats["pending"] == 1
+    assert stats["empty"]["n"] == 3
+    assert stats["empty"]["avoided"] == 1
+    assert stats["empty"]["missed"] == 1
+    assert stats["empty"]["flat"] == 1
+    assert stats["empty"]["avoided_total"] == pytest.approx(0.02)
+    assert stats["empty"]["missed_total"] == pytest.approx(0.015)
+    assert stats["holding"]["n"] == 2
+    assert stats["holding"]["conforming"] == 1
+    assert stats["holding"]["deviation"] == 1
+    assert stats["holding"]["deviation_total"] == pytest.approx(0.012)
+    assert stats["conclusion"] == "信号偏空；样本不足，暂不下结论"
+
+
+def test_render_signal_reconciliation_table_is_reverse_chronological():
+    table = render_signal_reconciliation_table(_make_reconciliation_history())
+    assert "| 日期 | 推送仓位 | score | 次日实际 | 3日 | 5日 | 10日 | 判定 | 备注 |" in table
+    assert table.index("2026-09-06") < table.index("2026-09-01")
+    assert "| 2026-09-06 | 60% | +0.300 | 待回填 | — | — | — | 待回填 |" in table
+    assert "| 2026-09-01 | 0% | -0.400 | -2.00% | -1.00% | -2.00% | -3.00% | 躲过 |" in table
+
+
+def test_compute_current_cycle_compounds_returns_after_latest_position_change():
+    history = [
+        {"date": "2026-09-01", "position": 0.0, "next_ret": 0.01},
+        {"date": "2026-09-02", "position": 0.6, "next_ret": -0.02},
+        {"date": "2026-09-03", "position": 0.6, "next_ret": 0.03},
+    ]
+    cycle = compute_current_cycle(history)
+    assert cycle["change_date"] == "2026-09-02"
+    assert cycle["previous_position"] == 0.0
+    assert cycle["position"] == 0.6
+    assert cycle["filled_n"] == 2
+    assert cycle["cumulative_ret"] == pytest.approx((1 - 0.02) * (1 + 0.03) - 1)
+
+
+def test_build_report_puts_signal_reconciliation_first():
+    report = build_report(_make_reconciliation_history())
+    assert report.index("## 1. 推送信号对账") < report.index("## 2. 仓位决策审计")
+    assert report.index("## 2. 仓位决策审计") < report.index("## 4. score→次日收益 IC")
+    assert "空仓信号日" in report
+    assert "次日已回填 5 条，待回填 1 条" in report
+    assert "按错过涨幅合计与持仓偏差跌幅合计较大者判断" in report
+    assert "最近一次仓位变动" in report
