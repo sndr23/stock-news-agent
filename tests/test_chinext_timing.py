@@ -734,7 +734,6 @@ def test_gather_context_keeps_intraday_snapshot(monkeypatch):
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
     monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
     monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
-    monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
 
     # 情形 A：末根为当日（partial）→ 保留，末根仍为当日（v5.1 口径）
     df_a = _make_gather_df("2026-08-24", n=71)
@@ -780,7 +779,6 @@ def test_gather_context_uses_latest_valid_citic_history(monkeypatch):
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
     monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
     monkeypatch.setattr(rct, "load_stock_sina", lambda *a, **k: None)
-    monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
 
     ctx = rct.gather_context(_make_gather_df("2026-08-21"))
 

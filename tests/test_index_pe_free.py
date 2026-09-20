@@ -112,3 +112,47 @@ def test_load_cy50_pe_ignores_malformed_cache_and_uses_free_source(monkeypatch, 
     )
 
     assert ipe.load_cy50_pe(cache_dir=tmp_path) == {fresh_day: 22.5}
+
+
+# ---------------- FIX-20260918-01：分位窗口必须排序后再取极值 ----------------
+# 旧实现用未排序窗口的 w[-1]（上一交易日值，月频缓存下是 30 天前的 ffill 值）
+# 当窗口最大值比较，把 98% 的回测日误判成"便宜度<0.10 极贵"（正确约 18%）。
+
+def test_pe_pctile_monthly_ffill_not_below_010_when_below_window_max():
+    """(a) 月频粒度（30 天间隔 ffill）当前 PE 低于窗口最大值 → cheap 不得 < 0.10。
+
+    场景等价 2026-09 生产口径：窗口内早前有更高 PE，当前 PE 处于中位而非顶部，
+    排序修复后应给出中性偏便宜的便宜度；旧实现因 w[-1]（昨日 ffill 值）== cur
+    直接判成 0（极贵）。
+    """
+    monthly = [60.0, 55.0, 20.0, 25.0, 30.0, 40.0, 45.0]
+    pe = [v for v in monthly for _ in range(30)]  # 月频值 30 天 ffill 近似
+
+    cheap = ipe.pe_to_cheap_pctile(pe, span=500)
+
+    assert cheap[-1] >= 0.10, f"低于窗口最大值却判极贵：{cheap[-1]}"
+
+
+def test_pe_pctile_monotone_lower_cheap_for_higher_pe():
+    """(b) 同一滚动窗内 PE 越高便宜度越低（单调非增，实测严格递减）。"""
+    pe = [100.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 99.0]
+    cheap = ipe.pe_to_cheap_pctile(pe, span=500)
+
+    for i in range(1, len(cheap) - 1):
+        # PE 单调抬升（50→99）但均低于窗口最高点 100，便宜度必须逐点下降
+        assert cheap[i] > cheap[i + 1], (
+            f"PE 抬高时便宜度未下降：i={i} {cheap[i]} <= {cheap[i + 1]}")
+
+
+def test_pe_pctile_20260917_caliber_cheap_approx_0638():
+    """(c) 2026-09-17 真实口径（PE=30.23 处窗口 36% 分位）→ cheap≈0.638。
+
+    用 500 条等价窗口构造秩分位：181 条低于 30.23 / 500 → p=0.362 → cheap=0.638。
+    旧实现会因 w[-1] 比较把该点判成 0。
+    """
+    window = [30.0] * 181 + [31.0] * 319  # 500 条，rank(30.23)=0.362
+    pe = window + [30.23]
+
+    cheap = ipe.pe_to_cheap_pctile(pe, span=500)
+
+    assert cheap[-1] == pytest.approx(0.638, abs=1e-3)

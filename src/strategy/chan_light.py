@@ -130,11 +130,20 @@ def _standardize(s: Sequence[float], n: int = 20) -> List[float]:
     return [(x - mu) / sd for x in s]
 
 
+# 新高/新低必须是"近期事件"：极值距窗口末根的最大允许距离（根）。
+# 否则窗口内最高点可能是 20+ 根前的旧点，下跌趋势中 "价格 >= 旧高点" 近乎恒真，
+# 每天都会误报顶背驰（2026-07-08 起 bustop 曾连续 52 个交易日 = True）。
+# 取 10（窗口 40 根的尾部约 1/4）：满足"距末根 ≤12 根"约束的更严格版本——
+# 用 12 时旧高点在下跌中仍会滞留 11 个交易日（重放 24 天 / 最长 11 天），
+# 无法满足"最长连续段 ≤10 个交易日"的验收线。
+_RECENT_PIVOT_MAX_LAG = 10
+
+
 def find_divergence(closes: Sequence[float], highs: Sequence[float],
                     lows: Sequence[float], macd_momentum: Optional[Sequence[float]] = None,
                     lookback: int = 40) -> str:
-    """背驰：比较该段价格的新高(低)与对应 MACD 动能。
-    若价格创新高但动能柱总量小于前一次高峰 → 'top'（顶背驰）。
+    """背驰：只在"近期创出新高(低)"时比较对应 MACD 动能。
+    近期严格创新高但动能柱总量小于高点前动能 → 'top'（顶背驰）；底背驰对称。
     返回 'top'/'bottom'/'none'。"""
     if macd_momentum is None:
         # 用收盘动量近似 MACD（简化：20日变化量）
@@ -151,14 +160,20 @@ def find_divergence(closes: Sequence[float], highs: Sequence[float],
     price_lo = min(win_lo)
     hi_idx = win_hi.index(price_hi)
     lo_idx = win_lo.index(price_lo)
+    last = lookback - 1
+    # 新高/新低只在近期才成立：极值必须落在窗口尾部 _RECENT_PIVOT_MAX_LAG 根内，
+    # 且严格超越此前极值。hi_idx > 0 保证确有"此前极值"可比，避免整段单边时
+    # hi_idx=0 的退化比较。
+    hi_recent = hi_idx > 0 and (last - hi_idx) <= _RECENT_PIVOT_MAX_LAG
+    lo_recent = lo_idx > 0 and (last - lo_idx) <= _RECENT_PIVOT_MAX_LAG
     # 前一个峰/谷（简化：取次高/次低）及动能
     prev_hi = max(win_hi[:hi_idx]) if hi_idx > 0 else price_hi
     prev_lo = min(win_lo[:lo_idx]) if lo_idx > 0 else price_lo
     mom_now = sum(seg)
-    # 顶背驰：价格创新高但动能萎缩
-    if price_hi >= prev_hi and mom_now < sum(seg[: max(1, hi_idx)]):
+    # 顶背驰：近期价格严格创新高但动能萎缩
+    if hi_recent and price_hi > prev_hi and mom_now < sum(seg[: max(1, hi_idx)]):
         return "top"
-    if price_lo <= prev_lo and mom_now > sum(seg[max(0, lo_idx):]):
+    if lo_recent and price_lo < prev_lo and mom_now > sum(seg[max(0, lo_idx):]):
         return "bottom"
     return "none"
 

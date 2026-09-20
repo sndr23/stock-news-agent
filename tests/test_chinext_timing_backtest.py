@@ -54,7 +54,10 @@ def test_backtest_uses_intraday_snapshot_for_decision(monkeypatch):
 
 
 def test_cli_backtest_disables_erp_filter(monkeypatch):
-    """CLI 回测必须与已切换的生产口径一致，传入 erp_cap=False。"""
+    """CLI 回测必须与生产口径一致：不启用 ERP（不加载 pe_map、erp_cap 关闭）。
+
+    FIX-20260918-01：ERP 滤波整体下线，CLI 不再加载估值源；v5.2 生产口径同为 ERP OFF。
+    """
     dates = pd.bdate_range(end=pd.Timestamp(datetime.now().date() - pd.Timedelta(days=1)),
                            periods=65)
     frame = pd.DataFrame({
@@ -77,7 +80,8 @@ def test_cli_backtest_disables_erp_filter(monkeypatch):
 
     rct.main()
 
-    assert seen["erp_cap"] is False
+    assert seen.get("erp_cap", False) is False  # 未启用 ERP 滤波
+    assert "pe_map" not in seen  # 不加载估值源（FIX-20260918-01）
 
 
 def test_backtest_excludes_current_partial_bar(monkeypatch):

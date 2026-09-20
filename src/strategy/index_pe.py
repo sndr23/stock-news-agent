@@ -69,8 +69,9 @@ def _cache_is_fresh(rows: Dict[str, float], max_lag_days: int = 3) -> bool:
 
 def pe_to_cheap_pctile(pe_series: Sequence[Optional[float]], span: int = 500) -> list:
     """滚动市盈率分期 → 便宜度分位 [0,1]。
-    用当前 PE 在**过去 span 窗口**的升序分位：PE 高 → 贵（分位高）；
-    返回便宜度 cheap = 1 - 分位（cheap 高=便宜→看多，低=贵→看空）。
+    用当前 PE 在**过去 span 窗口**的升序秩分位：p = count(v < cur) / len(w)，
+    窗口取排序后极值判边界：cur >= max → p=1，cur <= min → p=0；
+    返回便宜度 cheap = 1 - p（cheap 高=便宜→看多，低=贵→看空）。
     与 factor_value_erp 的 s=2*(p-0.5) 对齐：p=cheap 分位。"""
     out = [0.5] * len(pe_series)
     for i in range(1, len(pe_series)):
@@ -91,6 +92,9 @@ def pe_to_cheap_pctile(pe_series: Sequence[Optional[float]], span: int = 500) ->
             continue
         if not cur == cur or cur <= 0:  # 缺失值/非有效 PE 保持中性
             continue
+        # 排序后再取极值/做秩分位：w 是按原序切片的窗口，w[-1] 只是上一交易日的
+        # 值（月频缓存 ffill 的"昨日值"），并非窗口最大值（旧实现的根因 bug）。
+        w.sort()
         if cur >= w[-1]:
             out[i] = 1.0
         elif cur <= w[0]:

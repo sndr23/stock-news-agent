@@ -63,7 +63,6 @@ def _patch_all(monkeypatch, push_ok: bool = True):
     monkeypatch.setattr(rct.nl, "load_citic_pos_state", lambda: {})
     monkeypatch.setattr(rct.nl, "load_realtime_state", lambda: {})
     monkeypatch.setattr(rct.ovs, "load_overseas", lambda *a, **k: {})
-    monkeypatch.setattr(rct, "_load_erp_basis", lambda *a, **k: None)
 
     sent = []
     monkeypatch.setattr(
