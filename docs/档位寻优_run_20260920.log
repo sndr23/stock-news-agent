@@ -1,0 +1,95 @@
+Chinext timing tier research | objective=full-sample Calmar | fee=0
+fixed semantics: HYST_MARGIN=0.05, UPGRADE_CONFIRM_DAYS=2; grid=72
+2026-09-20 18:37:54,240 INFO 估值缓存命中 204 条
+data: 3000 bars 2014-05-23 -> 2026-09-18; WFV: train=3y/test=1y/folds=9
+running full-sample grid...
+  full 12/72
+  full 24/72
+  full 36/72
+  full 48/72
+  full 60/72
+  full 72/72
+running fixed-parameter WFV for all 72 candidates...
+  oos 8/72
+  oos 16/72
+  oos 24/72
+  oos 32/72
+  oos 40/72
+  oos 48/72
+  oos 56/72
+  oos 64/72
+  oos 72/72
+running subsample checks for 22 candidates...
+  subsample 8/22
+  subsample 16/22
+  subsample 22/22
+
+TOP10 full-sample Calmar ranking (fee=0)
+#  config                         total     CAGR      MDD  Calmar switches avg_pos OOSCalmar neighbor drift
+ 1 F0.45/N-0.25/S-0.40/ERPOFF      +224.0%   +10.3%   -48.9%   0.21      294    0.58      0.26 PASS@0.91     YES:OOS<.30
+ 2 F0.30/N-0.25/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 3 F0.30/N-0.15/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 4 F0.30/N-0.05/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 5 F0.35/N-0.25/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 6 F0.35/N-0.15/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 7 F0.35/N-0.05/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 8 F0.40/N-0.25/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+ 9 F0.40/N-0.15/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+10 F0.40/N-0.05/S-0.40/ERPON       +138.6%    +7.5%   -35.8%   0.21      142    0.44      0.25 PASS@0.87     YES:OOS<.30
+
+Return-drawdown Pareto frontier (full sample; total high, |MDD| low)
+config                         total     MDD  Calmar  ERP
+F0.30/N-0.25/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.30/N-0.15/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.30/N-0.05/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.35/N-0.25/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.35/N-0.15/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.35/N-0.05/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.40/N-0.25/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.40/N-0.15/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.40/N-0.05/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.45/N-0.25/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.45/N-0.15/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.45/N-0.05/S-0.40/ERPON       +138.6%   -35.8%   0.21  ON
+F0.45/N-0.05/S-0.40/ERPOFF      +188.7%   -47.2%   0.19  OFF
+F0.45/N-0.15/S-0.40/ERPOFF      +205.8%   -48.8%   0.20  OFF
+F0.45/N-0.25/S-0.40/ERPOFF      +224.0%   -48.9%   0.21  OFF
+
+Gate summary: eligible=12/72; global_best=F0.45/N-0.25/S-0.40/ERPOFF
+
+Global-best OOS detail: F0.45/N-0.25/S-0.40/ERPOFF
+OOS total=+117.1% CAGR=+9.0% MDD=-35.2% Calmar=0.26; fold direction vs production=OK OK OK OK OK OK OK OK OK
+OOS fold totals candidate: -3.2%, -8.4%, +25.9%, +38.5%, -7.6%, -7.3%, -14.0%, +15.0%, +65.7%
+OOS fold totals production: -2.9%, -5.8%, +21.7%, +27.6%, -8.1%, -0.4%, -7.8%, +12.0%, +45.3%
+
+Subsample stability: F0.45/N-0.25/S-0.40/ERPOFF
+2014-2020: total=+62.9% CAGR=+9.5% MDD=-48.9% Calmar=0.19
+2020-2026: total=+95.2% CAGR=+10.5% MDD=-35.2% Calmar=0.30
+subsample_gate=PASS
+Global-best neighbor check: PASS, neighbors=3, min_calmar_ratio=0.9112239737457929
+
+Recommended OOS detail: F0.30/N-0.25/S-0.30/ERPON
+OOS total=+95.3% CAGR=+7.7% MDD=-23.6% Calmar=0.33; fold direction vs production=OK OK OK OK OK OK OK OK OK
+OOS fold totals candidate: -2.9%, -5.8%, +21.7%, +27.6%, -8.1%, -0.4%, -7.8%, +12.0%, +45.3%
+OOS fold totals production: -2.9%, -5.8%, +21.7%, +27.6%, -8.1%, -0.4%, -7.8%, +12.0%, +45.3%
+
+Subsample stability: F0.30/N-0.25/S-0.30/ERPON
+2014-2020: total=+25.4% CAGR=+4.3% MDD=-40.3% Calmar=0.11
+2020-2026: total=+84.6% CAGR=+9.6% MDD=-23.6% Calmar=0.41
+subsample_gate=PASS
+Recommended neighbor check: PASS, neighbors=4, min_calmar_ratio=0.6847358498926961
+
+recommended vs production (in-sample and OOS)
+config                         IS total/CAGR/MDD/Calmar OOS total/CAGR/MDD/Calmar
+recommended                    +134.5%/+7.3%/-40.3%/0.18 +95.3%/+7.7%/-23.6%/0.33
+production                     +134.5%/+7.3%/-40.3%/0.18 +95.3%/+7.7%/-23.6%/0.33
+candidate: F0.30/N-0.25/S-0.30/ERPON
+production: F0.40/N-0.15/S-0.30/ERPON
+
+Production reference (same tiers, ERP switch):
+ERP ON   IS total=+134.5% MDD=-40.3% Calmar=0.18 OOS Calmar=0.33
+ERP OFF  IS total=+186.9% MDD=-52.3% Calmar=0.17 OOS Calmar=0.28
+
+Conclusion
+Gate-qualified candidate: F0.30/N-0.25/S-0.30/ERPON; all gates=PASS
+Recommendation: do not switch production TIERS; the qualified candidate does not improve both in-sample and OOS Calmar versus production.
