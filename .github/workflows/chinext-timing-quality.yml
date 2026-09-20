@@ -1,0 +1,72 @@
+# filepath: .github/workflows/chinext-timing-quality.yml
+name: 创业板择时质量周报
+
+# 每周日 10:00（北京时间，GitHub cron UTC 02:00）+ workflow_dispatch 手动触发。
+# 与每日 14:45 生产链路（chinext-timing.yml）完全独立：只读 Gist 状态文件
+# （chinext_timing_state.json），不推送仓位信号、不影响截单流程。
+#
+# 用途：对 run_chinext_timing.py（v5.2）历史仓位决策做质量评估
+# （IC/分层单调性/仓位决策审计/踏空躲跌归因/七层因子IC），
+# 产出 chinext_timing_quality_report.md。
+#
+# 注：GitHub cron 有 5-15 分钟调度延迟属正常，周日非交易时段运行，不影响生产。
+# 报告摘要通过 --push 推微信；无 --push 只打印+落盘。
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"   # 每周日北京时间 10:00（UTC 周日 02:00）
+  workflow_dispatch:
+
+concurrency:
+  group: chinext-timing-quality
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: 运行单元测试门禁（仅新测试文件）
+        id: unit_gate
+        continue-on-error: true
+        run: python -m pytest tests/test_chinext_timing_backtest.py -q --no-header -p no:cacheprovider
+
+      - name: 门禁失败告警
+        if: steps.unit_gate.outcome == 'failure'
+        run: |
+          echo "::warning::单元测试门禁失败,本轮任务仍继续执行,请尽快修复 tests/ 回归用例"
+
+      - name: 执行择时质量周报并推送摘要
+        run: python scripts/chinext_timing_backtest.py --push
+
+      - name: 上传报告与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinext-timing-quality-${{ github.run_id }}
+          path: |
+            logs/chinext_timing_quality_report.md
+            logs/
+          retention-days: 30
+          if-no-files-found: ignore
