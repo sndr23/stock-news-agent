@@ -1895,10 +1895,17 @@ def save_state(state: dict) -> None:
         # CI 下没有 Gist 配置 → 状态无处可存 → 下轮会重复推送，必须报错
         raise RuntimeError("CI 环境缺少 GIST_TOKEN/GIST_ID，状态无法持久化，禁止无状态运行")
 
-    # 滚动清理过期指纹（48h 窗口）
-    cutoff = (datetime.now(BJT) - timedelta(hours=STATE_WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    # 滚动清理过期指纹：已推条目保留 48h 供复盘/同事件拦截，未推条目只保留 24h，
+    # 避免大量普通未推记录长期占据 seen。pending/pushed_events 等仍统一使用 48h。
+    now = datetime.now(BJT)
+    cutoff = (now - timedelta(hours=STATE_WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    unpushed_cutoff = (now - timedelta(hours=STATE_WINDOW_HOURS_UNPUSHED)).strftime(
+        "%Y-%m-%d %H:%M:%S")
     seen = state.get("seen", {})
-    expired = [fp for fp, rec in seen.items() if rec.get("t", "") < cutoff]
+    expired = [
+        fp for fp, rec in seen.items()
+        if rec.get("t", "") < (cutoff if rec.get("pushed") else unpushed_cutoff)
+    ]
     for fp in expired:
         seen.pop(fp, None)
     if expired:
