@@ -2,7 +2,7 @@
 
 import importlib.util
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -100,3 +100,106 @@ def test_replay_d2_cxmt_mass_production_reports_are_the_same_event():
     )
 
     assert rtp._is_same_event(first, second)
+
+
+def _saturated_storage_state():
+    now = datetime.now(rtp.BJT)
+    pushed_events = [
+        {
+            "stocks": [],
+            "entities": [],
+            "events": [],
+            "numbers": [],
+            "sectors": ["存储"],
+            "scope": "sector",
+            "title_norm": f"存储题材既有报道{i}",
+            "dir": "bullish",
+            "t": (now - timedelta(hours=1, minutes=i)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for i in range(5)
+    ]
+    return {
+        "version": 2,
+        "seen": {},
+        "pending": {},
+        "pushed_events": pushed_events,
+        "candidate_events": [],
+        "watch_announce": [],
+        "backtest_events": [],
+    }
+
+
+def _run_replay_round(monkeypatch, state, news_items, judge):
+    empty_tool = type("T", (), {"func": staticmethod(lambda: [])})()
+    news_tool = type("T", (), {"func": staticmethod(lambda: list(news_items))})()
+    monkeypatch.setattr(rtp, "get_stock_news", news_tool)
+    monkeypatch.setattr(rtp, "get_market_signals", empty_tool)
+    monkeypatch.setattr(rtp, "get_announcements", empty_tool)
+    monkeypatch.setattr(rtp, "load_state", lambda: state)
+    monkeypatch.setattr(rtp, "save_state", lambda value: None)
+    monkeypatch.setattr(rtp, "dedup_news_3layer", lambda values: list(values))
+    monkeypatch.setattr(rtp, "push_source_health_alerts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rtp, "_load_leader_watchlist", lambda: set())
+    monkeypatch.setattr(rtp, "_load_factor_state",
+                        lambda: {"risk_state": "neutral", "snapshot": {}})
+    monkeypatch.setattr(rtp, "_prefilter", lambda news: (0.9, True))
+    monkeypatch.setattr(
+        rtp,
+        "_llm_judge",
+        lambda items, **kwargs: [dict(judge) for _ in items],
+    )
+    monkeypatch.setattr(rtp, "_send_alert_item", lambda *args, **kwargs: {"code": 200})
+    monkeypatch.setenv("PUSHPLUS_TOKEN", "test-token")
+    monkeypatch.setenv("WECOM_WEBHOOK", "")
+    monkeypatch.delenv("CI", raising=False)
+    return rtp.run_once(dry_run=False)
+
+
+def _hbm_news(title):
+    return {
+        "title": title,
+        "content": title,
+        "source": "金十数据",
+        "published_at": "2026-09-21 22:06:31",
+    }
+
+
+def _hbm_judge():
+    return {
+        "push": True,
+        "score": 8,
+        "direction": "bullish",
+        "scope": "sector",
+        "sectors": ["HBM", "存储"],
+        "entities": ["三星"],
+        "is_leader_stock": False,
+        "reason": "产能硬事实",
+    }
+
+
+def test_replay_hbm_capacity_fact_breaks_saturated_topic_once(monkeypatch):
+    state = _saturated_storage_state()
+    title = "消息称三星HBM4产能明年或翻倍"
+
+    _run_replay_round(monkeypatch, state, [_hbm_news(title)], _hbm_judge())
+
+    assert len(state["pushed_events"]) == 6
+    pushed = state["pushed_events"][-1]
+    assert pushed["title"] == title
+    assert pushed["topic_exemption"] is True
+
+
+def test_replay_hbm_same_capacity_chain_cannot_reuse_exemption(monkeypatch):
+    state = _saturated_storage_state()
+    first = _hbm_news("消息称三星HBM4产能明年或翻倍")
+    second = _hbm_news("三星存储业务产能预计未来扩张")
+
+    # LLM 本轮未抽出实体时仍应按“存储 + 产能扩张”事件链只豁免一次，
+    # 同时避免现有同实体标题合并规则把两条回放样本提前合并。
+    judge = {**_hbm_judge(), "entities": []}
+    _run_replay_round(monkeypatch, state, [first, second], judge)
+
+    assert len(state["pushed_events"]) == 6
+    assert state["pushed_events"][-1]["title"] == first["title"]
+    second_fp = rtp._news_fingerprint(second)
+    assert "同题材已饱和" in state["seen"][second_fp]["title"]
