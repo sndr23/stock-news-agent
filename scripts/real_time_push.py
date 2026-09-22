@@ -1075,6 +1075,65 @@ _MARKET_THEME_PATTERNS = [
 ]
 MARKET_TOPIC_PUSH_LIMIT = _env_int("RT_MARKET_TOPIC_LIMIT", 3)
 
+# 题材饱和时允许有限突破的高置信硬事件词表（2026-09-22 Q-03）。
+# 完整范围：量产/投产/复产；涨价/提价/降价；扩产/扩建/产能扩张/新增产能/
+# 产能翻倍/产能提升/产能释放；回购完成/完成回购/回购注销/注销回购股份；
+# 立案/立案调查/行政处罚/监管处罚；退市/终止上市；罢工/停产/停工；
+# 收购完成/完成收购/并购完成/重组完成；重大中标/中标/重大合同/签约。
+# “产能+翻倍/倍增/增长/提升/扩张/释放”等组合也视为产能硬事实，覆盖
+# “产能明年或翻倍”这类跨源插入预测词的标题，但不把单独“产能”当豁免依据。
+_HARD_EVENT_NOVELTY_GROUPS = (
+    ("mass_production", ("量产", "投产", "复产")),
+    ("price_change", ("涨价", "提价", "降价")),
+    ("capacity_expansion", ("扩产", "扩建", "产能扩张", "新增产能",
+                             "产能翻倍", "产能提升", "产能释放")),
+    ("buyback_completion", ("回购完成", "完成回购", "回购注销", "注销回购股份")),
+    ("regulatory_action", ("立案", "立案调查", "行政处罚", "监管处罚")),
+    ("delisting", ("退市", "终止上市")),
+    ("labor_or_shutdown", ("罢工", "停产", "停工")),
+    ("deal_completion", ("收购完成", "完成收购", "并购完成", "重组完成",
+                          "重大中标", "中标", "重大合同", "签约")),
+)
+_CAPACITY_COMPOUND_MARKERS = ("翻倍", "倍增", "增长", "提升", "扩张", "释放", "扩产")
+
+
+def _hard_event_novelty_facts(news: dict) -> set:
+    """返回标题/正文中的硬事件事实族，避免单独宽泛主题词触发豁免。"""
+    text = f"{news.get('title', '')} {news.get('content', '')}"
+    facts = {name for name, words in _HARD_EVENT_NOVELTY_GROUPS
+             if any(word in text for word in words)}
+    if "产能" in text and any(word in text for word in _CAPACITY_COMPOUND_MARKERS):
+        facts.add("capacity_expansion")
+    if "回购" in text and any(word in text for word in ("完成", "完毕", "注销", "实施")):
+        facts.add("buyback_completion")
+    return facts
+
+
+def _hard_event_chain_key(sig: dict, news: dict) -> str:
+    """生成一次性豁免的事件链键；弱包装标题不会因历史存在自动消耗豁免。"""
+    facts = _hard_event_novelty_facts(news)
+    if not facts:
+        return ""
+    entities = sorted({_normalize_entity(e) for e in (
+        _as_list(sig.get("stocks")) + _as_list(sig.get("entities"))) if e})
+    sectors = sorted({str(s).strip() for s in _as_list(sig.get("sectors")) if str(s).strip()})
+    return "facts=" + ",".join(sorted(facts)) + "|entities=" + ",".join(entities) + \
+        "|sectors=" + ",".join(sectors)
+
+
+def _hard_event_topic_exemption_available(news: dict, judge: dict,
+                                          sig: dict, pushed_events: list) -> bool:
+    """题材已饱和时，强方向硬事件是否还能获得一次链路豁免。"""
+    if judge.get("direction") not in ("bullish", "bearish"):
+        return False
+    chain = _hard_event_chain_key(sig, news)
+    if not chain:
+        return False
+    return not any(
+        pe.get("topic_exemption") and pe.get("topic_exemption_chain") == chain
+        for pe in pushed_events
+    )
+
 
 def _market_theme_keys(text: str) -> set:
     """标题命中的 market 主题键集合（market 级同主题饱和计数槽位）"""
@@ -3603,6 +3662,8 @@ def run_once(dry_run: bool = False) -> dict:
     daily_push_limit = _env_int("RT_MAX_PUSH_PER_DAY", 0)
     _cand_seen = set()  # P7-1：本轮已记录的候选 (日期,事件签名)，防同轮重复落 candidate_events
     for n, j in reps:
+        hard_event_exemption = False
+        hard_event_chain = ""
         # watchlist 公告直通（2026-09-07 P1）：白名单公告已跳过预筛竞争，
         # 此处继续跳过强档方向/噪声/阈值/风险降级/题材饱和/日限额等闸门直接
         # 推送（LLM 判定仍必须完成——judged=False 照常挂起；48h 同事件拦截
@@ -3702,11 +3763,17 @@ def run_once(dry_run: bool = False) -> dict:
         # （默认 5 条）后不再推——存储行情日 17 推实证；market 级（宏观数据/大盘）
         # 豁免，CPI 等宏观数据永不受限。
         if not watch_direct and _topic_saturated(n["_sig"], pushed_events):
-            logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
-            seen[n["_fp"]] = {"t": now, "pushed": False,
-                              "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
-            skipped += 1
-            continue
+            hard_event_chain = _hard_event_chain_key(n["_sig"], n)
+            if _hard_event_topic_exemption_available(
+                    n, j, n["_sig"], pushed_events):
+                hard_event_exemption = True
+                logger.info(f"同题材已饱和，但硬事件新颖度豁免一次: {n.get('title', '')[:50]}")
+            else:
+                logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
+                seen[n["_fp"]] = {"t": now, "pushed": False,
+                                  "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
+                skipped += 1
+                continue
 
         # 全局日推送上限（2026-09-07 P0 审计 3.2）：计数源=pushed_events 当日条数。
         # 触顶后非高信号条目一律不推（保护 pushplus 200条/天限额与用户收件箱）；
@@ -3744,9 +3811,13 @@ def run_once(dry_run: bool = False) -> dict:
             # 2026-09-01：补存原文 title（_sig 只有去标点 title_norm，可读性差），
             # 供盘后复盘列表统一以 pushed_events 为唯一数据源时直接展示。
             # 2026-09-04 P1-3：补存 source，供每源推送贡献率审计。
-            pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
-                                  "title": str(n.get("title", ""))[:60],
-                                  "source": str(n.get("source", "") or "")[:30]})
+            event_record = {**n["_sig"], "dir": j.get("direction"), "t": now,
+                            "title": str(n.get("title", ""))[:60],
+                            "source": str(n.get("source", "") or "")[:30]}
+            if hard_event_exemption:
+                event_record.update({"topic_exemption": True,
+                                     "topic_exemption_chain": hard_event_chain})
+            pushed_events.append(event_record)
             pushed += 1
         else:
             # 推送标题直接用新闻原文标题（避免显示"重要资讯"占位符）
@@ -3760,9 +3831,13 @@ def run_once(dry_run: bool = False) -> dict:
                     # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
                     state.setdefault("watch_announce", []).append(
                         {"key": n.get("_watch_announce_key", ""), "t": now})
-                pushed_events.append({**n["_sig"], "dir": j.get("direction"), "t": now,
-                                      "title": str(n.get("title", ""))[:60],
-                                      "source": str(n.get("source", "") or "")[:30]})
+                event_record = {**n["_sig"], "dir": j.get("direction"), "t": now,
+                                "title": str(n.get("title", ""))[:60],
+                                "source": str(n.get("source", "") or "")[:30]}
+                if hard_event_exemption:
+                    event_record.update({"topic_exemption": True,
+                                         "topic_exemption_chain": hard_event_chain})
+                pushed_events.append(event_record)
                 pushed += 1
             else:
                 # 推送失败：挂起 pending 下轮重试（2026-09-07 P0 审计修复——
