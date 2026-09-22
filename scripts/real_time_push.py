@@ -562,8 +562,29 @@ _ENTITY_ALIAS = {
     "Google": "谷歌", "Alphabet": "谷歌", "Microsoft": "微软",
     "Amazon": "亚马逊", "欧洲央行": "欧央行", "ECB": "欧央行",
     "日央行": "日本央行", "BOJ": "日本央行", "Fed": "美联储",
+    # 2026-09-22 Q-01：长鑫科技/长鑫存储/CXMT 是同一公司，跨源 LLM 实体抽取会漂移。
+    "长鑫存储": "长鑫科技", "CXMT": "长鑫科技",
     "上海市": "上海", "北京市": "北京",
 }
+
+
+# 跨源同事件的高置信核心事实锚点。只收语义明确的事实完成态/状态变化，
+# 不把“扩产/产能/看好”等宽泛主题词单独当作同事件依据。
+_CORE_FACT_GROUPS = (
+    ("security_warning", ("安全警示", "安全警报", "安全警告", "安全提醒")),
+    ("mass_production", ("正式量产", "实现量产", "投入量产", "量产")),
+    ("capacity_expansion", ("产能扩张", "扩充产能", "新增产能", "产能翻倍", "扩产")),
+    ("buyback_completion", ("回购完成", "完成回购", "回购注销", "注销回购股份")),
+    ("regulatory_filing", ("立案调查", "被立案", "立案")),
+    ("delisting", ("退市", "终止上市")),
+    ("strike", ("罢工", "大罢工")),
+    ("shutdown", ("停产", "停工")),
+)
+
+_TITLE_NUMERIC_ANCHOR_RE = re.compile(
+    r"第[一二三四五六七八九十百]+代|[A-Za-z]{2,12}\d+[A-Za-z0-9]*|"
+    r"\d+(?:\.\d+)?(?:亿|万|%|倍|GB|TB|nm|纳米|百分点|年|月|日|G)"
+)
 
 
 def _normalize_entity(e: str) -> str:
@@ -574,6 +595,18 @@ def _normalize_entity(e: str) -> str:
     # 剥离末尾股票代码后缀 "(TSM.N)" / "(AAPL.O)" / "(00700.HK)"
     e = re.sub(r"[（(][A-Za-z0-9.\-]+[)）]$", "", e).strip()
     return _ENTITY_ALIAS.get(e, e)
+
+
+def _core_fact_anchors(text: str) -> set:
+    """提取标题中的高置信核心事实类别。"""
+    text = str(text or "")
+    return {name for name, words in _CORE_FACT_GROUPS
+            if any(word in text for word in words)}
+
+
+def _title_numeric_anchors(text: str) -> set:
+    """提取代际、产品型号和带单位数字，作为跨源数字事实锚点。"""
+    return set(_TITLE_NUMERIC_ANCHOR_RE.findall(str(text or "")))
 
 
 def _sectors_overlap(sec_a, sec_b) -> set:
@@ -1279,6 +1312,26 @@ def _same_event_ctx(sig_a: dict, sig_b: dict) -> _SameEventCtx:
     )
 
 
+def _same_event_core_facts(ctx: _SameEventCtx) -> bool:
+    """核心事实/别名/数字锚点兜底，识别包装标题与原始报道的同事件关系。
+
+    只有共享高置信事实且具备实体或数字锚点才合并；双方都给出数字事实时，
+    数字不一致直接终止，避免同公司不同代际/不同金额的事件被误合并。
+    """
+    if _title_direction_conflict(ctx.ta, ctx.tb):
+        return False
+    if not (_core_fact_anchors(ctx.ta) & _core_fact_anchors(ctx.tb)):
+        return False
+    if ctx.num_a and ctx.num_b and not (ctx.num_a & ctx.num_b):
+        return False
+    title_num_a = _title_numeric_anchors(ctx.ta)
+    title_num_b = _title_numeric_anchors(ctx.tb)
+    if title_num_a and title_num_b and not (title_num_a & title_num_b):
+        return False
+    return bool(ctx.ent_overlap or (ctx.num_a & ctx.num_b)
+                or (title_num_a & title_num_b))
+
+
 def _same_event_shared_group(ctx: _SameEventCtx) -> bool:
     """规则1-3：双方共享事件组（shared_ev≠∅）时的合并判定
 
@@ -1369,6 +1422,8 @@ def _is_same_event(sig_a: dict, sig_b: dict) -> bool:
     （板块行情/宏观数据/央行政策/实体锚定等增量规则见各规则函数内注释）
     """
     ctx = _same_event_ctx(sig_a, sig_b)
+    if _same_event_core_facts(ctx):
+        return True
     if ctx.shared_ev:
         return _same_event_shared_group(ctx)
     if not ctx.ev_a and not ctx.ev_b:

@@ -55,3 +55,48 @@ def test_save_state_uses_shorter_window_only_for_unpushed_seen(monkeypatch, tmp_
 
     saved = json.loads(state_path.read_text(encoding="utf-8"))
     assert set(saved["seen"]) == {"unpushed-fresh", "pushed-fresh"}
+
+
+def _snapshot_sig(title, *, entities=(), sectors=(), numbers=(), scope="sector"):
+    return {
+        "stocks": [],
+        "entities": list(entities),
+        "events": [],
+        "numbers": list(numbers),
+        "sectors": list(sectors),
+        "scope": scope,
+        "title_norm": title,
+    }
+
+
+def test_replay_d1_security_alert_reports_are_the_same_event():
+    first = _snapshot_sig(
+        "美驻中东多国使馆发布安全警示",
+        entities=["美国"],
+        sectors=["军工", "原油", "黄金"],
+        scope="market",
+    )
+    second = _snapshot_sig(
+        "军事冲突或迅速升级美国针对中东地区发布新的安全警报",
+        entities=["也门胡塞武装", "沙特阿拉伯", "美国"],
+        sectors=["大盘"],
+        scope="market",
+    )
+
+    assert rtp._is_same_event(first, second)
+
+
+def test_replay_d2_cxmt_mass_production_reports_are_the_same_event():
+    first = _snapshot_sig(
+        "长鑫科技宣布第五代技术平台正式量产",
+        entities=["长鑫科技"],
+        sectors=["半导体", "存储芯片"],
+    )
+    second = _snapshot_sig(
+        "冲击七连红长鑫第五代DRAM平台正式量产科创芯片设计ETF国联安588780跟踪指数涨超1%",
+        entities=["长鑫存储"],
+        numbers=["万:849.2"],
+        sectors=["半导体", "存储"],
+    )
+
+    assert rtp._is_same_event(first, second)
