@@ -166,6 +166,13 @@ BACKTEST_EVENTS_MAX = 2000
 # 候选溢出挂起重试上限（2026-08-06 新增）：同一指纹连续 N 轮溢出后放弃（写 seen），
 # 防止突发行情持续超限时 pending 无限累积 / 无限重试消耗 LLM 额度
 MAX_PENDING_RETRY = 3
+# 高信号条目单独保留更长但有限的重试窗口；超过后同样落 seen，防止占满 pending。
+MAX_PENDING_RETRY_HIGH_SIGNAL = 10
+
+
+def _pending_retry_limit(item: dict) -> int:
+    """返回候选溢出条目的有限重试上限。"""
+    return MAX_PENDING_RETRY_HIGH_SIGNAL if item.get("_hit_signal") else MAX_PENDING_RETRY
 
 # pending 序列化字节上限（2026-09-04 P1-1 新增）：挂起条目带全量 payload 后
 # 体积上升，200 条 × ~700B ≈ 140KB，叠加 seen(700KB)+pushed/candidate(210KB)
@@ -3543,8 +3550,9 @@ def run_once(dry_run: bool = False) -> dict:
     # 科技/板块/来源偏好，极端行情下"立案调查/降准"等高信号核心事件可能被
     # 低分科技噪声挤出第 41 位。现改为两级排序：命中高信号词（核心事件）恒优先，
     # 普通候选再按预筛分排序，保证核心事件在溢出时不被挤占。
-    # 放弃策略同步收紧：仅普通条目连续 MAX_PENDING_RETRY 轮溢出后放弃（写 seen 防无限重试）；
-    # 高信号条目永不放弃（持续挂起 pending，行情回落后自动进入判定）——核心事件不许漏推。
+    # 放弃策略同步收紧：普通条目连续 MAX_PENDING_RETRY 轮、高信号条目连续
+    # MAX_PENDING_RETRY_HIGH_SIGNAL 轮溢出后均写 seen，既保留核心事件重试窗口，
+    # 又防止高信号条目永久占满 pending。
     max_candidates = _env_int("RT_MAX_CANDIDATES", MAX_CANDIDATES_PER_ROUND)
     overflow = []
     if len(candidates) > max_candidates:
@@ -3559,9 +3567,8 @@ def run_once(dry_run: bool = False) -> dict:
         now_for_pend = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
         for n in overflow:
             retry = int(n.get("_pend_retry", 0)) + 1
-            if retry >= MAX_PENDING_RETRY and not n.get("_hit_signal"):
-                # 连续多轮溢出：放弃普通条目，记 seen 防无限重试
-                # （高信号核心事件不放弃——漏推立案调查/降准等比多一轮重试代价大得多）
+            if retry >= _pending_retry_limit(n):
+                # 连续多轮溢出：写 seen 防无限重试；高信号使用更长的独立上限。
                 seen[n["_fp"]] = {"t": now_for_pend, "pushed": False,
                                   "title": str(n.get("title", ""))[:60] + "[溢出放弃]"}
                 logger.info(f"候选溢出重试{retry}轮仍无法进入判定，放弃: {n.get('title', '')[:40]}")

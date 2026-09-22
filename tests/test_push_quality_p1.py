@@ -203,3 +203,44 @@ def test_replay_hbm_same_capacity_chain_cannot_reuse_exemption(monkeypatch):
     assert state["pushed_events"][-1]["title"] == first["title"]
     second_fp = rtp._news_fingerprint(second)
     assert "同题材已饱和" in state["seen"][second_fp]["title"]
+
+
+def test_high_signal_overflow_has_separate_retry_cap(monkeypatch):
+    target = {
+        "title": "主体40重大立案调查",
+        "content": "重大立案调查",
+        "source": "财联社",
+        "published_at": "2026-09-22 10:00:00",
+    }
+    fillers = [
+        {
+            "title": f"主体{i}重大立案调查",
+            "content": "重大立案调查",
+            "source": "财联社",
+            "published_at": "2026-09-22 10:00:00",
+        }
+        for i in range(40)
+    ]
+    target_fp = rtp._news_fingerprint(target)
+    state = {
+        "version": 2,
+        "seen": {},
+        "pending": {
+            target_fp: {
+                "t": "2026-09-22 09:00:00",
+                "retry": 9,
+                "title": target["title"],
+                "payload": dict(target),
+            }
+        },
+        "pushed_events": [],
+        "candidate_events": [],
+        "watch_announce": [],
+        "backtest_events": [],
+    }
+
+    _run_replay_round(monkeypatch, state, fillers + [target], _hbm_judge())
+
+    assert rtp.MAX_PENDING_RETRY_HIGH_SIGNAL == 10
+    assert target_fp not in state["pending"]
+    assert "溢出放弃" in state["seen"][target_fp]["title"]
