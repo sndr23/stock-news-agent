@@ -2042,8 +2042,21 @@ def save_state(state: dict) -> None:
                        "优先淘汰未推条目后按时间保留最新（条数/字节双上限）")
     state["seen"] = seen
 
-    # 滚动清理过期挂起重试（48h 窗口）+ 上限 200 条防爆胀
+    # 滚动清理过期挂起重试（48h 窗口）+ 上限 200 条防爆胀 + 重试上限兜底
     pending = state.get("pending", {})
+    dropped_retry = 0
+    seen = state.get("seen", {})
+    for fp, rec in list(pending.items()):
+        retry = int(rec.get("retry", 0))
+        limit = _pending_retry_limit(rec)
+        if retry >= limit:
+            old = seen.get(fp)
+            if not (old and old.get("pushed")):
+                seen[fp] = {"t": rec.get("t", datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")),
+                            "pushed": False,
+                            "title": str(rec.get("title", ""))[:60] + "[溢出放弃]"}
+            pending.pop(fp, None)
+            dropped_retry += 1
     pend_expired = [fp for fp, rec in pending.items() if rec.get("t", "") < cutoff]
     for fp in pend_expired:
         pending.pop(fp, None)
@@ -2053,8 +2066,8 @@ def save_state(state: dict) -> None:
     if _est_pending_bytes(pending) > PENDING_MAX_BYTES:
         pending = dict(sorted(pending.items(), key=lambda kv: kv[1].get("t", ""))[-150:])
     state["pending"] = pending
-    if pend_expired or len(pending) != len(state.get("pending", {})):
-        logger.info(f"清理过期挂起重试 {len(pend_expired)} 条，剩余 {len(pending)} 条")
+    if pend_expired or dropped_retry or len(pending) != len(state.get("pending", {})):
+        logger.info(f"清理过期挂起重试 {len(pend_expired)} 条 + 重试上限放弃 {dropped_retry} 条，剩余 {len(pending)} 条")
 
     # 滚动清理过期已推事件签名（48h 窗口）+ 上限 300 条防爆胀
     pe_all = state.get("pushed_events") or []
