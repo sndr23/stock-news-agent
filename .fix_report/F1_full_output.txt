@@ -1,0 +1,547 @@
+$ python scripts/nested_selection_eval.py
+[start] 2026-09-24 02:54:33    
+Chinext timing third round | nested walk-forward selection | fee=0
+fixed state: HYST_MARGIN=0.05, UPGRADE_CONFIRM_DAYS=2; cash interest=2.00%/year, daily=0.000081967213
+penalty objective: inner compound return / abs(inner MDD); selection columns are no-interest, cash columns are display-only
+candidate grids: A=72; B1=3; B2=12
+2026-09-24 02:54:35,540 INFO 估值缓存命中 204 条
+data: 3000 bars 2014-05-23 -> 2026-09-18; outer=3y train/1y test/9 folds; baseline window=3000 bars end<=2026-09-18
+outer rule: selected candidate is applied to each test fold; the previous fold's actual {position,pending} is inherited
+
+Replay correctness validation against backtest_metrics
+  v5.2 full window: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  v5.1 full window: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  v5.2 outer fold 1: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  B1 -0.50 outer fold 5: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  B2 H0.08/C3 outer fold 9: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  replay correctness checks: PASS (all differences < 1e-9)
+
+Fixed baselines: replaying v5.2, v5.1, and buy-and-hold
+  fixed v5.2: outer folds 0/9
+    fixed v5.2: outer fold 1/9
+    fixed v5.2: outer fold 2/9
+    fixed v5.2: outer fold 3/9
+    fixed v5.2: outer fold 4/9
+    fixed v5.2: outer fold 5/9
+    fixed v5.2: outer fold 6/9
+    fixed v5.2: outer fold 7/9
+    fixed v5.2: outer fold 8/9
+    fixed v5.2: outer fold 9/9
+  fixed v5.2: OOS no-interest=+123.1% MDD=-32.3%; with-interest=+142.5% MDD=-29.8%
+  fixed v5.1: outer folds 0/9
+    fixed v5.1: outer fold 1/9
+    fixed v5.1: outer fold 2/9
+    fixed v5.1: outer fold 3/9
+    fixed v5.1: outer fold 4/9
+    fixed v5.1: outer fold 5/9
+    fixed v5.1: outer fold 6/9
+    fixed v5.1: outer fold 7/9
+    fixed v5.1: outer fold 8/9
+    fixed v5.1: outer fold 9/9
+  fixed v5.1: OOS no-interest=+96.5% MDD=-31.0%; with-interest=+116.1% MDD=-28.3%
+  buy-and-hold: OOS=+119.2% MDD=-57.0% (interest identical because position=100%)
+
+Required baseline cross-checks (rounded reference values)
+  fixed v5.2: observed=+123.1%/-32.3% expected=+123.1%/-32.3% diff=0.00042982/0.00044968
+  fixed v5.1: observed=+96.5%/-31.0% expected=+96.5%/-31.0% diff=0.00002033/0.00001848
+  buy-and-hold: observed=+119.2%/-57.0% expected=+119.2%/-57.0% diff=0.00042195/0.00045988
+  baseline rounded-value checks: PASS
+
+[A] nested selection: candidates=72, outer=9, inner=3, selection uses no-interest inner OOS only
+  outer 1/9: train=2014-05-23..2017-05-23 test=2017-05-23..2018-05-23
+    inner 1/3: train=2014-05-23..2015-02-17 validate=2015-02-17..2015-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2014-05-23..2015-11-20 validate=2015-11-20..2016-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2014-05-23..2016-08-17 validate=2016-08-17..2017-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 1/9)
+    inner candidates 24/72 (outer 1/9)
+    inner candidates 36/72 (outer 1/9)
+    inner candidates 48/72 (outer 1/9)
+    inner candidates 60/72 (outer 1/9)
+    inner candidates 72/72 (outer 1/9)
+    selected inner return max: F0.30/N-0.05/S-0.40/ERPOFF score=+0.286880
+    selected inner Calmar max: F0.45/N-0.15/S-0.20/ERPOFF score=+0.344685
+    selected inner return/|MDD| max: F0.45/N-0.15/S-0.20/ERPOFF score=+0.833356
+  outer 2/9: train=2015-05-22..2018-05-23 test=2018-05-23..2019-05-24
+    inner 1/3: train=2015-05-22..2016-02-23 validate=2016-02-23..2016-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2015-05-22..2016-11-21 validate=2016-11-21..2017-08-18 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2015-05-22..2017-08-18 validate=2017-08-18..2018-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 2/9)
+    inner candidates 24/72 (outer 2/9)
+    inner candidates 36/72 (outer 2/9)
+    inner candidates 48/72 (outer 2/9)
+    inner candidates 60/72 (outer 2/9)
+    inner candidates 72/72 (outer 2/9)
+    selected inner return max: F0.35/N-0.05/S-0.40/ERPOFF score=-0.231160
+    selected inner Calmar max: F0.35/N-0.25/S-0.40/ERPOFF score=-0.421808
+    selected inner return/|MDD| max: F0.35/N-0.25/S-0.40/ERPOFF score=-0.881683
+  outer 3/9: train=2016-05-20..2019-05-24 test=2019-05-24..2020-05-26
+    inner 1/3: train=2016-05-20..2017-02-22 validate=2017-02-22..2017-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2016-05-20..2017-11-20 validate=2017-11-20..2018-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2016-05-20..2018-08-17 validate=2018-08-17..2019-05-24 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 3/9)
+    inner candidates 24/72 (outer 3/9)
+    inner candidates 36/72 (outer 3/9)
+    inner candidates 48/72 (outer 3/9)
+    inner candidates 60/72 (outer 3/9)
+    inner candidates 72/72 (outer 3/9)
+    selected inner return max: F0.35/N-0.05/S-0.30/ERPON score=-0.118905
+    selected inner Calmar max: F0.35/N-0.05/S-0.40/ERPON score=-0.223636
+    selected inner return/|MDD| max: F0.35/N-0.05/S-0.40/ERPON score=-0.485996
+  outer 4/9: train=2017-05-23..2020-05-26 test=2020-05-26..2021-05-27
+    inner 1/3: train=2017-05-23..2018-02-14 validate=2018-02-14..2018-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2017-05-23..2018-11-20 validate=2018-11-20..2019-08-20 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2017-05-23..2019-08-20 validate=2019-08-20..2020-05-26 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 4/9)
+    inner candidates 24/72 (outer 4/9)
+    inner candidates 36/72 (outer 4/9)
+    inner candidates 48/72 (outer 4/9)
+    inner candidates 60/72 (outer 4/9)
+    inner candidates 72/72 (outer 4/9)
+    selected inner return max: F0.45/N-0.25/S-0.40/ERPOFF score=+0.187352
+    selected inner Calmar max: F0.35/N-0.05/S-0.40/ERPON score=+0.373542
+    selected inner return/|MDD| max: F0.35/N-0.05/S-0.40/ERPON score=+0.879939
+  outer 5/9: train=2018-05-23..2021-05-27 test=2021-05-27..2022-05-31
+    inner 1/3: train=2018-05-23..2019-02-22 validate=2019-02-22..2019-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2018-05-23..2019-11-21 validate=2019-11-21..2020-08-21 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2018-05-23..2020-08-21 validate=2020-08-21..2021-05-27 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 5/9)
+    inner candidates 24/72 (outer 5/9)
+    inner candidates 36/72 (outer 5/9)
+    inner candidates 48/72 (outer 5/9)
+    inner candidates 60/72 (outer 5/9)
+    inner candidates 72/72 (outer 5/9)
+    selected inner return max: F0.30/N-0.25/S-0.30/ERPOFF score=+0.786536
+    selected inner Calmar max: F0.35/N-0.25/S-0.30/ERPON score=+2.013793
+    selected inner return/|MDD| max: F0.35/N-0.25/S-0.30/ERPON score=+5.277473
+  outer 6/9: train=2019-05-24..2022-05-31 test=2022-05-31..2023-05-31
+    inner 1/3: train=2019-05-24..2020-02-25 validate=2020-02-25..2020-11-24 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2019-05-24..2020-11-24 validate=2020-11-24..2021-08-23 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2019-05-24..2021-08-23 validate=2021-08-23..2022-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 6/9)
+    inner candidates 24/72 (outer 6/9)
+    inner candidates 36/72 (outer 6/9)
+    inner candidates 48/72 (outer 6/9)
+    inner candidates 60/72 (outer 6/9)
+    inner candidates 72/72 (outer 6/9)
+    selected inner return max: F0.35/N-0.15/S-0.40/ERPON score=+0.154610
+    selected inner Calmar max: F0.35/N-0.05/S-0.40/ERPON score=+0.417620
+    selected inner return/|MDD| max: F0.35/N-0.05/S-0.40/ERPON score=+0.977911
+  outer 7/9: train=2020-05-26..2023-05-31 test=2023-05-31..2024-06-04
+    inner 1/3: train=2020-05-26..2021-02-25 validate=2021-02-25..2021-11-25 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2020-05-26..2021-11-25 validate=2021-11-25..2022-08-25 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2020-05-26..2022-08-25 validate=2022-08-25..2023-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 7/9)
+    inner candidates 24/72 (outer 7/9)
+    inner candidates 36/72 (outer 7/9)
+    inner candidates 48/72 (outer 7/9)
+    inner candidates 60/72 (outer 7/9)
+    inner candidates 72/72 (outer 7/9)
+    selected inner return max: F0.35/N-0.15/S-0.20/ERPOFF score=-0.007564
+    selected inner Calmar max: F0.35/N-0.15/S-0.20/ERPOFF score=-0.018851
+    selected inner return/|MDD| max: F0.35/N-0.15/S-0.20/ERPOFF score=-0.042326
+  outer 8/9: train=2021-05-27..2024-06-04 test=2024-06-04..2025-06-09
+    inner 1/3: train=2021-05-27..2022-02-28 validate=2022-02-28..2022-11-28 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2021-05-27..2022-11-28 validate=2022-11-28..2023-08-28 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2021-05-27..2023-08-28 validate=2023-08-28..2024-06-04 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 8/9)
+    inner candidates 24/72 (outer 8/9)
+    inner candidates 36/72 (outer 8/9)
+    inner candidates 48/72 (outer 8/9)
+    inner candidates 60/72 (outer 8/9)
+    inner candidates 72/72 (outer 8/9)
+    selected inner return max: F0.30/N-0.25/S-0.20/ERPOFF score=-0.088950
+    selected inner Calmar max: F0.30/N-0.25/S-0.20/ERPOFF score=-0.198480
+    selected inner return/|MDD| max: F0.30/N-0.25/S-0.20/ERPOFF score=-0.435299
+  outer 9/9: train=2022-05-31..2025-06-09 test=2025-06-09..2026-06-10
+    inner 1/3: train=2022-05-31..2023-03-01 validate=2023-03-01..2023-11-29 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2022-05-31..2023-11-29 validate=2023-11-29..2024-08-29 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2022-05-31..2024-08-29 validate=2024-08-29..2025-06-09 (validate_end<=outer_train_end: True)
+    inner candidates 12/72 (outer 9/9)
+    inner candidates 24/72 (outer 9/9)
+    inner candidates 36/72 (outer 9/9)
+    inner candidates 48/72 (outer 9/9)
+    inner candidates 60/72 (outer 9/9)
+    inner candidates 72/72 (outer 9/9)
+    selected inner return max: F0.30/N-0.25/S-0.20/ERPOFF score=+0.081252
+    selected inner Calmar max: F0.30/N-0.25/S-0.20/ERPOFF score=+0.225593
+    selected inner return/|MDD| max: F0.30/N-0.25/S-0.20/ERPOFF score=+0.518825
+  [A] outer evaluation: inner return max
+    outer 1/9: F0.30/N-0.05/S-0.40/ERPOFF     return=-3.6% MDD=-10.5% state=100.0%
+    outer 2/9: F0.35/N-0.05/S-0.40/ERPOFF     return=-7.2% MDD=-16.8% state=0.0%
+    outer 3/9: F0.35/N-0.05/S-0.30/ERPON      return=+21.3% MDD=-11.2% state=60.0%
+    outer 4/9: F0.45/N-0.25/S-0.40/ERPOFF     return=+39.3% MDD=-15.5% state=90.0%
+    outer 5/9: F0.30/N-0.25/S-0.30/ERPOFF     return=-10.5% MDD=-18.3% state=0.0%
+    outer 6/9: F0.35/N-0.15/S-0.40/ERPON      return=-8.6% MDD=-19.3% state=0.0%
+    outer 7/9: F0.35/N-0.15/S-0.20/ERPOFF     return=-11.1% MDD=-11.3% state=0.0%
+    outer 8/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+25.0% MDD=-15.7% state=60.0%
+    outer 9/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+56.5% MDD=-10.7% state=90.0%
+  [A] outer evaluation: inner Calmar max
+    outer 1/9: F0.45/N-0.15/S-0.20/ERPOFF     return=-11.0% MDD=-16.5% state=90.0%
+    outer 2/9: F0.35/N-0.25/S-0.40/ERPOFF     return=-8.6% MDD=-18.4% state=0.0%
+    outer 3/9: F0.35/N-0.05/S-0.40/ERPON      return=+20.3% MDD=-13.6% state=60.0%
+    outer 4/9: F0.35/N-0.05/S-0.40/ERPON      return=+30.2% MDD=-11.3% state=90.0%
+    outer 5/9: F0.35/N-0.25/S-0.30/ERPON      return=-9.7% MDD=-18.0% state=0.0%
+    outer 6/9: F0.35/N-0.05/S-0.40/ERPON      return=-9.4% MDD=-19.7% state=0.0%
+    outer 7/9: F0.35/N-0.15/S-0.20/ERPOFF     return=-11.1% MDD=-11.3% state=0.0%
+    outer 8/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+25.0% MDD=-15.7% state=60.0%
+    outer 9/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+56.5% MDD=-10.7% state=90.0%
+  [A] outer evaluation: inner return/|MDD| max
+    outer 1/9: F0.45/N-0.15/S-0.20/ERPOFF     return=-11.0% MDD=-16.5% state=90.0%
+    outer 2/9: F0.35/N-0.25/S-0.40/ERPOFF     return=-8.6% MDD=-18.4% state=0.0%
+    outer 3/9: F0.35/N-0.05/S-0.40/ERPON      return=+20.3% MDD=-13.6% state=60.0%
+    outer 4/9: F0.35/N-0.05/S-0.40/ERPON      return=+30.2% MDD=-11.3% state=90.0%
+    outer 5/9: F0.35/N-0.25/S-0.30/ERPON      return=-9.7% MDD=-18.0% state=0.0%
+    outer 6/9: F0.35/N-0.05/S-0.40/ERPON      return=-9.4% MDD=-19.7% state=0.0%
+    outer 7/9: F0.35/N-0.15/S-0.20/ERPOFF     return=-11.1% MDD=-11.3% state=0.0%
+    outer 8/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+25.0% MDD=-15.7% state=60.0%
+    outer 9/9: F0.30/N-0.25/S-0.20/ERPOFF     return=+56.5% MDD=-10.7% state=90.0%
+[A] inner-only neighborhood flatness:
+  return: neighbor_pairs=35 min_ratio=0.874 median_ratio=0.990 (computed from inner scores; outer test not used)
+    fold 1: F0.30/N-0.05/S-0.40/ERPOFF | F0.35/N-0.05/S-0.40/ERPOFF ratio=0.997, F0.30/N-0.15/S-0.40/ERPOFF ratio=0.998, F0.30/N-0.05/S-0.30/ERPOFF ratio=0.940
+    fold 2: F0.35/N-0.05/S-0.40/ERPOFF | F0.30/N-0.05/S-0.40/ERPOFF ratio=0.999, F0.40/N-0.05/S-0.40/ERPOFF ratio=1.000, F0.35/N-0.15/S-0.40/ERPOFF ratio=0.983, F0.35/N-0.05/S-0.30/ERPOFF ratio=0.914
+    fold 3: F0.35/N-0.05/S-0.30/ERPON | F0.30/N-0.05/S-0.30/ERPON ratio=0.991, F0.40/N-0.05/S-0.30/ERPON ratio=1.000, F0.35/N-0.15/S-0.30/ERPON ratio=0.958, F0.35/N-0.05/S-0.40/ERPON ratio=1.000, F0.35/N-0.05/S-0.20/ERPON ratio=0.973
+    fold 4: F0.45/N-0.25/S-0.40/ERPOFF | F0.40/N-0.25/S-0.40/ERPOFF ratio=0.996, F0.45/N-0.15/S-0.40/ERPOFF ratio=0.974, F0.45/N-0.25/S-0.30/ERPOFF ratio=0.975
+    fold 5: F0.30/N-0.25/S-0.30/ERPOFF | F0.35/N-0.25/S-0.30/ERPOFF ratio=0.991, F0.30/N-0.15/S-0.30/ERPOFF ratio=0.981, F0.30/N-0.25/S-0.40/ERPOFF ratio=0.994, F0.30/N-0.25/S-0.20/ERPOFF ratio=0.874
+    fold 6: F0.35/N-0.15/S-0.40/ERPON | F0.30/N-0.15/S-0.40/ERPON ratio=0.995, F0.40/N-0.15/S-0.40/ERPON ratio=0.998, F0.35/N-0.25/S-0.40/ERPON ratio=0.995, F0.35/N-0.05/S-0.40/ERPON ratio=0.998, F0.35/N-0.15/S-0.30/ERPON ratio=0.947
+    fold 7: F0.35/N-0.15/S-0.20/ERPOFF | F0.30/N-0.15/S-0.20/ERPOFF ratio=0.992, F0.40/N-0.15/S-0.20/ERPOFF ratio=0.998, F0.35/N-0.25/S-0.20/ERPOFF ratio=0.988, F0.35/N-0.05/S-0.20/ERPOFF ratio=0.984, F0.35/N-0.15/S-0.30/ERPOFF ratio=0.943
+    fold 8: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=1.000, F0.30/N-0.15/S-0.20/ERPOFF ratio=0.964, F0.30/N-0.25/S-0.30/ERPOFF ratio=0.946
+    fold 9: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=0.990, F0.30/N-0.15/S-0.20/ERPOFF ratio=0.972, F0.30/N-0.25/S-0.30/ERPOFF ratio=0.960
+  calmar: neighbor_pairs=36 min_ratio=0.414 median_ratio=0.888 (computed from inner scores; outer test not used)
+    fold 1: F0.45/N-0.15/S-0.20/ERPOFF | F0.40/N-0.15/S-0.20/ERPOFF ratio=0.977, F0.45/N-0.25/S-0.20/ERPOFF ratio=0.650, F0.45/N-0.05/S-0.20/ERPOFF ratio=0.895, F0.45/N-0.15/S-0.30/ERPOFF ratio=0.657
+    fold 2: F0.35/N-0.25/S-0.40/ERPOFF | F0.30/N-0.25/S-0.40/ERPOFF ratio=NA, F0.40/N-0.25/S-0.40/ERPOFF ratio=NA, F0.35/N-0.15/S-0.40/ERPOFF ratio=NA, F0.35/N-0.25/S-0.30/ERPOFF ratio=NA
+    fold 3: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=NA, F0.40/N-0.05/S-0.40/ERPON ratio=NA, F0.35/N-0.15/S-0.40/ERPON ratio=NA, F0.35/N-0.05/S-0.30/ERPON ratio=NA
+    fold 4: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=0.909, F0.40/N-0.05/S-0.40/ERPON ratio=1.000, F0.35/N-0.15/S-0.40/ERPON ratio=0.728, F0.35/N-0.05/S-0.30/ERPON ratio=0.833
+    fold 5: F0.35/N-0.25/S-0.30/ERPON | F0.30/N-0.25/S-0.30/ERPON ratio=0.957, F0.40/N-0.25/S-0.30/ERPON ratio=1.000, F0.35/N-0.15/S-0.30/ERPON ratio=0.963, F0.35/N-0.25/S-0.40/ERPON ratio=0.881, F0.35/N-0.25/S-0.20/ERPON ratio=0.644
+    fold 6: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=0.943, F0.40/N-0.05/S-0.40/ERPON ratio=0.998, F0.35/N-0.15/S-0.40/ERPON ratio=0.961, F0.35/N-0.05/S-0.30/ERPON ratio=0.569
+    fold 7: F0.35/N-0.15/S-0.20/ERPOFF | F0.30/N-0.15/S-0.20/ERPOFF ratio=NA, F0.40/N-0.15/S-0.20/ERPOFF ratio=NA, F0.35/N-0.25/S-0.20/ERPOFF ratio=NA, F0.35/N-0.05/S-0.20/ERPOFF ratio=NA, F0.35/N-0.15/S-0.30/ERPOFF ratio=NA
+    fold 8: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=NA, F0.30/N-0.15/S-0.20/ERPOFF ratio=NA, F0.30/N-0.25/S-0.30/ERPOFF ratio=NA
+    fold 9: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=0.818, F0.30/N-0.15/S-0.20/ERPOFF ratio=0.644, F0.30/N-0.25/S-0.30/ERPOFF ratio=0.414
+  penalty: neighbor_pairs=36 min_ratio=0.409 median_ratio=0.885 (computed from inner scores; outer test not used)
+    fold 1: F0.45/N-0.15/S-0.20/ERPOFF | F0.40/N-0.15/S-0.20/ERPOFF ratio=0.976, F0.45/N-0.25/S-0.20/ERPOFF ratio=0.638, F0.45/N-0.05/S-0.20/ERPOFF ratio=0.891, F0.45/N-0.15/S-0.30/ERPOFF ratio=0.644
+    fold 2: F0.35/N-0.25/S-0.40/ERPOFF | F0.30/N-0.25/S-0.40/ERPOFF ratio=NA, F0.40/N-0.25/S-0.40/ERPOFF ratio=NA, F0.35/N-0.15/S-0.40/ERPOFF ratio=NA, F0.35/N-0.25/S-0.30/ERPOFF ratio=NA
+    fold 3: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=NA, F0.40/N-0.05/S-0.40/ERPON ratio=NA, F0.35/N-0.15/S-0.40/ERPON ratio=NA, F0.35/N-0.05/S-0.30/ERPON ratio=NA
+    fold 4: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=0.905, F0.40/N-0.05/S-0.40/ERPON ratio=1.000, F0.35/N-0.15/S-0.40/ERPON ratio=0.722, F0.35/N-0.05/S-0.30/ERPON ratio=0.829
+    fold 5: F0.35/N-0.25/S-0.30/ERPON | F0.30/N-0.25/S-0.30/ERPON ratio=0.955, F0.40/N-0.25/S-0.30/ERPON ratio=1.000, F0.35/N-0.15/S-0.30/ERPON ratio=0.958, F0.35/N-0.25/S-0.40/ERPON ratio=0.879, F0.35/N-0.25/S-0.20/ERPON ratio=0.618
+    fold 6: F0.35/N-0.05/S-0.40/ERPON | F0.30/N-0.05/S-0.40/ERPON ratio=0.942, F0.40/N-0.05/S-0.40/ERPON ratio=0.997, F0.35/N-0.15/S-0.40/ERPON ratio=0.962, F0.35/N-0.05/S-0.30/ERPON ratio=0.561
+    fold 7: F0.35/N-0.15/S-0.20/ERPOFF | F0.30/N-0.15/S-0.20/ERPOFF ratio=NA, F0.40/N-0.15/S-0.20/ERPOFF ratio=NA, F0.35/N-0.25/S-0.20/ERPOFF ratio=NA, F0.35/N-0.05/S-0.20/ERPOFF ratio=NA, F0.35/N-0.15/S-0.30/ERPOFF ratio=NA
+    fold 8: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=NA, F0.30/N-0.15/S-0.20/ERPOFF ratio=NA, F0.30/N-0.25/S-0.30/ERPOFF ratio=NA
+    fold 9: F0.30/N-0.25/S-0.20/ERPOFF | F0.35/N-0.25/S-0.20/ERPOFF ratio=0.815, F0.30/N-0.15/S-0.20/ERPOFF ratio=0.639, F0.30/N-0.25/S-0.30/ERPOFF ratio=0.409
+
+[B1] nested selection: candidates=3, outer=9, inner=3, selection uses no-interest inner OOS only
+  outer 1/9: train=2014-05-23..2017-05-23 test=2017-05-23..2018-05-23
+    inner 1/3: train=2014-05-23..2015-02-17 validate=2015-02-17..2015-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2014-05-23..2015-11-20 validate=2015-11-20..2016-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2014-05-23..2016-08-17 validate=2016-08-17..2017-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 1/9)
+    selected inner return max: B1-30%@-0.45 score=+0.192747
+    selected inner Calmar max: B1-30%@-0.45 score=+0.205283
+    selected inner return/|MDD| max: B1-30%@-0.45 score=+0.485568
+  outer 2/9: train=2015-05-22..2018-05-23 test=2018-05-23..2019-05-24
+    inner 1/3: train=2015-05-22..2016-02-23 validate=2016-02-23..2016-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2015-05-22..2016-11-21 validate=2016-11-21..2017-08-18 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2015-05-22..2017-08-18 validate=2017-08-18..2018-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 2/9)
+    selected inner return max: B1-30%@-0.50 score=-0.290531
+    selected inner Calmar max: B1-30%@-0.50 score=-0.442209
+    selected inner return/|MDD| max: B1-30%@-0.50 score=-0.908054
+  outer 3/9: train=2016-05-20..2019-05-24 test=2019-05-24..2020-05-26
+    inner 1/3: train=2016-05-20..2017-02-22 validate=2017-02-22..2017-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2016-05-20..2017-11-20 validate=2017-11-20..2018-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2016-05-20..2018-08-17 validate=2018-08-17..2019-05-24 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 3/9)
+    selected inner return max: B1-30%@-0.50 score=-0.215858
+    selected inner Calmar max: B1-30%@-0.50 score=-0.326783
+    selected inner return/|MDD| max: B1-30%@-0.50 score=-0.688597
+  outer 4/9: train=2017-05-23..2020-05-26 test=2020-05-26..2021-05-27
+    inner 1/3: train=2017-05-23..2018-02-14 validate=2018-02-14..2018-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2017-05-23..2018-11-20 validate=2018-11-20..2019-08-20 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2017-05-23..2019-08-20 validate=2019-08-20..2020-05-26 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 4/9)
+    selected inner return max: B1-30%@-0.50 score=+0.153619
+    selected inner Calmar max: B1-30%@-0.50 score=+0.258488
+    selected inner return/|MDD| max: B1-30%@-0.50 score=+0.605561
+  outer 5/9: train=2018-05-23..2021-05-27 test=2021-05-27..2022-05-31
+    inner 1/3: train=2018-05-23..2019-02-22 validate=2019-02-22..2019-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2018-05-23..2019-11-21 validate=2019-11-21..2020-08-21 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2018-05-23..2020-08-21 validate=2020-08-21..2021-05-27 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 5/9)
+    selected inner return max: B1-30%@-0.50 score=+0.802007
+    selected inner Calmar max: B1-30%@-0.50 score=+1.776207
+    selected inner return/|MDD| max: B1-30%@-0.50 score=+4.761438
+  outer 6/9: train=2019-05-24..2022-05-31 test=2022-05-31..2023-05-31
+    inner 1/3: train=2019-05-24..2020-02-25 validate=2020-02-25..2020-11-24 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2019-05-24..2020-11-24 validate=2020-11-24..2021-08-23 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2019-05-24..2021-08-23 validate=2021-08-23..2022-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 6/9)
+    selected inner return max: B1-30%@-0.50 score=+0.133045
+    selected inner Calmar max: B1-30%@-0.45 score=+0.317665
+    selected inner return/|MDD| max: B1-30%@-0.45 score=+0.739904
+  outer 7/9: train=2020-05-26..2023-05-31 test=2023-05-31..2024-06-04
+    inner 1/3: train=2020-05-26..2021-02-25 validate=2021-02-25..2021-11-25 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2020-05-26..2021-11-25 validate=2021-11-25..2022-08-25 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2020-05-26..2022-08-25 validate=2022-08-25..2023-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 7/9)
+    selected inner return max: B1-30%@-0.45 score=-0.066268
+    selected inner Calmar max: B1-30%@-0.45 score=-0.146199
+    selected inner return/|MDD| max: B1-30%@-0.45 score=-0.322793
+  outer 8/9: train=2021-05-27..2024-06-04 test=2024-06-04..2025-06-09
+    inner 1/3: train=2021-05-27..2022-02-28 validate=2022-02-28..2022-11-28 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2021-05-27..2022-11-28 validate=2022-11-28..2023-08-28 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2021-05-27..2023-08-28 validate=2023-08-28..2024-06-04 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 8/9)
+    selected inner return max: B1-30%@-0.45 score=-0.154835
+    selected inner Calmar max: B1-30%@-0.45 score=-0.267091
+    selected inner return/|MDD| max: B1-30%@-0.45 score=-0.574063
+  outer 9/9: train=2022-05-31..2025-06-09 test=2025-06-09..2026-06-10
+    inner 1/3: train=2022-05-31..2023-03-01 validate=2023-03-01..2023-11-29 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2022-05-31..2023-11-29 validate=2023-11-29..2024-08-29 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2022-05-31..2024-08-29 validate=2024-08-29..2025-06-09 (validate_end<=outer_train_end: True)
+    inner candidates 3/3 (outer 9/9)
+    selected inner return max: B1-30%@-0.50 score=-0.013989
+    selected inner Calmar max: B1-30%@-0.50 score=-0.027288
+    selected inner return/|MDD| max: B1-30%@-0.50 score=-0.061159
+  [B1] outer evaluation: inner return max
+    outer 1/9: B1-30%@-0.45                   return=-7.6% MDD=-15.9% state=100.0%
+    outer 2/9: B1-30%@-0.50                   return=-11.0% MDD=-20.7% state=30.0%
+    outer 3/9: B1-30%@-0.50                   return=+26.9% MDD=-15.7% state=60.0%
+    outer 4/9: B1-30%@-0.50                   return=+40.6% MDD=-16.7% state=90.0%
+    outer 5/9: B1-30%@-0.50                   return=-10.0% MDD=-18.7% state=30.0%
+    outer 6/9: B1-30%@-0.50                   return=-5.4% MDD=-16.7% state=30.0%
+    outer 7/9: B1-30%@-0.45                   return=-11.5% MDD=-14.7% state=90.0%
+    outer 8/9: B1-30%@-0.45                   return=+18.9% MDD=-18.9% state=60.0%
+    outer 9/9: B1-30%@-0.50                   return=+64.7% MDD=-10.7% state=90.0%
+  [B1] outer evaluation: inner Calmar max
+    outer 1/9: B1-30%@-0.45                   return=-7.6% MDD=-15.9% state=100.0%
+    outer 2/9: B1-30%@-0.50                   return=-11.0% MDD=-20.7% state=30.0%
+    outer 3/9: B1-30%@-0.50                   return=+26.9% MDD=-15.7% state=60.0%
+    outer 4/9: B1-30%@-0.50                   return=+40.6% MDD=-16.7% state=90.0%
+    outer 5/9: B1-30%@-0.50                   return=-10.0% MDD=-18.7% state=30.0%
+    outer 6/9: B1-30%@-0.45                   return=-4.5% MDD=-15.9% state=30.0%
+    outer 7/9: B1-30%@-0.45                   return=-11.5% MDD=-14.7% state=90.0%
+    outer 8/9: B1-30%@-0.45                   return=+18.9% MDD=-18.9% state=60.0%
+    outer 9/9: B1-30%@-0.50                   return=+64.7% MDD=-10.7% state=90.0%
+  [B1] outer evaluation: inner return/|MDD| max
+    outer 1/9: B1-30%@-0.45                   return=-7.6% MDD=-15.9% state=100.0%
+    outer 2/9: B1-30%@-0.50                   return=-11.0% MDD=-20.7% state=30.0%
+    outer 3/9: B1-30%@-0.50                   return=+26.9% MDD=-15.7% state=60.0%
+    outer 4/9: B1-30%@-0.50                   return=+40.6% MDD=-16.7% state=90.0%
+    outer 5/9: B1-30%@-0.50                   return=-10.0% MDD=-18.7% state=30.0%
+    outer 6/9: B1-30%@-0.45                   return=-4.5% MDD=-15.9% state=30.0%
+    outer 7/9: B1-30%@-0.45                   return=-11.5% MDD=-14.7% state=90.0%
+    outer 8/9: B1-30%@-0.45                   return=+18.9% MDD=-18.9% state=60.0%
+    outer 9/9: B1-30%@-0.50                   return=+64.7% MDD=-10.7% state=90.0%
+[B1] inner-only neighborhood flatness:
+  return: neighbor_pairs=15 min_ratio=0.964 median_ratio=0.986 (computed from inner scores; outer test not used)
+    fold 1: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.982
+    fold 2: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.999, B1-30%@-0.45 ratio=0.984
+    fold 3: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.984, B1-30%@-0.45 ratio=0.986
+    fold 4: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.996, B1-30%@-0.45 ratio=0.971
+    fold 5: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.989, B1-30%@-0.45 ratio=0.991
+    fold 6: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.964, B1-30%@-0.45 ratio=0.998
+    fold 7: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.975
+    fold 8: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.971
+    fold 9: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.992, B1-30%@-0.45 ratio=0.997
+  calmar: neighbor_pairs=14 min_ratio=0.838 median_ratio=0.950 (computed from inner scores; outer test not used)
+    fold 1: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.868
+    fold 2: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+    fold 3: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+    fold 4: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.938, B1-30%@-0.45 ratio=0.838
+    fold 5: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.988, B1-30%@-0.45 ratio=0.991
+    fold 6: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.962
+    fold 7: B1-30%@-0.45 | B1-30%@-0.50 ratio=NA
+    fold 8: B1-30%@-0.45 | B1-30%@-0.50 ratio=NA
+    fold 9: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+  penalty: neighbor_pairs=14 min_ratio=0.831 median_ratio=0.950 (computed from inner scores; outer test not used)
+    fold 1: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.863
+    fold 2: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+    fold 3: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+    fold 4: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.937, B1-30%@-0.45 ratio=0.831
+    fold 5: B1-30%@-0.50 | B1-30%@-0.55 ratio=0.984, B1-30%@-0.45 ratio=0.988
+    fold 6: B1-30%@-0.45 | B1-30%@-0.50 ratio=0.963
+    fold 7: B1-30%@-0.45 | B1-30%@-0.50 ratio=NA
+    fold 8: B1-30%@-0.45 | B1-30%@-0.50 ratio=NA
+    fold 9: B1-30%@-0.50 | B1-30%@-0.55 ratio=NA, B1-30%@-0.45 ratio=NA
+
+[B2] nested selection: candidates=12, outer=9, inner=3, selection uses no-interest inner OOS only
+  outer 1/9: train=2014-05-23..2017-05-23 test=2017-05-23..2018-05-23
+    inner 1/3: train=2014-05-23..2015-02-17 validate=2015-02-17..2015-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2014-05-23..2015-11-20 validate=2015-11-20..2016-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2014-05-23..2016-08-17 validate=2016-08-17..2017-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 1/9)
+    selected inner return max: B2-H0.03/C1 score=+0.255594
+    selected inner Calmar max: B2-H0.03/C1 score=+0.294448
+    selected inner return/|MDD| max: B2-H0.03/C1 score=+0.706970
+  outer 2/9: train=2015-05-22..2018-05-23 test=2018-05-23..2019-05-24
+    inner 1/3: train=2015-05-22..2016-02-23 validate=2016-02-23..2016-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2015-05-22..2016-11-21 validate=2016-11-21..2017-08-18 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2015-05-22..2017-08-18 validate=2017-08-18..2018-05-23 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 2/9)
+    selected inner return max: B2-H0.00/C3 score=-0.275127
+    selected inner Calmar max: B2-H0.00/C3 score=-0.422877
+    selected inner return/|MDD| max: B2-H0.00/C3 score=-0.873137
+  outer 3/9: train=2016-05-20..2019-05-24 test=2019-05-24..2020-05-26
+    inner 1/3: train=2016-05-20..2017-02-22 validate=2017-02-22..2017-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2016-05-20..2017-11-20 validate=2017-11-20..2018-08-17 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2016-05-20..2018-08-17 validate=2018-08-17..2019-05-24 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 3/9)
+    selected inner return max: B2-H0.05/C3 score=-0.178882
+    selected inner Calmar max: B2-H0.05/C3 score=-0.314676
+    selected inner return/|MDD| max: B2-H0.05/C3 score=-0.671172
+  outer 4/9: train=2017-05-23..2020-05-26 test=2020-05-26..2021-05-27
+    inner 1/3: train=2017-05-23..2018-02-14 validate=2018-02-14..2018-11-20 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2017-05-23..2018-11-20 validate=2018-11-20..2019-08-20 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2017-05-23..2019-08-20 validate=2019-08-20..2020-05-26 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 4/9)
+    selected inner return max: B2-H0.05/C1 score=+0.143179
+    selected inner Calmar max: B2-H0.05/C1 score=+0.257911
+    selected inner return/|MDD| max: B2-H0.05/C1 score=+0.602636
+  outer 5/9: train=2018-05-23..2021-05-27 test=2021-05-27..2022-05-31
+    inner 1/3: train=2018-05-23..2019-02-22 validate=2019-02-22..2019-11-21 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2018-05-23..2019-11-21 validate=2019-11-21..2020-08-21 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2018-05-23..2020-08-21 validate=2020-08-21..2021-05-27 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 5/9)
+    selected inner return max: B2-H0.08/C1 score=+0.812392
+    selected inner Calmar max: B2-H0.08/C1 score=+1.856185
+    selected inner return/|MDD| max: B2-H0.08/C1 score=+4.984908
+  outer 6/9: train=2019-05-24..2022-05-31 test=2022-05-31..2023-05-31
+    inner 1/3: train=2019-05-24..2020-02-25 validate=2020-02-25..2020-11-24 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2019-05-24..2020-11-24 validate=2020-11-24..2021-08-23 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2019-05-24..2021-08-23 validate=2021-08-23..2022-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 6/9)
+    selected inner return max: B2-H0.08/C3 score=+0.182456
+    selected inner Calmar max: B2-H0.08/C3 score=+0.482575
+    selected inner return/|MDD| max: B2-H0.08/C3 score=+1.138605
+  outer 7/9: train=2020-05-26..2023-05-31 test=2023-05-31..2024-06-04
+    inner 1/3: train=2020-05-26..2021-02-25 validate=2021-02-25..2021-11-25 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2020-05-26..2021-11-25 validate=2021-11-25..2022-08-25 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2020-05-26..2022-08-25 validate=2022-08-25..2023-05-31 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 7/9)
+    selected inner return max: B2-H0.05/C3 score=-0.051499
+    selected inner Calmar max: B2-H0.05/C3 score=-0.133339
+    selected inner return/|MDD| max: B2-H0.05/C3 score=-0.295667
+  outer 8/9: train=2021-05-27..2024-06-04 test=2024-06-04..2025-06-09
+    inner 1/3: train=2021-05-27..2022-02-28 validate=2022-02-28..2022-11-28 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2021-05-27..2022-11-28 validate=2022-11-28..2023-08-28 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2021-05-27..2023-08-28 validate=2023-08-28..2024-06-04 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 8/9)
+    selected inner return max: B2-H0.00/C3 score=-0.054051
+    selected inner Calmar max: B2-H0.00/C3 score=-0.146645
+    selected inner return/|MDD| max: B2-H0.00/C3 score=-0.324932
+  outer 9/9: train=2022-05-31..2025-06-09 test=2025-06-09..2026-06-10
+    inner 1/3: train=2022-05-31..2023-03-01 validate=2023-03-01..2023-11-29 (validate_end<=outer_train_end: True)
+    inner 2/3: train=2022-05-31..2023-11-29 validate=2023-11-29..2024-08-29 (validate_end<=outer_train_end: True)
+    inner 3/3: train=2022-05-31..2024-08-29 validate=2024-08-29..2025-06-09 (validate_end<=outer_train_end: True)
+    inner candidates 12/12 (outer 9/9)
+    selected inner return max: B2-H0.00/C3 score=+0.107630
+    selected inner Calmar max: B2-H0.00/C3 score=+0.300257
+    selected inner return/|MDD| max: B2-H0.00/C3 score=+0.695280
+  [B2] outer evaluation: inner return max
+    outer 1/9: B2-H0.03/C1                    return=-9.8% MDD=-16.7% state=100.0%
+    outer 2/9: B2-H0.00/C3                    return=-9.2% MDD=-16.4% state=0.0%
+    outer 3/9: B2-H0.05/C3                    return=+22.7% MDD=-16.0% state=60.0%
+    outer 4/9: B2-H0.05/C1                    return=+38.3% MDD=-17.6% state=90.0%
+    outer 5/9: B2-H0.08/C1                    return=-8.6% MDD=-16.6% state=0.0%
+    outer 6/9: B2-H0.08/C3                    return=-4.6% MDD=-14.8% state=0.0%
+    outer 7/9: B2-H0.05/C3                    return=-8.2% MDD=-10.0% state=90.0%
+    outer 8/9: B2-H0.00/C3                    return=+21.5% MDD=-15.5% state=60.0%
+    outer 9/9: B2-H0.00/C3                    return=+53.5% MDD=-10.8% state=90.0%
+  [B2] outer evaluation: inner Calmar max
+    outer 1/9: B2-H0.03/C1                    return=-9.8% MDD=-16.7% state=100.0%
+    outer 2/9: B2-H0.00/C3                    return=-9.2% MDD=-16.4% state=0.0%
+    outer 3/9: B2-H0.05/C3                    return=+22.7% MDD=-16.0% state=60.0%
+    outer 4/9: B2-H0.05/C1                    return=+38.3% MDD=-17.6% state=90.0%
+    outer 5/9: B2-H0.08/C1                    return=-8.6% MDD=-16.6% state=0.0%
+    outer 6/9: B2-H0.08/C3                    return=-4.6% MDD=-14.8% state=0.0%
+    outer 7/9: B2-H0.05/C3                    return=-8.2% MDD=-10.0% state=90.0%
+    outer 8/9: B2-H0.00/C3                    return=+21.5% MDD=-15.5% state=60.0%
+    outer 9/9: B2-H0.00/C3                    return=+53.5% MDD=-10.8% state=90.0%
+  [B2] outer evaluation: inner return/|MDD| max
+    outer 1/9: B2-H0.03/C1                    return=-9.8% MDD=-16.7% state=100.0%
+    outer 2/9: B2-H0.00/C3                    return=-9.2% MDD=-16.4% state=0.0%
+    outer 3/9: B2-H0.05/C3                    return=+22.7% MDD=-16.0% state=60.0%
+    outer 4/9: B2-H0.05/C1                    return=+38.3% MDD=-17.6% state=90.0%
+    outer 5/9: B2-H0.08/C1                    return=-8.6% MDD=-16.6% state=0.0%
+    outer 6/9: B2-H0.08/C3                    return=-4.6% MDD=-14.8% state=0.0%
+    outer 7/9: B2-H0.05/C3                    return=-8.2% MDD=-10.0% state=90.0%
+    outer 8/9: B2-H0.00/C3                    return=+21.5% MDD=-15.5% state=60.0%
+    outer 9/9: B2-H0.00/C3                    return=+53.5% MDD=-10.8% state=90.0%
+[B2] inner-only neighborhood flatness:
+  return: neighbor_pairs=22 min_ratio=0.922 median_ratio=0.978 (computed from inner scores; outer test not used)
+    fold 1: B2-H0.03/C1 | B2-H0.00/C1 ratio=0.993, B2-H0.05/C1 ratio=0.984, B2-H0.03/C2 ratio=1.000
+    fold 2: B2-H0.00/C3 | B2-H0.03/C3 ratio=0.952, B2-H0.00/C2 ratio=0.976
+    fold 3: B2-H0.05/C3 | B2-H0.03/C3 ratio=0.974, B2-H0.08/C3 ratio=0.958, B2-H0.05/C2 ratio=0.985
+    fold 4: B2-H0.05/C1 | B2-H0.03/C1 ratio=0.977, B2-H0.08/C1 ratio=0.980, B2-H0.05/C2 ratio=1.000
+    fold 5: B2-H0.08/C1 | B2-H0.05/C1 ratio=0.986, B2-H0.08/C2 ratio=1.000
+    fold 6: B2-H0.08/C3 | B2-H0.05/C3 ratio=0.922, B2-H0.08/C2 ratio=0.962
+    fold 7: B2-H0.05/C3 | B2-H0.03/C3 ratio=0.996, B2-H0.08/C3 ratio=0.995, B2-H0.05/C2 ratio=0.968
+    fold 8: B2-H0.00/C3 | B2-H0.03/C3 ratio=0.964, B2-H0.00/C2 ratio=0.972
+    fold 9: B2-H0.00/C3 | B2-H0.03/C3 ratio=0.957, B2-H0.00/C2 ratio=0.981
+  calmar: neighbor_pairs=22 min_ratio=0.401 median_ratio=0.844 (computed from inner scores; outer test not used)
+    fold 1: B2-H0.03/C1 | B2-H0.00/C1 ratio=0.954, B2-H0.05/C1 ratio=0.893, B2-H0.03/C2 ratio=1.000
+    fold 2: B2-H0.00/C3 | B2-H0.03/C3 ratio=NA, B2-H0.00/C2 ratio=NA
+    fold 3: B2-H0.05/C3 | B2-H0.03/C3 ratio=NA, B2-H0.08/C3 ratio=NA, B2-H0.05/C2 ratio=NA
+    fold 4: B2-H0.05/C1 | B2-H0.03/C1 ratio=0.781, B2-H0.08/C1 ratio=0.795, B2-H0.05/C2 ratio=1.000
+    fold 5: B2-H0.08/C1 | B2-H0.05/C1 ratio=0.902, B2-H0.08/C2 ratio=1.000
+    fold 6: B2-H0.08/C3 | B2-H0.05/C3 ratio=0.401, B2-H0.08/C2 ratio=0.735
+    fold 7: B2-H0.05/C3 | B2-H0.03/C3 ratio=NA, B2-H0.08/C3 ratio=NA, B2-H0.05/C2 ratio=NA
+    fold 8: B2-H0.00/C3 | B2-H0.03/C3 ratio=NA, B2-H0.00/C2 ratio=NA
+    fold 9: B2-H0.00/C3 | B2-H0.03/C3 ratio=0.568, B2-H0.00/C2 ratio=0.791
+  penalty: neighbor_pairs=22 min_ratio=0.392 median_ratio=0.840 (computed from inner scores; outer test not used)
+    fold 1: B2-H0.03/C1 | B2-H0.00/C1 ratio=0.951, B2-H0.05/C1 ratio=0.889, B2-H0.03/C2 ratio=1.000
+    fold 2: B2-H0.00/C3 | B2-H0.03/C3 ratio=NA, B2-H0.00/C2 ratio=NA
+    fold 3: B2-H0.05/C3 | B2-H0.03/C3 ratio=NA, B2-H0.08/C3 ratio=NA, B2-H0.05/C2 ratio=NA
+    fold 4: B2-H0.05/C1 | B2-H0.03/C1 ratio=0.776, B2-H0.08/C1 ratio=0.790, B2-H0.05/C2 ratio=1.000
+    fold 5: B2-H0.08/C1 | B2-H0.05/C1 ratio=0.898, B2-H0.08/C2 ratio=1.000
+    fold 6: B2-H0.08/C3 | B2-H0.05/C3 ratio=0.392, B2-H0.08/C2 ratio=0.727
+    fold 7: B2-H0.05/C3 | B2-H0.03/C3 ratio=NA, B2-H0.08/C3 ratio=NA, B2-H0.05/C2 ratio=NA
+    fold 8: B2-H0.00/C3 | B2-H0.03/C3 ratio=NA, B2-H0.00/C2 ratio=NA
+    fold 9: B2-H0.00/C3 | B2-H0.03/C3 ratio=0.561, B2-H0.00/C2 ratio=0.787
+
+A: nested selection results (each criterion has its own outer OOS path)
+configuration                         no-interest total/CAGR/MDD/Calmar                 with-interest total/CAGR/MDD/Calmar
+return                                 +114.9%/   +8.9%/  -34.6%/0.256        +134.2%/   +9.9%/  -32.1%/0.309
+calmar                                  +81.3%/   +6.8%/  -34.9%/0.196         +98.5%/   +7.9%/  -32.4%/0.245
+penalty                                 +81.3%/   +6.8%/  -34.9%/0.196         +98.5%/   +7.9%/  -32.4%/0.245
+
+A nested OOS vs fixed v5.2
+  inner return max: +114.9%/-34.6% vs +123.1%/-32.3%; with-interest +134.2% vs +142.5%; NO: not superior on both return and MDD
+  inner Calmar max: +81.3%/-34.9% vs +123.1%/-32.3%; with-interest +98.5% vs +142.5%; NO: not superior on both return and MDD
+  inner return/|MDD| max: +81.3%/-34.9% vs +123.1%/-32.3%; with-interest +98.5% vs +142.5%; NO: not superior on both return and MDD
+
+B1: five-tier nested results vs fixed v5.2
+configuration                         no-interest total/CAGR/MDD/Calmar                 with-interest total/CAGR/MDD/Calmar
+return                                 +116.3%/   +8.9%/  -35.2%/0.254        +133.1%/   +9.9%/  -32.8%/0.300
+calmar                                 +118.3%/   +9.1%/  -34.6%/0.262        +135.3%/  +10.0%/  -32.2%/0.310
+penalty                                +118.3%/   +9.1%/  -34.6%/0.262        +135.3%/  +10.0%/  -32.2%/0.310
+
+B1 nested OOS vs fixed v5.2
+  inner return max: +116.3%/-35.2% vs +123.1%/-32.3%; with-interest +133.1% vs +142.5%; NO: not superior on both return and MDD
+  inner Calmar max: +118.3%/-34.6% vs +123.1%/-32.3%; with-interest +135.3% vs +142.5%; NO: not superior on both return and MDD
+  inner return/|MDD| max: +118.3%/-34.6% vs +123.1%/-32.3%; with-interest +135.3% vs +142.5%; NO: not superior on both return and MDD
+
+B2: state-machine nested results vs fixed v5.2
+configuration                         no-interest total/CAGR/MDD/Calmar                 with-interest total/CAGR/MDD/Calmar
+return                                 +107.5%/   +8.5%/  -28.8%/0.294        +126.7%/   +9.5%/  -27.4%/0.348
+calmar                                 +107.5%/   +8.5%/  -28.8%/0.294        +126.7%/   +9.5%/  -27.4%/0.348
+penalty                                +107.5%/   +8.5%/  -28.8%/0.294        +126.7%/   +9.5%/  -27.4%/0.348
+
+B2 nested OOS vs fixed v5.2
+  inner return max: +107.5%/-28.8% vs +123.1%/-32.3%; with-interest +126.7% vs +142.5%; NO: not superior on both return and MDD
+  inner Calmar max: +107.5%/-28.8% vs +123.1%/-32.3%; with-interest +126.7% vs +142.5%; NO: not superior on both return and MDD
+  inner return/|MDD| max: +107.5%/-28.8% vs +123.1%/-32.3%; with-interest +126.7% vs +142.5%; NO: not superior on both return and MDD
+
+Reference comparison: fixed v5.2 / fixed v5.1 / buy-and-hold
+
+Fixed references
+configuration                         no-interest total/CAGR/MDD/Calmar                 with-interest total/CAGR/MDD/Calmar
+fixed v5.2                             +123.1%/   +9.3%/  -32.3%/0.288        +142.5%/  +10.3%/  -29.8%/0.348
+fixed v5.1                              +96.5%/   +7.8%/  -31.0%/0.251        +116.1%/   +8.9%/  -28.3%/0.316
+buy-and-hold                           +119.2%/   +9.1%/  -57.0%/0.160        +119.2%/   +9.1%/  -57.0%/0.160
+B1 conclusion: 嵌套 OOS 不优于固定 v5.2，不建议启用
+B2 conclusion: 嵌套 OOS 不优于固定 v5.2，不建议启用
+
+A direct answer: NO; no inner selection criterion dominates fixed v5.2 on both return and MDD.
+All displayed returns/MDDs are computed from this run; no full-sample best candidate was used for the nested conclusions.
+runtime_seconds=25.326 target_under_900s=PASS
+[exit_code] 0
+[end] 2026-09-24 02:55:00    

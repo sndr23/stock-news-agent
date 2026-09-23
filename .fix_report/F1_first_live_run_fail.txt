@@ -1,0 +1,29 @@
+# 首次裸跑失败实录（F1 改造前的实时窗口）
+
+说明：以下为 2026-09-24 02:50 修复前脚本在实时数据链（Sina 3000 根滚动窗口）
+上的终端实录（修复前运行，exit_code=1）。独立旁证见
+.audit_report/repro_out_oos_baseline.txt（审计复跑同样得到 +132.37% 实拉窗口值）。
+
+```
+$ python scripts/nested_selection_eval.py
+[start] 2026-09-24 02:50:51
+Chinext timing third round | nested walk-forward selection | fee=0
+...
+data: 3000 bars 2014-05-28 -> 2026-09-23; outer=3y train/1y test/9 folds
+...
+  fixed v5.2: OOS no-interest=+132.4% MDD=-32.3%; with-interest=+152.6% MDD=-29.8%
+  fixed v5.1: OOS no-interest=+101.9% MDD=-31.0%; with-interest=+122.1% MDD=-28.3%
+  buy-and-hold: OOS=+129.2% MDD=-57.0% (interest identical because position=100%)
+
+Required baseline cross-checks (rounded reference values)
+  fixed v5.2: observed=+132.4%/-32.3% expected=+123.1%/-32.3% diff=0.09273552/0.00044968
+Traceback (most recent call last):
+  ...
+RuntimeError: baseline mismatch for fixed v5.2: observed 1.3237355183500803/-0.3234496753857308 vs reference 1.231/-0.323 (diff 0.092736/0.000450 > tolerance 0.0005)。
+[exit_code] 1
+[end] 2026-09-24 02:51:00
+```
+
+结论：实时滚动窗口（末端 2026-09-23）与任务书/审计的固定窗口（末端 2026-09-18）
+差 3 根 K 线 → v5.2 OOS +132.4% vs +123.1%，差异 ~9pp，硬编码基线断言必崩。
+这正是 F3③ 窗口敏感性披露所述现象，也是本修复固定数据窗口的直接原因。
