@@ -55,10 +55,26 @@ V52_KEY = (0.30, -0.25, -0.30, False)
 V51_KEY = (0.40, -0.15, -0.30, True)
 EXPECTED_BASELINES = {
     "fixed v5.2": (1.231, -0.323),
-    "fixed v5.1": (0.953, -0.236),
+    # 2026-09-24 更新：v5.1 原参考值 (0.953, -0.236) 是 2026-09-18
+    # FIX-20260918-01（commit 6315776，pe_to_cheap_pctile 估值分位实现修复）
+    # 之前的旧代码产物——旧分位口径下 v5.1 结果恰好逼近 v5.2；修复后两者
+    # 脱钩。当前代码实测 +96.452%/-31.008%（脚注见 .fix_report/F1_run.log），
+    # 参考值随之更新为 (0.9645, -0.3101)。此更新只反映代码口径，与策略
+    # 参数（TIERS/HYST/confirm）无关。
+    "fixed v5.1": (0.9645, -0.3101),
     "buy-and-hold": (1.192, -0.570),
 }
 BASELINE_ROUNDED_TOLERANCE = 0.0005
+
+# 基线固定窗口（2026-09-24 加入）：EXPECTED_BASELINES 的参考值对应 2026-09-20
+# 研究轮的固定数据窗口——3000 根 K 线、末端 2026-09-18（起点 2014-05-23）。
+# 之所以必须固定：wfv.split_folds 按"根数下标"切分折边界，数据窗口末端/起点
+# 位移会让全部 OOS 折整体平移、基线数字随之漂移（实测 v5.2：2014-05-28 起
+# +132.4% vs 2014-05-23 起 +123.1%，差约 9pp），不固定窗口则断言无法稳定复现。
+# 若开启新一轮研究需要更换窗口，必须同步更新 EXPECTED_BASELINES 并留档证据。
+BASELINE_WINDOW_END = pd.Timestamp("2026-09-18")
+BASELINE_WINDOW_BARS = 3000
+BASELINE_FETCH_BARS = 3400  # 多取 400 根，覆盖窗口起点（生产链默认只取 3000）
 
 CRITERIA = ("return", "calmar", "penalty")
 CRITERION_LABELS = {
@@ -804,7 +820,20 @@ def _print_baseline_assertions(baselines: dict[str, dict[str, Any]]) -> None:
             raise RuntimeError(
                 f"baseline mismatch for {label}: observed "
                 f"{observed['total']}/{observed['mdd']} vs "
-                f"reference {expected_total}/{expected_mdd}"
+                f"reference {expected_total}/{expected_mdd} "
+                f"(diff {total_diff:.6f}/{mdd_diff:.6f} > "
+                f"tolerance {BASELINE_ROUNDED_TOLERANCE})。\n"
+                "本脚本已固定在 2026-09-20 研究窗口（末端 "
+                f"{BASELINE_WINDOW_END.date()}，{BASELINE_WINDOW_BARS} 根）上运行，"
+                "因此优先排查两类原因：\n"
+                "①估值分位实现漂移——对照 2026-09-18 前后的 "
+                "src/strategy/index_pe.py pe_to_cheap_pctile 实现（旧版为 "
+                "git 6315776^）；\n"
+                "②数据窗口漂移——数据源返回的历史不足/起点变化导致固定窗口重建"
+                "不完整（检查本次运行日志开头 data: 行的起止日期，折边界按 K 线"
+                "根数下标切分，起点平移会移动折边界）。\n"
+                "复跑命令：python scripts/nested_selection_eval.py；确认口径变化后"
+                "再同步更新 EXPECTED_BASELINES 并留档证据，勿直接放宽容差。"
             )
     print("  baseline rounded-value checks: PASS")
 
@@ -934,6 +963,47 @@ def _print_nested_answer(
         )
 
 
+def _load_fixed_window_df() -> pd.DataFrame:
+    """加载 399006 日线并裁剪到基线固定窗口（多取历史后取末 3000 根）。
+
+    数据源仍是生产免费链（新浪全量优先，失败回退东财短链）；为保证基线
+    断言可复现，本脚本多取 BASELINE_FETCH_BARS 根后裁剪到
+    BASELINE_WINDOW_END 之前、末 BASELINE_WINDOW_BARS 根（见窗口常量注释）。
+    加载期使用独立缓存子目录，避免与生产 3000 根滚动缓存（datalen 不同、
+    键相同）互相覆盖。
+    """
+    from src.strategy import data as sdata
+
+    original_cache = sdata.CACHE_DIR
+    sdata.CACHE_DIR = original_cache / "nested_selection_eval"
+    try:
+        df = rct.load_index_sina("399006", datalen=BASELINE_FETCH_BARS)
+    except Exception as exc:  # 与生产降级链一致：单源失败不致命
+        print(f"WARNING: 扩展历史加载失败({type(exc).__name__})，回退 opt.load_df()")
+        df = None
+    finally:
+        sdata.CACHE_DIR = original_cache
+    if df is None or df.empty:
+        df = opt.load_df()
+
+    frame = df.copy()
+    frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame.loc[frame.index.notna()].sort_index()
+    frame = frame.loc[~frame.index.duplicated(keep="last")]
+    frame = frame.loc[frame.index <= BASELINE_WINDOW_END]
+    if len(frame) < BASELINE_WINDOW_BARS:
+        raise SystemExit(
+            f"固定窗口数据不足：裁剪到 {BASELINE_WINDOW_END.date()} 后仅 "
+            f"{len(frame)} 根 < {BASELINE_WINDOW_BARS}。需要 {BASELINE_FETCH_BARS} "
+            "根以上历史以覆盖窗口起点，请检查网络/数据源后重跑。"
+        )
+    frame = frame.iloc[-BASELINE_WINDOW_BARS:]
+    missing = {"close", "amount"} - set(frame.columns)
+    if missing:
+        raise SystemExit(f"固定窗口数据缺列: {sorted(missing)}")
+    return frame
+
+
 def _run() -> None:
     started = time.perf_counter()
     print("Chinext timing third round | nested walk-forward selection | fee=0")
@@ -958,7 +1028,7 @@ def _run() -> None:
         f"B1={len(b1_candidates)}; B2={len(b2_candidates)}"
     )
 
-    df = opt.load_df()
+    df = _load_fixed_window_df()
     pe_map = ipe.load_cy50_pe(PROJECT_ROOT)
     if not pe_map:
         pe_map = None
@@ -974,7 +1044,8 @@ def _run() -> None:
         )
     print(
         f"data: {len(frame)} bars {frame.index.min().date()} -> {frame.index.max().date()}; "
-        f"outer={TRAIN_YEARS}y train/{TEST_YEARS}y test/{len(folds)} folds"
+        f"outer={TRAIN_YEARS}y train/{TEST_YEARS}y test/{len(folds)} folds; "
+        f"baseline window={BASELINE_WINDOW_BARS} bars end<={BASELINE_WINDOW_END.date()}"
     )
     print(
         "outer rule: selected candidate is applied to each test fold; "

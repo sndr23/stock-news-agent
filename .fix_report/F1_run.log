@@ -1,0 +1,41 @@
+=== F1 acceptance evidence ===
+repo: stock-news-agent
+branch: fix/audit-followup-20260924
+HEAD: 0ad4c92 (fix 未提交，脚本已含本次修改)
+date: 2026-09-24 02:55:20    
+
+--- 复跑命令与数据窗口 ---
+$ python scripts/nested_selection_eval.py
+[start] 2026-09-24 02:54:33    
+data: 3000 bars 2014-05-23 -> 2026-09-18; outer=3y train/1y test/9 folds; baseline window=3000 bars end<=2026-09-18
+
+--- replay 正确性校验 ---
+  B2 H0.08/C3 outer fold 9: daily_max_diff=0.000e+00 metric_max_diff=0.000e+00 state_diff=0.000e+00
+  replay correctness checks: PASS (all differences < 1e-9)
+
+--- 基线断言（全 PASS） ---
+Required baseline cross-checks (rounded reference values)
+  fixed v5.2: observed=+123.1%/-32.3% expected=+123.1%/-32.3% diff=0.00042982/0.00044968
+  fixed v5.1: observed=+96.5%/-31.0% expected=+96.5%/-31.0% diff=0.00002033/0.00001848
+  buy-and-hold: observed=+119.2%/-57.0% expected=+119.2%/-57.0% diff=0.00042195/0.00045988
+  baseline rounded-value checks: PASS
+
+--- 输出末尾 ---
+
+Reference comparison: fixed v5.2 / fixed v5.1 / buy-and-hold
+
+Fixed references
+configuration                         no-interest total/CAGR/MDD/Calmar                 with-interest total/CAGR/MDD/Calmar
+fixed v5.2                             +123.1%/   +9.3%/  -32.3%/0.288        +142.5%/  +10.3%/  -29.8%/0.348
+fixed v5.1                              +96.5%/   +7.8%/  -31.0%/0.251        +116.1%/   +8.9%/  -28.3%/0.316
+buy-and-hold                           +119.2%/   +9.1%/  -57.0%/0.160        +119.2%/   +9.1%/  -57.0%/0.160
+B1 conclusion: 嵌套 OOS 不优于固定 v5.2，不建议启用
+B2 conclusion: 嵌套 OOS 不优于固定 v5.2，不建议启用
+
+A direct answer: NO; no inner selection criterion dominates fixed v5.2 on both return and MDD.
+All displayed returns/MDDs are computed from this run; no full-sample best candidate was used for the nested conclusions.
+runtime_seconds=25.326 target_under_900s=PASS
+[exit_code] 0
+[end] 2026-09-24 02:55:00    
+
+（完整输出见 .fix_report/F1_full_output.txt；脚本日志同时写入 logs/nested_selection_eval_20260920.log）
