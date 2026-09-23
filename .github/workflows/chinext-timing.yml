@@ -60,8 +60,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-cloud.txt
 
-      - name: 运行单元测试门禁
-        run: python -m pytest tests/test_chinext_timing.py tests/test_chinext_factors.py tests/test_chan_light.py -q --no-header -p no:cacheprovider
+      - name: 运行单元测试门禁（tests/ 全量 unit）
+        env:
+          # dummy 推送后端：real_time_push.py:3437 在无 PUSHPLUS_TOKEN/WECOM_WEBHOOK
+          # 时 raise，部分用例依赖该变量。显式 dummy 而非依赖 secrets，
+          # 保证 secrets 未配置（如 fork）时门禁仍可运行且行为确定。
+          PUSHPLUS_TOKEN: dummy
+        run: python -m pytest tests/ -q -m unit --no-header -p no:cacheprovider
 
       - name: 恢复数据缓存（新浪全量日线）
         uses: actions/cache@v4
