@@ -22,7 +22,10 @@ def test_load_cy50_pe_refreshes_stale_cache(monkeypatch, tmp_path):
     """PE 缓存末根过期时必须重拉免费源，不得直接沿用旧估值。"""
     cache = tmp_path / "strategy_cache" / "cy50_pe_cache.json"
     cache.parent.mkdir(parents=True)
-    stale_day = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    # _cache_is_fresh 的 max_lag_days=3 按 A 股**工作日**计数（data_freshness.is_recent_data_date,
+    # calendar="cn"），不是自然日。取 30 自然日：最长春节连休约 9 天假期，30 天内仍必有
+    # >3 个工作日，恒为陈旧。原 6 自然日在中秋/国庆连休后只跨 3 个工作日，会被误判为新鲜。
+    stale_day = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     cache.write_text('{"rows": {"%s": 88.0}}' % stale_day, encoding="utf-8")
     fresh_day = datetime.now().strftime("%Y-%m-%d")
     monkeypatch.setattr(
@@ -35,7 +38,8 @@ def test_load_cy50_pe_refreshes_stale_cache(monkeypatch, tmp_path):
 
 def test_load_cy50_pe_rejects_stale_live_response(monkeypatch, tmp_path):
     """乐咕接口返回旧估值时不得缓存并参与当日信号。"""
-    stale_day = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    # 同上：30 自然日保证跨过 >3 个工作日，恒为陈旧，不受中秋/国庆/春节连休影响。
+    stale_day = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     monkeypatch.setattr(
         "akshare.stock_index_pe_lg",
         lambda **_kwargs: pd.DataFrame({"日期": [stale_day], "滚动市盈率": [22.5]}),
