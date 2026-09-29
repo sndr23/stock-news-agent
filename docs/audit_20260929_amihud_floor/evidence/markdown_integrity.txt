@@ -1,0 +1,8 @@
+0_method.md OK UTF-8 chars=1619
+A_caliber_symmetry.md OK UTF-8 chars=1726
+B_event_study.md OK UTF-8 chars=1771
+C_backtest_compare.md OK UTF-8 chars=2786
+D_overfit.md OK UTF-8 chars=1442
+E_lookahead.md OK UTF-8 chars=1554
+SUMMARY.md OK UTF-8 chars=2350
+PASS: 7 Markdown files read back; no repeated question-mark sequence in output files

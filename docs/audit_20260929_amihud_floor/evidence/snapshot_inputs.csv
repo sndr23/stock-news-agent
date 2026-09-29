@@ -1,0 +1,3 @@
+date,captured_at,capture_time_type,source,close,amount_shares,amount_unit
+2026-09-28,2026-09-28T16:39:26+08:00,local_observation_time,sina_volume,3139.825,15016674360.0,shares
+2026-09-29,2026-09-29T14:46:13+08:00,local_request_time,tencent_realtime,3145.02,11803505700.0,shares

@@ -1,0 +1,16 @@
+{
+  "market_source": ".bt_report/evidence/market_399006_sina_3000.csv",
+  "market_copy": "evidence/market_399006_sina_3000.csv",
+  "market_sha256": "fdb7097fe6029169bb8531ad48c226be101e3789abb8adaf3cc8e888ed450483",
+  "source_snapshot_stdout": ".audit_report/evidence/run_audit_stdout.txt (UTF-16LE decoded read-only)",
+  "market_rows": 3000,
+  "first_date": "2014-06-03",
+  "last_date": "2026-09-29",
+  "snapshot_rows": 2,
+  "snapshot_modifier_dates": [
+    "2026-09-28",
+    "2026-09-29"
+  ],
+  "dotenv_loader_called": false,
+  "network_requested": false
+}

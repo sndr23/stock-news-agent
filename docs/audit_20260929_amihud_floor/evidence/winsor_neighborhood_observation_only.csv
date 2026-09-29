@@ -1,0 +1,4 @@
+variant,winsor_low_pct,winsor_high_pct,cumulative_return,sharpe,max_drawdown,calmar,position_changes,adoption_status,rank_cumulative_return,rank_sharpe,rank_calmar
+B_3_97,3,97,1.7635735003127828,0.7417763303582899,-0.3121932205579344,0.45225504247289644,220,observation_only_not_adopted,1,1,1
+B_5_95,5,95,1.7281589594103641,0.7337310210494553,-0.3121932205579344,0.44613473099508766,220,observation_only_not_adopted,2,2,2
+B_10_90,10,90,1.5814040493892598,0.7007051462084484,-0.32307105708026485,0.4058702572850798,217,observation_only_not_adopted,3,3,3

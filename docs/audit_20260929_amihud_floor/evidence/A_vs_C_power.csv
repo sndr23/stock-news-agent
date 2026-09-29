@@ -1,0 +1,2 @@
+n_days,mean_A_minus_C_daily,annualized_mean_A_minus_C,hac_lag_days,hac_se_daily_mean,hac_p_two_sided_normal,approx_power_for_observed_effect,mde_80pct_annualized
+1878,1.819562643765378e-06,0.00044397328507875223,20,3.195289453092079e-06,0.5690497179017465,0.08789930130950216,0.0021842576706475095

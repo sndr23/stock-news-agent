@@ -1,0 +1,5 @@
+date,mode,core,expected,delta,pass_pm_0_005
+2026-09-28,full_day,-0.77,-0.77,0.0,True
+2026-09-29,full_day,-0.55,-0.55,0.0,True
+2026-09-28,retained_snapshot,-0.77,-0.77,0.0,True
+2026-09-29,retained_snapshot,-0.555,-0.555,0.0,True
