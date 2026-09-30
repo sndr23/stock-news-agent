@@ -283,11 +283,19 @@ def test_decide_hold_clears_pending():
 
 
 def test_hysteresis_band_blocks_threshold_jitter():
-    """分数在满仓线 0.30 下方 0.05 处震荡：原逻辑立即降档，滞回带内维持。"""
+    """分数在满仓线下方 HYST_MARGIN 处震荡：原逻辑立即降档，滞回带内维持。
+
+    边界随生产 HYST_MARGIN 派生（2026-09-30 由 0.05 改为 0.10，用户拍板）。
+    本用例验证的语义——带内维持、明确跌破才降档——未随参数改变；
+    仅边界分数随之从 0.25/0.24 移到 0.20/0.19。
+    """
+    edge = ct.TIERS[0][0] - ct.HYST_MARGIN  # 降档有效线 = 满仓线 - 滞回带
     prev = {"position": 1.0, "pending": None}
-    d = ct.decide_position(0.28, 1.0, prev)  # 0.28 ∈ [0.25, 0.30) → 维持满仓
+    d = ct.decide_position(edge + 0.08, 1.0, prev)  # 带内上方 → 维持满仓
     assert not d["changed"] and d["position"] == 1.0
-    d2 = ct.decide_position(0.24, 1.0, prev)  # 明确跌破 0.25 → 降九成
+    d_mid = ct.decide_position(edge + 0.04, 1.0, prev)  # 带内（距线 0.04 < 0.10）→ 维持
+    assert not d_mid["changed"] and d_mid["position"] == 1.0
+    d2 = ct.decide_position(edge - 0.01, 1.0, prev)  # 明确跌破 → 降九成
     assert d2["changed"] and d2["position"] == 0.9
 
 
