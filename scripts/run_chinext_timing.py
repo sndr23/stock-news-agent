@@ -616,10 +616,20 @@ def update_shadow_history(state: dict, ctx: dict, today: str, score: float,
                  "cap": caps_d.get("cap"), "cap_triggers": caps_d.get("triggers") or [],
                  "chan_bustop": bool(chan_d_dict.get("bustop")),
                  "chan_last_signal": chan_d_dict.get("last_signal"),
-                 "sig": {k: sig_all.get(k) for k in
-                         ("trend_ma20_60", "volprice_quadrant", "vol_regime",
-                          "pullback_52w", "dd60")},
-                 "probe": _shadow_probes(ctx, res)})
+                 # 2026-09-30：白名单由 5 项扩到全部 9 个注册因子 + 顶层
+                                  # amihud/quadrant 别名。原白名单只存 5 项，导致
+                                  # 私有库 chinext-timing 的 scripts/compare_daily_signal.py
+                                  # 9 因子比对永远 MISSING_DATA —— 私有库产得出、本库存不下，
+                                  # 双跑逐位一致无法验证。与私有库同一改动，两库必须同步。
+                                  # 取值与 core["signals"] 同源，保证两库比对同一口径。
+                                  "sig": {k: sig_all.get(k) for k in
+                                          ("trend_ma20_60", "trend_momentum_60",
+                                           "volprice_quadrant", "volprice_amihud",
+                                           "vol_regime", "vol_term", "value_erp",
+                                           "pullback_52w", "dd60")},
+                                  "amihud": sig_all.get("volprice_amihud"),
+                                  "quadrant": sig_all.get("volprice_quadrant"),
+                                  "probe": _shadow_probes(ctx, res)})
     state["history"] = hist[-HISTORY_LIMIT:]
 
 
