@@ -1328,12 +1328,15 @@ def _policy_direction_conflict(ta: str, tb: str) -> bool:
 
     _title_direction_conflict 的涨跌表不含"加息/降息"（"加息"无"涨/升"字、
     "降息"含"降"但不含"跌"），对货币政策方向对立识别失效，需单独守卫。
+    只有双方各自只表达一个相反方向时才拒绝合并；同一标题同时描述先加息再降息
+    等情形属于混合表态，不足以证明两条报道方向对立。
     """
     hawk_a = any(w in ta for w in _POLICY_HAWK_WORDS)
-    dove_b = any(w in tb for w in _POLICY_DOVE_WORDS)
     dove_a = any(w in ta for w in _POLICY_DOVE_WORDS)
     hawk_b = any(w in tb for w in _POLICY_HAWK_WORDS)
-    return (hawk_a and dove_b) or (dove_a and hawk_b)
+    dove_b = any(w in tb for w in _POLICY_DOVE_WORDS)
+    return ((hawk_a and not dove_a and dove_b and not hawk_b)
+            or (dove_a and not hawk_a and hawk_b and not dove_b))
 
 
 class _SameEventCtx(NamedTuple):
