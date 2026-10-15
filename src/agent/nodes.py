@@ -24,7 +24,9 @@ try:
 except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
     # 极简消息占位：仅承载 content，匹配 AIMessage 的构造/读取接口即可
     from collections import namedtuple
-    AIMessage = lambda content="", **kw: namedtuple("AIMessage", "content")(content=content)
+
+    def AIMessage(content="", **kw):
+        return namedtuple("AIMessage", "content")(content=content)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 from src.llm_client import _call_llm_api, _repair_json, _safe_parse_json  # noqa: F401
 from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
 from src.tools.data_fetchers import get_stock_news, get_announcements, get_market_signals, dedup_news_3layer
-from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, SECTOR_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display, _has_tech_keyword, _TECH_ENGLISH_WORDS
+from src.tools.calculators import rank_news, predict_direction_by_rules, infer_sectors_by_rules, score_news_relevance, TECH_HARDWARE_KEYWORDS, _load_watchlist, is_leader_or_high_impact, _is_self_only_individual_stock, dedup_and_cap_for_display, _has_tech_keyword, _TECH_ENGLISH_WORDS
 from src.tools.data_fetchers import get_hs300_constituents
 # 高信号关键词表已收敛至共享模块（与实时推送脚本共用单一事实来源，避免漂移）
 from src.tools.keyword_tables import HIGH_SIGNAL_KEYWORDS
@@ -1526,7 +1528,7 @@ def _llm_adjust_scores(ranked_news: list, top_n: int = 20, deadline: float = 0) 
         # 重新计算 total_score（复用 _calc_continuous_score + confidence 加权）
         from src.tools.data_fetchers import get_hs300_constituents
         from src.tools.calculators import (
-            _calc_continuous_score, CONFIDENCE_WEIGHT, BAND_PRIORITY, SCOPE_SCORE_BOOST,
+            _calc_continuous_score, CONFIDENCE_WEIGHT,
         )
         hs300 = get_hs300_constituents()
 

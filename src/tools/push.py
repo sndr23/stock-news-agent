@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 from src.tools.calculators import (
     dedup_ranked_by_event,
     _event_signature,
-    _EVENT_KEYWORD_GROUPS,
     dedup_and_cap_for_display,
     dedup_ranked_by_title,
     _extract_title_core,

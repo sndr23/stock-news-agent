@@ -18,7 +18,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL, IS_OPENROUTER_OFFICIAL
+from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL_NAME, OPENROUTER_BASE_URL
 
 
 def _build_llm_model_chain() -> list:

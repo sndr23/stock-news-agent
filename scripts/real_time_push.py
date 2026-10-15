@@ -129,7 +129,6 @@ from src.tools.keyword_tables import (                      # 共享关键词表
     OVERSEAS_SOURCE_MARKERS,
     TECH_SECTOR_WORDS_WIDE,     # 2026-08-19: 国内降级判定宽词表（原本地 _TECH_SECTOR_WORDS 收编）
     has_signal_keyword,        # 2026-08-06: 词边界感知的信号词匹配（ST/IPO 防误命中）
-    find_signal_keywords,      # 返回命中的信号词列表（事件指纹 sig 路径用）
     find_signal_fp_keywords,   # 2026-08-07: 指纹专用信号词（排除宽泛市场词，防跨事件指纹合并）
     has_overseas_tech_keyword, # 2026-08-13: 词边界感知的外围科技词匹配（AI 不误命中 DUBAI）
 )
@@ -4330,7 +4329,7 @@ def run_evening_review(dry_run: bool = False, on_date: str = None) -> dict:
     bull = sum(1 for pe in today_events if pe.get("dir") == "bullish")
     bear = sum(1 for pe in today_events if pe.get("dir") == "bearish")
     if today_events:
-        lines.append(f"### 方向分布")
+        lines.append("### 方向分布")
         lines.append("")
         lines.append(f"- 利好 {bull} 条｜利空 {bear} 条｜未标注 {len(today_events) - bull - bear} 条")
         # 板块热度 Top3（2026-09-01：先归一再计数，同分用板块名做二级排序键。
@@ -4375,7 +4374,6 @@ def run_evening_review(dry_run: bool = False, on_date: str = None) -> dict:
 
 def _is_trading_day(day=None) -> bool:
     """A股交易日判断（RT_ALWAYS_ON=0 时启用）。"""
-    from datetime import date
     return _is_workday(day or datetime.now(BJT).date(), "cn")
 
 

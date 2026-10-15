@@ -1,7 +1,6 @@
 # filepath: tests/test_adaptive_quota.py
 """测试 _adaptive_quota 自适应配额分配"""
 import pytest
-from unittest.mock import patch
 from src.agent.nodes import _adaptive_quota, _PREFILTER_TOTAL_LIMIT, _PREFILTER_MIN_QUOTA
 
 

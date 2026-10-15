@@ -28,7 +28,8 @@ except ImportError:  # pragma: no cover - 仅无 langchain 的云端环境触发
             return self.func(*args, **kwargs)
         def invoke(self, *args, **kwargs):
             return self.func(*args, **kwargs)
-    tool = lambda f: _ToolStub(f)
+    def tool(f):
+        return _ToolStub(f)
 
 logger = logging.getLogger(__name__)
 

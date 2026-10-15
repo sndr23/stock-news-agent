@@ -1,7 +1,7 @@
 # filepath: tests/test_push.py
 """测试推送模块：格式化 + 截断 + top_n 校验"""
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from src.tools.push import (
 
     format_ranked_news_md,

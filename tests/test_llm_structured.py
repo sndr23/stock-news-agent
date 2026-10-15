@@ -3,7 +3,6 @@ import pytest
 """测试 LLM 结构化输出构建与降级逻辑（mock LLM，不发真实请求）"""
 from unittest.mock import patch, MagicMock
 from src.agent.nodes import _build_analysis_prompt, _llm_analyze_batch_structured, _normalize_llm_item
-from src.schemas import NewsAnalysisItem, ImpactBand, Confidence
 
 
 

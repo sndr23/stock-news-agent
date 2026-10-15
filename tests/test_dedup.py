@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timedelta
 from src.tools.data_fetchers import (
     _normalize_url, _simhash, _hamming, _in_news_window,
-    dedup_news_3layer, NO_DATA_SENTINEL, BJT,
+    dedup_news_3layer, BJT,
 )
 
 
