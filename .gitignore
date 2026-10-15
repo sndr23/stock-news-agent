@@ -69,3 +69,6 @@ strategy_cache/
 
 # 外部工具残留（系统缓存副本，非项目代码）
 %SystemDrive%/
+
+# 修复轮运行输出/调试证据包（可重建，不入库）
+.fix_report/
