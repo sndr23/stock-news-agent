@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,7 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts._event_study import (  # noqa: E402
     load_cyb_closes, trading_days, _earliest_trading_day,
-    summarize_group, spearman_ic, _tstat, _mannwhitney_u)
+    summarize_group, spearman_ic, _mannwhitney_u)
 
 LHB_NET_BUY_MIN = 30000000  # 机构净买入 ≥ 3000万（与生产 data_fetchers 同口径）
 LHB_NET_SELL_MIN = -30000000  # 机构净卖出 ≤ -3000万

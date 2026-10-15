@@ -1587,7 +1587,7 @@ class TestHeartbeatAndCache:
         loaded = df._hs300_load_cache()
         assert loaded == {"codes": {"000001"}, "names": {"平安银行"}}
         # 过期
-        import json, time
+        import json
         p = tmp_path / "hs300_cache.json"
         data = json.loads(p.read_text(encoding="utf-8"))
         data["_mtime"] = 0
@@ -2111,7 +2111,6 @@ class TestMacroPolicyPriority:
 
     def test_overflow_sort_macro_first(self):
         """同命中高信号词时，宏观/政策类排在前（防存储行情挤出宏观）"""
-        import types
         cands = [
             {"title": "港股存储概念走强 南方两倍做多三星电子涨16.87%",
              "_hit_signal": True, "_pref_score": 0.9},

@@ -1,8 +1,6 @@
 # filepath: tests/test_fix_regression.py
 """修复回归测试：P0 词边界 / P1 cluster_weight 聚类 / P1 market 加成 / P2 confidence 惩罚"""
 import pytest
-from unittest.mock import patch
-from src.tools import data_fetchers
 from src.tools.calculators import (
 
     _has_tech_keyword, rank_news, CONFIDENCE_WEIGHT, SCOPE_SCORE_BOOST,

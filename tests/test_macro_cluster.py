@@ -7,7 +7,7 @@ import pytest
 """
 from src.tools.calculators import (
 
-    dedup_macro_clusters, dedup_and_cap_for_display, _macro_cluster_key,
+    dedup_macro_clusters, _macro_cluster_key,
 )
 
 

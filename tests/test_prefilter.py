@@ -4,7 +4,6 @@ import pytest
 from src.tools.calculators import (
 
     score_news_relevance, _is_official_source,
-    _COMPANY_EVENT_TERMS, _SECTOR_NEWS_TERMS, _MACRO_NEWS_TERMS,
 )
 
 

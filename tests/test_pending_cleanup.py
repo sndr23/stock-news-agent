@@ -1,7 +1,5 @@
 """Verify pending retry-cap cleanup runs in the periodic save path (not just overflow loop)."""
 from datetime import datetime
-from pathlib import Path
-from unittest.mock import patch
 
 import scripts.real_time_push as rtp
 

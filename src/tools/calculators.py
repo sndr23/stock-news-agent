@@ -381,23 +381,29 @@ def score_news_relevance(item: dict, stock_code: str = "", stock_name: str = "")
 
     if stock_code:
         if stock_code in title:
-            score += 55; direct_signal += 55
+            score += 55
+            direct_signal += 55
         elif stock_code in content:
-            score += 34; direct_signal += 34
+            score += 34
+            direct_signal += 34
         elif stock_code in url:
-            score += 18; direct_signal += 18
+            score += 18
+            direct_signal += 18
 
     if stock_name:
         if stock_name in title:
-            score += 45; direct_signal += 45
+            score += 45
+            direct_signal += 45
         elif stock_name in content:
-            score += 28; direct_signal += 28
+            score += 28
+            direct_signal += 28
 
     # 事件词加分：有 direct_signal 时按设计 +12；无 direct_signal（纯资讯流）时降为 +6
     # 避免高频词（涨停/跌停）过度加分，但保留有价值的事件信号
     if any(t in text for t in _COMPANY_EVENT_TERMS):
         if direct_signal > 0:
-            score += 12; direct_signal += 12
+            score += 12
+            direct_signal += 12
         else:
             score += 6
 
