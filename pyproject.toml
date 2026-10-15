@@ -1,0 +1,5 @@
+# Ruff 静态检查配置（工程化安全网，不涉及业务逻辑）
+# 仅存量统计与后续增量拦截用；本 PR 不自动修复任何违规。
+[tool.ruff]
+line-length = 100
+target-version = "py311"
