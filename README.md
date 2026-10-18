@@ -4,9 +4,9 @@
 
 ## 快速开始
 
-- **系统概览与工程现状**：见 [docs/项目深度分析_20260908.md](docs/项目深度分析_20260908.md)
+- **系统概览与工程现状**：量化相关深度分析报告已随量化层迁至私有库；本库现状见 [docs/roadmap.md](docs/roadmap.md) 与 [docs/development-plan.md](docs/development-plan.md)
 - **实时资讯推送入口**：`python scripts/real_time_push.py`（单次）/ `--loop`（本地常驻）/ `--dry-run`（诊断）
-- **其余生产入口**（量化因子采集 / 信号回测 / 中信持仓日报）：见下表模块「状态」列
+- **量化择时相关入口**（因子采集 / 仓位信号 / 回测 / 中信持仓日报）：已迁至私有库 `sndr23/chinext-timing`
 - **云端调度**：cron-job.org 每 30 分钟触发 GitHub Actions（`.github/workflows/realtime-push.yml`）
 
 ## 架构
@@ -35,9 +35,7 @@
 | `src/agent/` | LangGraph 批处理管线（历史汇总报告引擎） | ⚠️ DEPRECATED，无生产入口 |
 | `daily-review/` | 每日技术面复盘报告（本地生成 HTML） | ⚠️ 独立辅助功能，不入库 |
 
-> **量化择时系统已迁移**：创业板择时（E1 无掩码生产版）现维护于私有库 `sndr23/chinext-timing`，本库仅保留资讯管线依赖的共享工具（`src/strategy/{data,data_freshness,state_io}.py`）。
-
-> **量化择时系统已迁移**：创业板择时（E1 无掩码生产版）现维护于私有库 `sndr23/chinext-timing`，本库仅保留资讯管线依赖的共享工具（`src/strategy/{data,data_freshness,state_io}.py`）。
+> **量化择时系统已迁移（2026-10-15 切换完成）**：创业板择时（E1 无掩码生产版）现维护于私有库 `sndr23/chinext-timing`，本库仅保留资讯管线依赖的共享工具（`src/strategy/{data,data_freshness,state_io}.py`）。
 
 ## 定时推送全景（当前生效）
 
@@ -45,14 +43,12 @@
 |---|---|---|
 | 08:45 | 盘前简报 | market-brief |
 | 盘中×N | 实时资讯（每30分钟） | realtime-push |
-| 盘中×N | 因子采集（盘中15分钟；GitHub schedule 14:15 兜底） | realtime-factor |
-| **14:45** | **创业板仓位信号** | **chinext-timing** |
 | 15:10 | 盘后复盘 | market-brief |
-| 17:00 | 中信持仓日报 | citic-pos-push |
-| 手动 | 信号质量回测 | signal-backtest |
-| 周日 | 创业板择时质量周报 | chinext-timing-quality |
 
 > 已停用：~~strategy-daily（18:00 选股策略日报）~~
+>
+> **已迁出（2026-10-15 切换完成）**：创业板仓位信号（14:45）、因子采集、中信持仓日报、
+> 信号质量回测、择时质量周报等择时链路 workflow 已随量化层迁至私有库 `sndr23/chinext-timing`，本库不再承载。
 
 ## 关键设计
 
@@ -63,10 +59,6 @@
 - **状态并发安全**：Gist 读-改-写合并，本地与云端并发不互相覆盖
 - **词边界匹配**：ST/IPO 等英文缩写词边界感知，防 STorage/nAMD 误命中（2026-08-06）
 - **红涨绿跌**：A 股惯例配色 + emoji 表达方向
-
-> 准点调度说明：realtime-factor 以 cron-job.org 为主触发，GitHub schedule 在 14:15 提供因子采集
-> 兜底；chinext-timing 继续只由 cron-job.org 在 14:45 准点触发。创业板信号不能提前 schedule，
-> 否则会先写入 `last_date`，抢跑并抑制正常的 14:45 信号；外部服务失联时需人工恢复或手动触发。
 
 ## 工程审查台账（2026-08-22 第三轮核查结论）
 
@@ -84,7 +76,7 @@
 PUSHPLUS_TOKEN=dummy python -m pytest tests/ -q -m "unit" -p no:cacheprovider   # 当前工作区 1394 passed, 15 deselected
 ```
 
-测试需提供 `PUSHPLUS_TOKEN=dummy`（或 `WECOM_WEBHOOK`）：`scripts/real_time_push.py:3437` 在无推送后端时抛错，部分用例依赖该环境变量。
+测试需提供 `PUSHPLUS_TOKEN=dummy`（或 `WECOM_WEBHOOK`）：`scripts/real_time_push.py` 在无推送后端时抛错，部分用例依赖该环境变量。
 
 CI 已接入全量 unit 测试门禁（`python -m pytest tests/ -q -m unit`，step env 提供 `PUSHPLUS_TOKEN=dummy`），防止重构/依赖升级回归。
 
