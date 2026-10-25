@@ -24,3 +24,16 @@ def _isolate_strategy_cache(tmp_path, monkeypatch):
     cache_dir = tmp_path / "strategy_cache"
     monkeypatch.setattr(sdata, "CACHE_DIR", cache_dir)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _disable_quiet_hours_by_default(monkeypatch):
+    """P1-2（2026-10-26）：默认关闭时段静默，保证门禁与运行时刻无关。
+
+    静默窗按北京时间挂钟判定（周末全天 / 每日 21:30–08:00），不隔离的话
+    同一批 run_once 用例白天绿、夜间红（实测凌晨跑 20 个推送用例转红）。
+    专项用例自行 monkeypatch.setenv("RT_QUIET_HOURS", "1") 并冻结 datetime
+    复现静默窗，此处只提供确定性默认值。
+    """
+    monkeypatch.setenv("RT_QUIET_HOURS", "0")
+    yield

@@ -253,6 +253,19 @@ PREFILTER_SCORE_MIN = 0.55
 # 单轮进入 LLM 判定的候选条数上限（防止突发大行情时候选激增拖慢/超时）
 MAX_CANDIDATES_PER_ROUND = 40
 
+# P1-1 相关性加权（2026-10-26）：只用于候选溢出排序，不放宽预筛入口。
+# 用户持仓集中在 CPO 光模块 / PCB 覆铜板 / 元器件链，关心科技产业链景气；
+# 候选溢出时同业链条目应优先于海外地缘/宏观叙事。
+_CHAIN_KEYWORDS = (
+    "CPO", "光模块", "光通信", "光芯片", "PCB", "覆铜板", "铜箔", "玻纤",
+    "电子布", "存储", "HBM", "DRAM", "NAND", "MLCC", "算力", "数据中心",
+    "液冷", "AI芯片",
+)
+_RELEVANCE_WATCH_BONUS = 0.25    # 命中 watchlist 个股名
+_RELEVANCE_CHAIN_STEP = 0.05     # 产业链词每词加分
+_RELEVANCE_CHAIN_CAP = 0.15      # 产业链词加分封顶
+_RELEVANCE_MAX = 0.40            # 相关性总分上限
+
 _NOISE_LEADER_WHITELIST = (
     "中际旭创", "寒武纪", "宁德时代", "新易盛", "天孚通信", "源杰科技",
     "生益科技", "南亚新材", "鼎泰高科", "中国巨石", "风华高科", "英伟达",
@@ -1134,6 +1147,53 @@ def _prefilter(news: dict) -> tuple:
     return float(score), hit
 
 
+def _relevance_bonus(title: str, content: str, watch_names) -> float:
+    """P1-1 相关性加分（2026-10-26）：只影响候选溢出排序，不放宽预筛入口
+
+    口径：
+    - watchlist 个股名命中（watch_names 即 leader_watchlist）→ +0.25（命中一次即止）
+    - 产业链词表 _CHAIN_KEYWORDS 每命中一词 +0.05，封顶 +0.15
+    - 总分封顶 0.40
+
+    背景：用户持仓集中在 CPO 光模块 / PCB 覆铜板 / 元器件链，候选溢出时
+    同产业链条目的信息价值高于海外地缘/宏观叙事。本函数只在 _prefilter 通过
+    之后给 n["_relevance"] 赋值，PREFILTER_SCORE_MIN 判定逻辑完全不变。
+    """
+    text = f"{str(title or '')} {str(content or '')}"
+    bonus = 0.0
+    for name in watch_names or ():
+        if name and str(name) in text:
+            bonus += _RELEVANCE_WATCH_BONUS
+            break
+    chain_hits = sum(1 for kw in _CHAIN_KEYWORDS if kw in text)
+    bonus += min(chain_hits * _RELEVANCE_CHAIN_STEP, _RELEVANCE_CHAIN_CAP)
+    return round(min(bonus, _RELEVANCE_MAX), 4)
+
+
+def _candidate_sort_key(x: dict) -> tuple:
+    """候选择优排序键（P1-1 2026-10-26 四层改造，溢出截断时用）
+
+    层序：高信号 > 宏观数据发布 > 相关性(_relevance) > 截断/标题实质版 > 预筛分
+
+    2026-08-12 修复初衷保留：CPI/非农等"确定性数据发布"仍在第二层，溢出时
+    不被科技噪声挤掉。区别是第二层从 `_is_macro_policy`（含地缘/战争/关税/
+    制裁等海外叙事词）收窄为 `_is_macro_data_release`——地缘/海外宏观（非数据
+    发布）失去第二优先级，与普通条目一起按相关性与预筛分竞争 40 个坑位。
+    第三层 _relevance 由 _relevance_bonus 在预筛通过后写入（持仓/产业链加权）。
+    第 4/5 层沿用 2026-09-07 标题党治理结论：截断标题下沉、实质版优先，
+    作为相关性同分时的次序，不逆转前三层。
+    """
+    text = f"{x.get('title', '')} {x.get('content', '')}"
+    return (
+        1 if x.get("_hit_signal") else 0,
+        1 if _is_macro_data_release(text) else 0,
+        float(x.get("_relevance") or 0.0),
+        1 if not x.get("_truncated") else 0,
+        _headline_quality(x),
+        x["_pref_score"],
+    )
+
+
 
 
 
@@ -1806,6 +1866,73 @@ def _ingest_announcements(announces: list, watchlist: set, state: dict,
 
 
 # ============================================================
+# P1-2 时段静默（2026-10-26）
+# ============================================================
+# 用户口径：反对周末/夜间推送轰炸；但持仓公告、确定性宏观数据、硬经营事件、
+# 高分利空（风险提醒）必须照常送达。静默只挡"过时即无价值"的播报/软资讯。
+# 静默窗（北京时间）：每日 21:30–次日 08:00（跨午夜）、周六周日全天。
+# 开关：RT_QUIET_HOURS=0 完全关闭，回到 P1-2 之前的现行为（默认开启）。
+_QUIET_START_MIN = 21 * 60 + 30   # 21:30
+_QUIET_END_MIN = 8 * 60           # 08:00
+
+
+def _quiet_hours_enabled() -> bool:
+    """时段静默是否开启（RT_QUIET_HOURS，默认 1=开启；0/false/no/off 关闭）"""
+    raw = os.getenv("RT_QUIET_HOURS", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _quiet_hours_window(now: datetime | None = None) -> str:
+    """当前是否处于静默窗，返回窗描述（""=非静默窗）
+
+    周末判定 weekday()>=5；夜间用"当日分钟数"比较，跨午夜区间不漏
+    21:30–22:00（整数小时写法 8<=h<21.5 会漏掉该半小时）。
+    """
+    now = now or datetime.now(BJT)
+    if now.weekday() >= 5:
+        return "周末静默"
+    mins = now.hour * 60 + now.minute
+    if mins >= _QUIET_START_MIN or mins < _QUIET_END_MIN:
+        return "夜间静默(21:30-08:00)"
+    return ""
+
+
+def _quiet_hours_exempt_reason(news: dict, judge: dict,
+                               watch_direct: bool = False) -> str:
+    """静默窗放行条件，返回放行理由（""=不放行）
+
+    1. watch_direct（持仓公告直通）
+    2. 宏观数据发布（CPI/非农/利率决议等确定性数据）
+    3. 大额经营事件（金额/订单/公告类硬事件）
+    4. 强利空且 score>=7（风险类提醒静默期仍送达）
+    """
+    if watch_direct:
+        return "持仓公告直通"
+    text = f"{news.get('title', '')} {news.get('content', '')}"
+    if _is_macro_data_release(text):
+        return "宏观数据发布"
+    if _is_major_deal_event(text):
+        return "硬事件"
+    if (str(judge.get("direction") or "") == "bearish"
+            and _to_float(judge.get("score", 0)) >= 7):
+        return "高分利空"
+    return ""
+
+
+def _quiet_hours_block_reason(news: dict, judge: dict, watch_direct: bool = False,
+                              now: datetime | None = None) -> str:
+    """静默窗拦截判定：返回静默窗描述（""=放行/非静默窗/开关关闭）"""
+    if not _quiet_hours_enabled():
+        return ""
+    window = _quiet_hours_window(now)
+    if not window:
+        return ""
+    if _quiet_hours_exempt_reason(news, judge, watch_direct):
+        return ""
+    return window
+
+
+# ============================================================
 # 主流程：单次执行
 # ============================================================
 def run_once(dry_run: bool = False) -> dict:
@@ -1935,6 +2062,11 @@ def run_once(dry_run: bool = False) -> dict:
             logger.info(f"截断标题进入候选并降权: {str(n.get('title', ''))[:40]}")
         pref_score, hit = _prefilter(n)
         n["_pref_score"] = pref_score
+        # P1-1（2026-10-26）：相关性加分只存字段供溢出排序，不参与下面的
+        # PREFILTER_SCORE_MIN 判定——预筛入口不放宽。
+        n["_relevance"] = _relevance_bonus(
+            str(n.get("title", "") or ""), str(n.get("content", "") or ""),
+            leader_watchlist)
         # watchlist 公告直通（2026-09-07 P1）：跳过预筛竞争，等同高信号
         # （候选恒进入 + 溢出排序恒优先）
         if n.get("_watch_announce"):
@@ -2160,6 +2292,22 @@ def run_once(dry_run: bool = False) -> dict:
             if cand is not None:
                 cand["gate"] = "threshold"
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
+            skipped += 1
+            continue
+
+        # P1-2 时段静默（2026-10-26）：周末全天 / 每日 21:30–08:00 只放行
+        # 持仓公告直通、宏观数据发布、大额经营事件、强利空(score>=7)；
+        # 其余（播报/软资讯）不推、写 seen 但**不进 pending**——静默期被丢的是
+        # 过时即无价值的播报/软资讯，挂起只会在周一早晨重复涌出。
+        # 位置：噪声/阈值之后（只挡本可推送的条目）、risk_off 同层、日限额之前；
+        # 不改变 LLM 判定与上方 candidate_events 的记录完整性（gate 可复核）。
+        quiet_reason = _quiet_hours_block_reason(n, j, watch_direct)
+        if quiet_reason:
+            logger.info(f"静默时段不推({quiet_reason})，不推: {n.get('title', '')[:40]}")
+            if cand is not None:
+                cand["gate"] = "quiet_hours"
+            seen[n["_fp"]] = {"t": now, "pushed": False,
+                              "title": str(n.get("title", ""))[:52] + "[静默时段不推]"}
             skipped += 1
             continue
 

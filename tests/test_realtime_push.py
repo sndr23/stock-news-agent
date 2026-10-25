@@ -3222,8 +3222,13 @@ class TestHeadlineQuality0907:
         assert rtp._candidate_sort_key(neutral) > rtp._candidate_sort_key(emotional)
 
     def test_sort_key_keeps_signal_macro_priority(self):
-        """高信号/宏观层级仍优先于实质版（不逆转既有分层）"""
-        macro = {"title": "普通标题", "content": "央行 降准",
+        """高信号/宏观数据层级仍优先于实质版（不逆转既有分层）
+
+        P1-1（2026-10-26）：溢出排序第二层由 _is_macro_policy 收窄为
+        _is_macro_data_release（地缘/海外宏观叙事不再占第二层），故用例从
+        "央行降准"（宏观政策）改为真实的确定性数据发布。
+        """
+        macro = {"title": "美国9月CPI同比增长3%", "content": "数据公布",
                  "_hit_signal": False, "_pref_score": 1.0}
         substantive = {"title": "中际旭创拟40亿元回购股份",
                        "affected_stocks": ["中际旭创"],
