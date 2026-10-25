@@ -2265,6 +2265,20 @@ class TestPushQualityP0:
         for title in keep:
             assert rtp._is_noise_push({"title": title}, self._judge(), exempt) == "", title
 
+    def test_broadcast_exempts_price_signals(self):
+        """行业价格/供需信号（存储涨价链、覆铜板、材料）不得被播报体误杀。"""
+        keep = (
+            "内存条价格持续“狂飙”，华强北一年涨超300%",
+            "覆铜板报价上调 生益科技涨超5%",
+            "存储颗粒缺货 部分模组厂暂停接单",
+        )
+        for title in keep:
+            assert rtp._is_noise_push({"title": title}, self._judge(), set()) == "", title
+        # 纯商品/指数行情不含价格信号词，仍应拦
+        assert rtp._is_noise_push(
+            {"title": "国际金价跌约1.4%，白银跌超6%"}, self._judge(), set()
+        ) == "播报体"
+
     def test_broadcast_exempts_watchlist(self):
         title = "源杰科技盘初大跌15%"
         assert rtp._is_noise_push({"title": title}, self._judge(), {"源杰科技"}) == ""
