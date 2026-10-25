@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+BASE_ROOT = Path.home() / "AppData" / "Local" / "Temp" / "stock-news-agent-p0-base"
 DEFAULT_STATE = Path(
     r"C:/Users/mxs/AppData/Local/hermes/cache/scratch/news_audit/rt_state.json"
 )
@@ -81,7 +82,8 @@ def _count_old_rules(module, events: list[dict], watchlist: set[str]) -> Counter
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--baseline-root", type=Path)
+    parser.add_argument("--baseline-root", type=Path, default=BASE_ROOT)
+    parser.add_argument("--with-baseline", action="store_true")
     args = parser.parse_args()
 
     rtp = _load_rtp()
@@ -102,7 +104,9 @@ def main() -> int:
     }
     overlap = candidate_titles & pushed_titles
     baseline_counts = Counter()
-    old = _old_rules(args.baseline_root) if args.baseline_root else None
+    old = None
+    if args.with_baseline and args.baseline_root and args.baseline_root.exists():
+        old = _old_rules(args.baseline_root)
     if old:
         baseline_counts = _count_old_rules(old, events, watchlist)
     judge = {
@@ -158,7 +162,7 @@ def main() -> int:
             f"{title_norm}|dir={direction}|t={timestamp}|pushed="
             f"{next((x.get('pushed') for x in state.get('candidate_events') or [] if isinstance(x, dict) and x.get('title_norm') == title_norm), None)}"
         )
-    if args.baseline_root:
+    if old:
         print(f"baseline_rule_hits={sum(baseline_counts.values())}")
         for reason in sorted(baseline_counts):
             print(f"baseline_rule.{reason}={baseline_counts[reason]}")
@@ -170,13 +174,6 @@ def main() -> int:
                 rest = title
                 for marker in old._NOISE_COLUMN_MARKERS:
                     rest = rest.replace(marker, "")
-                if not (old._is_macro_data_release(rest)
-                        or old._is_major_deal_event(rest)
-                        or old._hit_headline_entity(rest)):
-                    baseline_column += int(
-                        old._is_index_move_text(rest)
-                        or old._is_intraday_move_text(rest)
-                    )
                 if not (old._is_macro_data_release(rest)
                         or old._is_major_deal_event(rest)):
                     baseline_column += int(
@@ -191,27 +188,6 @@ def main() -> int:
         print(f"baseline_static_column={baseline_column}")
         print(f"baseline_static_intraday={baseline_intraday}")
         print(f"baseline_static_total={baseline_column + baseline_intraday}")
-        remaining_static = 0
-        remaining_intraday = 0
-        for reason, title in hits:
-            if title in {
-                    "物理AI概念局部回暖 天娱数科直线涨停",
-                    "人形机器人概念反复走强 兆威机电5天3板",
-                    "南方两倍做多海力士大涨19%",
-                    "CPO概念震荡走弱 东山精密跌停",
-                    "假期要闻汇总：非农数据意外“爆冷” 美联储10月加息概率骤降",
-            }:
-                continue
-            if reason == "日报栏目":
-                remaining_static += 1
-            elif reason == "盘面异动":
-                remaining_intraday += 1
-        print(f"post_static_column_after_anchor_exception={remaining_static}")
-        print(f"post_static_intraday_after_anchor_exception={remaining_intraday}")
-        print(
-            "post_static_total_after_anchor_exception="
-            f"{remaining_static + remaining_intraday}"
-        )
     print(f"baseline_noise={baseline_noise}")
     print(f"new_noise={len(hits)}")
     print(f"pure_broadcast={baseline_broadcast}")
@@ -230,7 +206,6 @@ def main() -> int:
     print(f"broadcast_verb_candidates={len(broad_candidates)}")
     for reason in sorted(counts):
         print(f"rule.{reason}={counts[reason]}")
-    print(f"static_rule_hits_after_anchor_exception={remaining_static + remaining_intraday}")
 
     print("\nBLOCKED_TOP30")
     for index, (reason, title) in enumerate(hits[:30], 1):
