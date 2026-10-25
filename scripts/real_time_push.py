@@ -131,8 +131,11 @@ from src.rt_push.same_event import (  # noqa: F401
     _is_intraday_move_text,
     _NOISE_INTRADAY_MARKERS,
     _NOISE_COLUMN_MARKERS,
+    _DAILY_COLUMN_MARKERS,
     _NOISE_OVERSEAS_STOCK_MOVE,
     _NOISE_OVERSEAS_STOCK_NAMES,
+    _BROADCAST_EVENT_VERBS,
+    _is_broadcast_body,
     _MAJOR_CORPORATE_EVENT_MARKERS,
     _hit_watchlist,
     _MACRO_DATA_PATTERNS,
@@ -249,6 +252,13 @@ PREFILTER_SCORE_MIN = 0.55
 
 # 单轮进入 LLM 判定的候选条数上限（防止突发大行情时候选激增拖慢/超时）
 MAX_CANDIDATES_PER_ROUND = 40
+
+_NOISE_LEADER_WHITELIST = (
+    "中际旭创", "寒武纪", "宁德时代", "新易盛", "天孚通信", "源杰科技",
+    "生益科技", "南亚新材", "鼎泰高科", "中国巨石", "风华高科", "英伟达",
+    "台积电", "三星电子", "SK海力士", "美光", "阿斯麦", "ASML",
+    "长江存储", "长鑫存储",
+)
 
 # 批量 LLM 判定每批条数（控制单次请求 token 与延迟）
 LLM_BATCH_SIZE = 4
@@ -591,6 +601,11 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
         for m in _NOISE_COLUMN_MARKERS:
             if m in rest:
                 rest = rest.replace(m, "")
+        if any(m in title for m in _DAILY_COLUMN_MARKERS):
+            if not (_is_macro_data_release(rest) or _is_major_deal_event(rest)
+                    or _hit_watchlist(news, leader_watchlist)):
+                return "日报栏目"
+            return ""
         # 2026-08-25 审核实证："午评创业板指半日跌35…算力硬件"剥离"午评"后
         # 因 has_signal_keyword（算力硬件）被误放行，实为指数+盘面行情播报。
         # 剥离后若仍是"指数名+行情措辞"或"盘面异动措辞"→ 栏目/行情不推。
@@ -616,9 +631,18 @@ def _is_noise_push(news: dict, judge: dict, leader_watchlist: set) -> str:
         # 会被"涨停"误判盘面异动——但核心是留置/冻结重大事件，盘面词仅是背景。
         # 含重大公司治理/监管事件词时放行（后续仍走强档门槛 + LLM 把关）。
         if not any(k in title for k in _MAJOR_CORPORATE_EVENT_MARKERS):
-            is_leader = bool(judge.get("is_leader_stock")) or _hit_watchlist(news, leader_watchlist)
+            is_leader = (_hit_watchlist(news, leader_watchlist)
+                         or any(x in title for x in _NOISE_LEADER_WHITELIST)
+                         or (bool(judge.get("is_leader_stock"))
+                             and float(judge.get("score") or 0) >= 8
+                             and str(judge.get("scope") or "") == "stock"))
             if not is_leader:
                 return "盘面异动"
+    broadcast_reason = _is_broadcast_body(title, exempt_names=leader_watchlist)
+    if broadcast_reason and any(x in title for x in _NOISE_LEADER_WHITELIST):
+        broadcast_reason = ""
+    if broadcast_reason:
+        return broadcast_reason
     return ""
 
 
@@ -2057,6 +2081,7 @@ def run_once(dry_run: bool = False) -> dict:
             logger.info(f"LLM 未判定，挂起下轮重试: {n.get('title', '')[:40]}")
             skipped += 1
             continue
+        cand = None
         # P7-1（2026-08-22）：预筛候选持久化——资讯维度可消费"当日全部重大候选"而非仅强档推送。
         # 每个经 LLM 判定的候选（含方向+事件签名）写入 candidate_events，今日作用域、按事件去重。
         # pushed 与否由 pushed_events 权威记录；此处统一量，供择时 news_modifier 并集读取。
@@ -2064,14 +2089,25 @@ def run_once(dry_run: bool = False) -> dict:
         _ck = (now[:10], _event_sig_key(n.get("_sig") or {}))
         if _ck not in _cand_seen:
             _cand_seen.add(_ck)
-            state.setdefault("candidate_events", []).append(
-                {**n.get("_sig", {}), "dir": _dir0, "t": now, "pushed": False})
+            cand = {**n.get("_sig", {}), "dir": _dir0, "t": now, "pushed": False,
+                    "score": j.get("score"),
+                    "reason": str(j.get("reason") or "")[:60],
+                    "source": str(n.get("source") or "")[:30]}
+            state.setdefault("candidate_events", []).append(cand)
+        else:
+            cand = next(
+                (e for e in (state.get("candidate_events") or [])
+                 if (_day_key(e), _event_sig_key(e)) == _ck),
+                None,
+            )
         # 2026-08-04 用户口径：仅强利好/强利空（bullish/bearish）推送；
         # 弱档/中性/混合（mildly_bullish/mildly_bearish/neutral/mixed）一律不推，
         # 覆盖 market/sector/stock、外围科技必推、科技防漏推等全部路径。
         # 例外：watchlist 公告直通不适用（解除质押等公告方向常被判中性/弱档）。
         if not watch_direct and j.get("direction") not in ("bullish", "bearish"):
             logger.info(f"非强档方向({j.get('direction')})，不推: {n.get('title', '')[:40]}")
+            if cand is not None:
+                cand["gate"] = "direction"
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
             continue
@@ -2081,6 +2117,8 @@ def run_once(dry_run: bool = False) -> dict:
         noise_reason = None if watch_direct else _is_noise_push(n, j, leader_watchlist)
         if noise_reason:
             logger.info(f"噪声过滤({noise_reason})，不推: {n.get('title', '')[:40]}")
+            if cand is not None:
+                cand["gate"] = f"noise:{noise_reason}"
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + f"[{noise_reason}不推]"}
             skipped += 1
@@ -2119,6 +2157,8 @@ def run_once(dry_run: bool = False) -> dict:
             pass_round = False
 
         if not pass_round:
+            if cand is not None:
+                cand["gate"] = "threshold"
             seen[n["_fp"]] = {"t": now, "pushed": False, "title": str(n.get("title", ""))[:60]}
             skipped += 1
             continue
@@ -2128,6 +2168,8 @@ def run_once(dry_run: bool = False) -> dict:
         # 利空/风险资讯不受影响（风险期更应提示）。seen 标注原因便于复核。
         if risk_state == "risk_off" and not watch_direct and _risk_off_downgrade(n, j):
             logger.info(f"风险收缩期降级(科技利好无硬事件佐证): {n.get('title', '')[:40]}")
+            if cand is not None:
+                cand["gate"] = "risk_off"
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[风险收缩期降级]"}
             skipped += 1
@@ -2136,6 +2178,8 @@ def run_once(dry_run: bool = False) -> dict:
         # 跨轮同事件拦截：48h 内已推过同事件则不再推（防多源报道时间差导致重复推送）
         if any(_is_same_event(n["_sig"], pe) for pe in pushed_events):
             logger.info(f"同事件48h内已推送，跳过: {n.get('title', '')[:50]}")
+            if cand is not None:
+                cand["gate"] = "same_event"
             seen[n["_fp"]] = {"t": now, "pushed": False,
                               "title": str(n.get("title", ""))[:52] + "[同事件已推]"}
             skipped += 1
@@ -2152,6 +2196,8 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.info(f"同题材已饱和，但硬事件新颖度豁免一次: {n.get('title', '')[:50]}")
             else:
                 logger.info(f"同题材已饱和(≥{TOPIC_PUSH_LIMIT}条/24h)，不推: {n.get('title', '')[:50]}")
+                if cand is not None:
+                    cand["gate"] = "topic_saturated"
                 seen[n["_fp"]] = {"t": now, "pushed": False,
                                   "title": str(n.get("title", ""))[:52] + "[同题材已饱和]"}
                 skipped += 1
@@ -2166,6 +2212,8 @@ def run_once(dry_run: bool = False) -> dict:
                                if str(pe.get("t", ""))[:10] == now[:10])
             if today_pushed >= daily_push_limit:
                 logger.info(f"已达日推送上限({daily_push_limit})，不推: {n.get('title', '')[:50]}")
+                if cand is not None:
+                    cand["gate"] = "daily_limit"
                 seen[n["_fp"]] = {"t": now, "pushed": False,
                                   "title": str(n.get("title", ""))[:52] + "[日限额不推]"}
                 skipped += 1
@@ -2185,6 +2233,8 @@ def run_once(dry_run: bool = False) -> dict:
             print("\n===== 将推送内容预览 =====\n" + content + "\n==========================")
             seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
             _mark_candidate_pushed(state, _ck)
+            if cand is not None:
+                cand["gate"] = "pushed"
             if watch_direct:
                 # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
                 state.setdefault("watch_announce", []).append(
@@ -2209,6 +2259,8 @@ def run_once(dry_run: bool = False) -> dict:
                 logger.info(f"推送成功: {n.get('title', '')[:50]}")
                 seen[n["_fp"]] = {"t": now, "pushed": True, "title": str(n.get("title", ""))[:60]}
                 _mark_candidate_pushed(state, _ck)
+                if cand is not None:
+                    cand["gate"] = "pushed"
                 if watch_direct:
                     # 同股同类别 24h 限频登记（推送成功才计，失败下轮可重试）
                     state.setdefault("watch_announce", []).append(

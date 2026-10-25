@@ -205,6 +205,49 @@ _NOISE_COLUMN_MARKERS = [
     # 纯数据播报栏目，无事件语义。
     "主力资金流向", "资金流向",
 ]
+
+_DAILY_COLUMN_MARKERS = (
+    "局势跟踪", "期货热点追踪", "盘前要闻一览", "要闻速递", "新闻汇总", "要闻汇总",
+    "市场汇总", "资金流向日报", "主力资金监控", "投资避雷针", "行业动态汇总",
+    "每日动态汇总", "早间要闻", "隔夜要闻",
+)
+
+_BROADCAST_MOVE_RE = re.compile(
+    r"(涨超|跌超|涨逾|跌逾|涨幅|跌幅|大涨|大跌|暴涨|暴跌|走强|走弱|拉升|下挫|"
+    r"高开|低开|创新高|创新低|净流入|净流出|异动|翻红|翻绿|收涨|收跌|现报)"
+)
+_BROADCAST_MAG_RE = re.compile(
+    r"(\d+(?:\.\d+)?%|\d+\.\d+%|超\d+%|\d+个点|\d+cm|\d+天\d+板)"
+)
+_BROADCAST_EVENT_VERBS = (
+    "公告", "订单", "中标", "签约", "签署", "收购", "并购", "增持", "回购", "业绩",
+    "净利", "营收", "投产", "扩产", "产能", "涨价", "提价", "定增", "分红", "获批",
+    "量产", "交付", "出货", "制裁", "管制", "关税", "降准", "降息", "加息", "立案",
+    "问询", "减持", "融资", "合作", "大单", "解禁", "停牌", "复牌", "调查", "处罚",
+)
+
+
+def _is_broadcast_body(title: str, exempt_names=None) -> str:
+    """盘面播报体识别：主体+涨跌措辞(+涨跌停或幅度数字) 且 无事件动词 → 返回 "播报体"
+
+    exempt_names: 豁免主体名集合（用户持仓/watchlist）。命中即返回 ""，保持现有
+    「持仓股的涨跌播报仍推」的既定行为，不得改动这一语义。
+    """
+    title = str(title or "")
+    if not title:
+        return ""
+    if any(v in title for v in _BROADCAST_EVENT_VERBS):
+        return ""
+    if exempt_names and any(name and name in title for name in exempt_names):
+        return ""
+    if not _BROADCAST_MOVE_RE.search(title):
+        return ""
+    if (_BROADCAST_MAG_RE.search(title)
+            or any(k in title for k in ("涨停", "跌停", "连板"))):
+        return "播报体"
+    return ""
+
+
 # 指数盘中行情播报的波动措辞（与 _INDEX_TOKENS 组合判定，避免误伤个股消息）
 _NOISE_INDEX_MOVE = [
     "涨超", "跌超", "涨逾", "跌逾", "涨幅扩大", "跌幅扩大", "涨幅扩大至",

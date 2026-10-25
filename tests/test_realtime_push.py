@@ -1620,7 +1620,9 @@ class TestNoiseFilter:
             "金十数据整理A股盘前市场要闻速递",
         ]
         for t in cases:
-            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "栏目汇总", t
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) in {
+                "栏目汇总", "日报栏目"
+            }, t
 
     def test_index_move_filtered(self):
         """指数盘中行情播报不推：KOSPI涨超/韩国综指涨幅扩大/日经上涨"""
@@ -1651,7 +1653,9 @@ class TestNoiseFilter:
     def test_leader_intraday_kept(self):
         """龙头个股盘面保留：LLM 龙头标记或命中自选名单 → 不过滤"""
         t = "中际旭创跌超3% 成交额超110亿元"
-        assert rtp._is_noise_push({"title": t}, self._judge(is_leader_stock=True), set()) == ""
+        assert rtp._is_noise_push(
+            {"title": t}, self._judge(is_leader_stock=True, score=8, scope="stock"), set()
+        ) == ""
         assert rtp._is_noise_push({"title": t}, self._judge(), {"中际旭创"}) == ""
 
     def test_major_news_not_filtered(self):
@@ -1703,7 +1707,9 @@ class TestNoiseFilter:
             "局势跟踪：原油期货涨超2%",
         ]
         for t in cases:
-            assert rtp._is_noise_push({"title": t}, self._judge(), set()) == "栏目汇总", t
+            assert rtp._is_noise_push({"title": t}, self._judge(), set()) in {
+                "栏目汇总", "日报栏目"
+            }, t
         # "中东"高信号词放行 + 主题槽位兜底（不重复计为噪声过滤职责）
         assert rtp._is_noise_push({"title": "局势跟踪：中东局势持续紧张"}, self._judge(), set()) == "" or \
             rtp._market_theme_keys("局势跟踪：中东局势持续紧张") == {"中东局势/油价"}
@@ -2012,7 +2018,9 @@ class TestNoiseColumnSummary:
             "今日市场要闻汇总：三大指数集体收涨",
         ]
         for t in cases:
-            assert rtp._is_noise_push({"title": t}, {"is_leader_stock": False}, set()) == "栏目汇总", t
+            assert rtp._is_noise_push({"title": t}, {"is_leader_stock": False}, set()) in {
+                "栏目汇总", "日报栏目"
+            }, t
 
     def test_macro_early_report_not_hit(self):
         """防误伤：含宏观数据的早报类不被"新闻汇总"误伤"""
@@ -2224,6 +2232,159 @@ class TestNoisePushNewWords20260825:
         """龙头个股跳水保留（is_leader 例外，防漏推持仓龙头）"""
         assert rtp._is_noise_push({"title": "万亿中际旭创跳水 股价跌破900元"},
                                   self._j(is_leader_stock=True), set()) == ""
+
+
+class TestPushQualityP0:
+    """P0 播报体/日报栏目/龙头豁免收口 + 候选 gate 可观测性。"""
+
+    def _judge(self, **kw):
+        j = {"push": True, "score": 8, "direction": "bullish", "scope": "sector",
+             "is_leader_stock": False, "entities": [], "reason": "重大事件"}
+        j.update(kw)
+        return j
+
+    def test_broadcast_body_structure(self):
+        exempt = {"中际旭创"}
+        cases = (
+            "物理AI概念局部回暖 天娱数科直线涨停",
+            "人形机器人概念反复走强 兆威机电5天3板",
+            "南方两倍做多海力士大涨19%",
+            "CPO概念震荡走弱 东山精密跌停",
+        )
+        for title in cases:
+            assert rtp._is_noise_push({"title": title}, self._judge(), exempt), title
+
+        keep = (
+            "天孚通信:关于收到控股股东提议回购公司股份的提示性公告",
+            "生益科技:关于以集中竞价交易方式回购股份方案的公告",
+            "生益科技:生益科技关于以集中竞价交易方式回购股份方案的公告",
+            "中际旭创：预计1.6T、800G等高端光模块需求将保持快速增长",
+            "长鑫科技：预计2026年前三季度净利润1310亿元至1325亿元，同比扭亏为盈",
+            "假期要闻汇总：非农数据意外“爆冷” 美联储10月加息概率骤降",
+        )
+        for title in keep:
+            assert rtp._is_noise_push({"title": title}, self._judge(), exempt) == "", title
+
+    def test_broadcast_exempts_watchlist(self):
+        title = "源杰科技盘初大跌15%"
+        assert rtp._is_noise_push({"title": title}, self._judge(), {"源杰科技"}) == ""
+        assert rtp._is_noise_push({"title": title}, self._judge(), set()) == ""
+        non_leader = "贵州茅台盘初大跌15%"
+        assert rtp._is_noise_push(
+            {"title": non_leader}, self._judge(), {"贵州茅台"}
+        ) == ""
+        assert rtp._is_noise_push(
+            {"title": non_leader}, self._judge(), set()
+        ) == "播报体"
+
+    def test_daily_column_only_allows_macro_or_deal(self):
+        assert rtp._is_noise_push(
+            {"title": "局势跟踪：中东局势持续紧张"},
+            self._judge(), set(),
+        ) == "日报栏目"
+        assert rtp._is_noise_push(
+            {"title": "美股盘前要闻一览：英伟达升级Isaac通用机器人开发平台"},
+            self._judge(), set(),
+        ) == "日报栏目"
+        assert rtp._is_noise_push(
+            {"title": "假期要闻汇总：非农数据意外“爆冷” 美联储10月加息概率骤降"},
+            self._judge(), set(),
+        ) == ""
+        assert rtp._is_noise_push(
+            {"title": "涨停分析：中际旭创获50亿大单涨停"},
+            self._judge(), set(),
+        ) == ""
+        assert rtp._is_noise_push(
+            {"title": "中际旭创获融资资金买入超12亿元丨资金流向日报"},
+            self._judge(), {"中际旭创"},
+        ) == ""
+
+    def test_noise_leader_requires_hard_evidence(self):
+        title = "CPO概念震荡走弱 东山精密跌停"
+        assert rtp._is_noise_push(
+            {"title": title}, self._judge(is_leader_stock=True, score=9, scope="sector"), set(),
+        ) == "盘面异动"
+        assert rtp._is_noise_push(
+            {"title": title}, self._judge(is_leader_stock=True, score=7, scope="stock"), set(),
+        ) == "盘面异动"
+        assert rtp._is_noise_push(
+            {"title": "中际旭创跌超3% 成交额超110亿元"},
+            self._judge(is_leader_stock=True, score=8, scope="stock"), set(),
+        ) == ""
+
+
+class TestCandidateGateP0:
+    def test_candidate_gate_survives_merge_and_push_backfill(self):
+        from src.rt_push import state_store
+
+        state = {
+            "seen": {},
+            "pending": {},
+            "pushed_events": [],
+            "candidate_events": [{
+                "t": "2026-10-25 10:00:00",
+                "title_norm": "中际旭创800G光模块获海外大单",
+                "pushed": False,
+                "gate": "direction",
+            }],
+        }
+        remote = {
+            "seen": {}, "pending": {}, "pushed_events": [],
+            "candidate_events": [{
+                "t": "2026-10-25 10:00:00",
+                "title_norm": "中际旭创800G光模块获海外大单",
+                "pushed": False,
+                "gate": "noise:播报体",
+            }],
+        }
+        merged = state_store._merge_state(state, remote)
+        assert len(merged["candidate_events"]) == 1
+        candidate = merged["candidate_events"][0]
+        assert candidate["gate"] == "noise:播报体"
+        ck = (state_store._day_key(candidate), state_store._event_sig_key(candidate))
+        state_store._mark_candidate_pushed(merged, ck)
+        assert "gate" in candidate
+        assert candidate["pushed"] is True
+        assert candidate["gate"] == "noise:播报体"
+
+    def test_pushed_candidate_has_gate_and_metadata(self, monkeypatch, tmp_path):
+        news = [{"title": "中际旭创 800G 光模块获海外大单",
+                 "content": "公司公告获得海外大客户订单",
+                 "source": "财联社", "published_at": "2026-10-25 10:00:00",
+                 "affected_stocks": ["中际旭创"]}]
+        state_path = _setup_run_round(monkeypatch, tmp_path, news)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        title_norm = rtp._normalize_title(news[0]["title"])
+        cand = next(e for e in saved["candidate_events"]
+                    if e.get("title_norm") == title_norm)
+        assert cand["pushed"] is True
+        assert cand["gate"] == "pushed"
+        assert cand["score"] == 8
+        assert cand["reason"] == "重大事件"
+        assert cand["source"] == "财联社"
+
+    def test_unpushed_candidate_has_gate(self, monkeypatch, tmp_path):
+        news = [{"title": "中际旭创 800G 光模块获海外大单",
+                 "content": "公司公告获得海外大客户订单",
+                 "source": "财联社", "published_at": "2026-10-25 10:00:00",
+                 "affected_stocks": ["中际旭创"]}]
+        state_path = _setup_run_round(
+            monkeypatch, tmp_path, news, judge={"direction": "neutral"})
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert saved["candidate_events"]
+        assert all(e.get("gate") == "direction" for e in saved["candidate_events"])
+
+    def test_noise_candidate_gate_keeps_reason(self, monkeypatch, tmp_path):
+        news = [{"title": "CPO概念震荡走弱 东山精密跌停",
+                 "content": "盘面异动",
+                 "source": "财联社", "published_at": "2026-10-25 10:00:00"}]
+        state_path = _setup_run_round(monkeypatch, tmp_path, news)
+        rtp.run_once(dry_run=False)
+        saved = _load_saved_state(state_path)
+        assert saved["candidate_events"]
+        assert saved["candidate_events"][0]["gate"].startswith("noise:")
 
 
 class TestPendingCleanse:
